@@ -1,0 +1,995 @@
+{
+  "incident_id": "INC-002",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The incident is most likely caused by config change cfg-2207, which cut portfolio-service's datasource pool (db.pool.max_size 50->5) at 09:52Z and saturated portfolio-service, propagating upstream as gateway 504s on /v1/portfolio/* (H2, confidence 0.60, medium). The onset evidence is the strongest discriminator: gateway and portfolio-service p99 both jump in the same 09:50-09:52Z bucket and then hold ~4.3s, and cfg-2207 is the only change at that moment, whereas the gateway HTTP/2 deploy (dep-5220) preceded onset by 110 minutes with flat latency in between (H1 downgraded to 0.12). Confidence is medium rather than high because no metric or log data was retrieved from portfolio-service's own pool/CPU metrics or from the shared datastores (ledger-db, redis-cache), so an independent datastore fault (H3, 0.22) cannot be fully excluded. Recommendation: roll back cfg-2207 first (fast, low-risk, directly tests the top hypothesis), and if latency does not recover, escalate to datastore-layer checks before touching the gateway deploy.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H2",
+      "title": "cfg-2207 portfolio-service DB pool cut (50->5) exhausted its ledger-db connection pool, saturating portfolio-service",
+      "statement": "Config change cfg-2207 ('Apply cost-optimisation profile small', db.pool.max_size 50->5) at 09:52Z shrank portfolio-service's datasource pool, so portfolio-service requests queue/block waiting for a connection to ledger-db, driving portfolio-service latency to ~4.3s and propagating upstream as gateway 504s on /v1/portfolio/*.",
+      "category": "config_change",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": "cfg-2207",
+      "confidence": 0.6,
+      "pre_cap_confidence": 0.62,
+      "confidence_label": "medium",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-2207 changes portfolio-service db.pool.max_size 50 -> 5 at 09:52Z via an automated cost-optimisation profile",
+          "finding_ids": [
+            "F2",
+            "F13"
+          ]
+        },
+        {
+          "claim": "With only 5 pooled connections, portfolio-service requests block/queue on the ledger-db pool (pool exhaustion), the same mechanism as the matching precedent HIST-115",
+          "finding_ids": [
+            "F16",
+            "F5"
+          ]
+        },
+        {
+          "claim": "portfolio-service p99 jumps in the 09:50Z bucket alongside the gateway, showing the latency originates inside the portfolio-service path",
+          "finding_ids": [
+            "F12",
+            "F8"
+          ]
+        },
+        {
+          "claim": "Slow portfolio-service calls exceed the gateway upstream timeout -> 504s confined to /v1/portfolio/holdings",
+          "finding_ids": [
+            "F10",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2",
+        "F13",
+        "F14",
+        "F12",
+        "F8",
+        "F16",
+        "F5",
+        "F10"
+      ],
+      "contradicting_evidence": [
+        "F7",
+        "F8"
+      ],
+      "assumptions": [
+        "cfg-2207 propagates promptly (pool resize applied on reload) rather than only at next restart",
+        "The 09:52 config commit and the 09:50-09:52 metric onset offset is measurement-bucket granularity, not a genuine 2-minute lead of the symptom over the cause"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H3",
+      "title": "Shared ledger-db (or redis-cache) degraded independently of any change, slowing portfolio-service",
+      "statement": "A shared datastore on the portfolio path — ledger-db (shared:true) or redis-cache (shared:true) — began failing or throttling (as in HIST-102 failover / HIST-110 IOPS throttling) around 09:50Z, so portfolio-service calls blocked on the datastore and the gateway reflected the upstream wait as 504s. No change was recorded for these components.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "null",
+      "confidence": 0.22,
+      "pre_cap_confidence": 0.22,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "portfolio-service depends on ledger-db and redis-cache (both shared:true) on the /v1/portfolio/* path",
+          "finding_ids": [
+            "F4",
+            "F18"
+          ]
+        },
+        {
+          "claim": "ledger-db or redis-cache degrades (failover, IOPS throttling, connection saturation) around 09:50Z",
+          "finding_ids": [
+            "F17"
+          ]
+        },
+        {
+          "claim": "portfolio-service requests block on the degraded datastore -> p99 ~4.3s",
+          "finding_ids": [
+            "F12"
+          ]
+        },
+        {
+          "claim": "Gateway surfaces the upstream wait as 504s on /v1/portfolio/holdings",
+          "finding_ids": [
+            "F10",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F4",
+        "F17",
+        "F18",
+        "F12"
+      ],
+      "contradicting_evidence": [
+        "F6",
+        "F8",
+        "F14"
+      ],
+      "assumptions": [
+        "A datastore fault can occur with no recorded change (no deploy/config visible in the window, per F6/F13)",
+        "The datastore would produce no ERROR-level gateway logs, only upstream timeouts"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H1",
+      "title": "Gateway HTTP/2-to-upstream upgrade (dep-5220) introduced protocol-level stalls causing 504s",
+      "statement": "api-gateway v9.3.0 (dep-5220, envoy 1.29->1.30, upstream protocol h2 to portfolio-service and order-service) deployed 08:00Z introduced an HTTP/2-to-upstream behavior change (e.g. max concurrent streams default shift) that stalls portfolio-service calls, producing upstream timeouts and 504s on /v1/portfolio/* and elevated gateway p99.",
+      "category": "bad_deployment",
+      "root_cause_service": "api-gateway",
+      "trigger_change_id": "dep-5220",
+      "confidence": 0.12,
+      "pre_cap_confidence": 0.12,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5220 deploys envoy 1.30 with upstream protocol h2 for portfolio-service at 08:00Z",
+          "finding_ids": [
+            "F1",
+            "F13"
+          ]
+        },
+        {
+          "claim": "Envoy HTTP/2 default change (max concurrent streams) causes upstream resets/stalls on portfolio-service calls",
+          "finding_ids": [
+            "F5",
+            "F15"
+          ]
+        },
+        {
+          "claim": "Stalled upstream calls hit gateway timeout -> 504 on /v1/portfolio/holdings",
+          "finding_ids": [
+            "F10",
+            "F9"
+          ]
+        },
+        {
+          "claim": "Gateway p99 and error rate rise",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F5",
+        "F10",
+        "F15",
+        "F13"
+      ],
+      "contradicting_evidence": [
+        "F7",
+        "F8",
+        "F12",
+        "F14",
+        "F6",
+        "F11"
+      ],
+      "assumptions": [
+        "The gateway envoy HTTP/2 change has a delayed trigger (e.g. connection reuse exhaustion or stream-limit hit only after 110 minutes of traffic) that would explain a 09:50 onset rather than an 08:00 onset",
+        "No gateway-side error/exception is expected in logs (matches F11 zero ERRORs), i.e. the failure manifests only as upstream timeouts"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H5",
+      "title": "Gateway deploy is coincident-but-harmless; scheduling/chance aside, portfolio path self-saturated (resource exhaustion without a triggering release)",
+      "statement": "portfolio-service's own resources (CPU/memory/threads/connection handling) saturated due to a traffic or query change with no faulty deploy, producing the latency and 504s.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": "null",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "portfolio-service resource usage climbs (traffic/query mix change) with no corresponding code/config cause",
+          "finding_ids": []
+        },
+        {
+          "claim": "Requests slow to ~4.3s p99",
+          "finding_ids": [
+            "F12"
+          ]
+        },
+        {
+          "claim": "Gateway times out -> 504 on portfolio route",
+          "finding_ids": [
+            "F10"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F12",
+        "F10"
+      ],
+      "contradicting_evidence": [
+        "F14",
+        "F2",
+        "F13"
+      ],
+      "assumptions": [
+        "A load/query change occurred that is not visible in the change list"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 5,
+      "hypothesis_id": "H4",
+      "title": "Shared infrastructure in front of the gateway (LB/DNS/mesh) degraded, throttling /v1/portfolio/*",
+      "statement": "A load balancer, DNS, or service-mesh component upstream of api-gateway degraded and specifically affected the portfolio path, inflating gateway p99 and producing 504s on /v1/portfolio/*.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "api-gateway (upstream network path)",
+      "trigger_change_id": "null",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "A shared network component (LB/DNS/mesh) in front of or between gateway and portfolio-service degrades",
+          "finding_ids": []
+        },
+        {
+          "claim": "It selectively slows the portfolio route",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "Gateway p99 rises and 504s appear",
+          "finding_ids": [
+            "F7",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F10"
+      ],
+      "contradicting_evidence": [
+        "F6",
+        "F12",
+        "F7",
+        "F8",
+        "F11"
+      ],
+      "assumptions": [
+        "A network-layer fault can degrade portfolio traffic without touching other routes and without any recorded DNS/LB/mesh change"
+      ],
+      "rejection_reason": "null"
+    }
+  ],
+  "facts": [
+    {
+      "statement": "The /v1/portfolio/* chain is api-gateway -> portfolio-service -> {ledger-db (db), market-data-service (http), redis-cache (cache)}; ledger-db and redis-cache are shared (shared:true, owner platform) across multiple services.",
+      "finding_ids": [
+        "F4",
+        "F18"
+      ]
+    },
+    {
+      "statement": "A config change cfg-2207 changed portfolio-service key 'db.pool.max_size' from 50 to 5 at 2026-03-10T09:52:00Z by infra-automation, described as 'Apply cost-optimisation profile small to service datasource'; it is the latest change before the 10:05Z report and touches the reported call path's own service.",
+      "finding_ids": [
+        "F2",
+        "F13"
+      ]
+    },
+    {
+      "statement": "api-gateway p99 was flat at ~200-230 ms from 08:00 to 09:45Z, then jumped in the 09:50Z bucket (avg 1849.99 ms, max 4418.76 ms) and stayed ~4300 ms through 11:55Z.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "2-minute-bucket zoom pins the gateway onset to 09:50-09:52Z: 09:50 avg 201.4 ms, 09:52 avg 2309.55 ms (max 4418.76), 09:54 avg 4293.88 ms.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "portfolio-service p99 was flat at ~170-190 ms from 08:00 to 09:45Z, then rose in the SAME 09:50Z bucket as the gateway (avg 1865.15 ms, max 4546.3 ms) and stayed ~4100-4300 ms; it tracks the gateway almost exactly, indicating the added latency originates inside the portfolio-service path rather than at the gateway edge.",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "statement": "api-gateway error_rate was 0.17-0.31% from 08:00 through 09:45Z, then rose to 1.66% avg (max 7.18) in the 09:50Z bucket and held ~7.1-7.3% thereafter.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "All gateway 504/timeout errors are confined to a single route: 252 matched WARN entries with top pattern 'upstream timeout portfolio-service GET /v<n>/portfolio/holdings', first_seen 2026-03-10T09:53:53Z; no other route appears.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "api-gateway emitted zero ERROR-level logs in the window 09:30-11:59Z; the only other WARN besides 504 timeouts was a single 'clock drift ... resyncing with NTP' at 10:38:45Z.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "Deployment dep-5220 (api-gateway v9.3.0, envoy 1.29->1.30, upstream protocol h2 for portfolio-service and order-service) went live at 08:00:00Z and has rolled_back_at null.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "The full change list for 2026-03-09T22:00Z-11:59Z contains exactly one deployment and two config changes (dep-5220 at 08:00Z, cfg-2199 order-service log.sampling_rate at 07:00Z, cfg-2207 portfolio-service db.pool.max_size at 09:52Z); there was no change to ledger-db, redis-cache, DNS, LB or mesh, and no rollback.",
+      "finding_ids": [
+        "F13",
+        "F6"
+      ]
+    },
+    {
+      "statement": "Precedent HIST-115 (order-service, match_score 7) shows symptoms 'connection is not available','request timed out','pool exhausted' with root cause 'Datasource pool size overridden by a wrong environment profile' and fix 'Reverted config; added validation', mirroring cfg-2207 on the portfolio-service->ledger-db edge.",
+      "finding_ids": [
+        "F16"
+      ]
+    },
+    {
+      "statement": "Precedent HIST-116 (api-gateway, match_score 6) matches the HTTP/2 signature ('HTTP/2 resets after gateway envoy upgrade', 504s, upstream resets, timeouts; root cause 'Envoy upgrade changed HTTP/2 max concurrent streams default'; fix 'Rolled back gateway'), and HIST-102/HIST-110 show a datastore fault on this path can also surface as gateway 504s; these are leads only.",
+      "finding_ids": [
+        "F5",
+        "F15",
+        "F17"
+      ]
+    }
+  ],
+  "assumptions": [
+    "Assumption: cfg-2207 propagates promptly (the pool resize is applied on reload) rather than only at the next restart.",
+    "Assumption: the 09:50-09:52 offset between the 09:52 config commit and the metric onset is measurement-bucket granularity, not a genuine 2-minute lead of symptom over cause.",
+    "Assumption: portfolio-service's db.pool.max_size governs the connections available to ledger-db, so a 50->5 cut can exhaust the pool and cause request blocking/queueing.",
+    "Assumption: the gateway 504s on /v1/portfolio/* are a downstream reflection of portfolio-service slowness, consistent with portfolio-service p99 tracking gateway p99 (F12).",
+    "Assumption: no unrecorded binary/config rollout occurred on ledger-db or redis-cache in the window; the visible change list (F13) is complete.",
+    "Assumption: the absence of other routes in the 504 log pattern (F10) means the fault is specific to the portfolio path and not a gateway-wide protocol defect.",
+    "(demoted from facts: no verified observation backs it) Onset (09:50-09:52Z) is 110 minutes after the 08:00Z gateway HTTP/2 deploy but coincides in the same minute with cfg-2207 at 09:52:00Z; the deploy cannot explain a 09:50 onset without a delayed trigger, and the pool cut is the only change at onset."
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-10T08:00:00Z",
+      "event": "Deployment dep-5220: api-gateway v9.3.0 goes live (envoy 1.29->1.30; upstream protocol h2 for portfolio-service and order-service); not rolled back (F1, F13).",
+      "finding_ids": [
+        "F1",
+        "F13"
+      ]
+    },
+    {
+      "time": "2026-03-10T08:00:00Z-09:45:00Z",
+      "event": "api-gateway p99 stays flat at ~200-230 ms and error_rate at 0.17-0.31%; portfolio-service p99 stays flat at ~170-190 ms — no impact from the 08:00Z gateway deploy for the first 105+ minutes (F7, F9, F12).",
+      "finding_ids": [
+        "F7",
+        "F9",
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:50:00Z",
+      "event": "Onset: gateway p99 jumps in the 09:50Z bucket (avg 1849.99 ms, max 4418.76) and error_rate rises to 1.66% avg; portfolio-service p99 rises in the SAME bucket (avg 1865.15 ms, max 4546.3) (F7, F8, F9, F12).",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F9",
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:52:00Z",
+      "event": "Config change cfg-2207: portfolio-service db.pool.max_size 50->5 ('Apply cost-optimisation profile small to service datasource') by infra-automation — the only change coincident with onset (F2, F13, F14).",
+      "finding_ids": [
+        "F2",
+        "F13",
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:53:00Z onward",
+      "event": "Gateway 504/timeout WARN entries first seen 09:53:53Z, all confined to /v1/portfolio/holdings ('upstream timeout portfolio-service'); gateway p99 holds ~4300 ms and error_rate ~7.1-7.3% through 11:55Z (F7, F9, F10).",
+      "finding_ids": [
+        "F7",
+        "F9",
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-03-10T10:05:00Z",
+      "event": "Incident INC-002 reported by on-call SRE: portfolio page spinning/timing out, gateway p99 through the roof, suspicion placed on the morning gateway HTTP/2 upgrade.",
+      "finding_ids": [
+        "F1",
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-03-10T11:59:00Z",
+      "event": "Latest data: no rollback of dep-5220 and no revert of cfg-2207 recorded; degradation persists (F6, F13).",
+      "finding_ids": [
+        "F6",
+        "F13"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Revert config change cfg-2207 (portfolio-service db.pool.max_size 5 -> 50) and watch api-gateway and portfolio-service p99 over the next 10 minutes.",
+      "priority": "immediate",
+      "rationale": "cfg-2207 is the only change coincident with the 09:50-09:52Z onset, and the top hypothesis (H2, 0.60) attributes the saturation to a pool cut via a profile; a config revert is fast, low-risk and directly tests the leading hypothesis. HIST-115 shows the same 'wrong environment profile cut the datasource pool' pattern with fix 'Reverted config'.",
+      "finding_ids": [
+        "F2",
+        "F13",
+        "F14",
+        "F16"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "While the revert propagates, verify portfolio-service db_pool_in_use, cpu_pct, memory_pct, restarts and its WARN/ERROR logs over 09:40-10:00Z, and pull ledger-db/redis-cache connection-pool, IOPS and GC telemetry for the same window.",
+      "priority": "immediate",
+      "rationale": "Distinguishes H2 (pool exhausted in portfolio-service) from H3 (shared datastore degraded independently). These metrics were never retrieved, which is the main reason confidence is capped at medium.",
+      "finding_ids": [
+        "F2",
+        "F12",
+        "F18"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Do NOT roll back dep-5220 (the gateway HTTP/2 upgrade) as a first move; if p99 remains elevated after the cfg-2207 revert, then roll back api-gateway to v9.3.0-predecessor and re-measure /v1/portfolio/* latency.",
+      "priority": "immediate",
+      "rationale": "The 08:00Z deploy preceded onset by 110 minutes with flat latency in between, so it requires an implausible delayed trigger; rolling it back first would discard the stronger causal evidence and add avoidable risk. It stays as the fallback if the pool revert fails.",
+      "finding_ids": [
+        "F1",
+        "F7",
+        "F12",
+        "F14"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "If neither revert restores latency, capture a live latency profile of portfolio-service -> ledger-db (connection acquisition wait time vs query time) and check ledger-db for primary failover or I/O throttling, per the HIST-102 / HIST-110 patterns.",
+      "priority": "short_term",
+      "rationale": "This is the discriminating step for the remaining H3 datastore-degradation hypothesis, which could not be ruled in or out from change data alone.",
+      "finding_ids": [
+        "F17",
+        "F4",
+        "F18"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Confirm fix: verify p99 returns to ~200 ms baseline on both api-gateway and portfolio-service and that gateway 504s on /v1/portfolio/holdings cease, then close the incident with the confirmed cause.",
+      "priority": "short_term",
+      "rationale": "Establishes causal validation (a step explicitly missing from the evidence) and ensures the degradation has fully cleared before declaring resolution.",
+      "finding_ids": [
+        "F7",
+        "F10",
+        "F12"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add guardrails on datasource pool configuration: require a minimum pool size floor per service class and enforce change review/validation for 'cost-optimisation profile' configs applied by automation to request-path services.",
+      "priority": "long_term",
+      "rationale": "Prevents recurrence of the HIST-115 failure mode ('datasource pool size overridden by a wrong environment profile'); cfg-2207 was committed by infra-automation with no validation gate.",
+      "finding_ids": [
+        "F2",
+        "F16"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add per-service alerting on db_pool_in_use / connection-acquisition latency and a golden-signal alert keyed to /v1/portfolio/* so pool exhaustion is caught before it manifests as gateway 504s.",
+      "priority": "long_term",
+      "rationale": "The incident was detected only at the gateway edge (504s, p99) after portfolio-service was already saturated; portfolio-service exposes db_pool_in_use but no alert fired on it.",
+      "finding_ids": [
+        "F9",
+        "F10",
+        "F12"
+      ],
+      "hypothesis_id": null
+    }
+  ],
+  "data_gaps": [
+    "get_service_dependencies for api-gateway direction=upstream returned empty, so callers in front of the gateway (DNS/LB/mesh) could not be enumerated; cannot confirm whether any component upstream of the gateway changed in the window (limits rejection of H4).",
+    "No metric time series were retrieved for api-gateway, portfolio-service, ledger-db or redis-cache (tool budget exhausted); cannot establish exact onset ordering within the 09:50-09:52Z bucket, nor whether the shared datastores themselves degraded.",
+    "portfolio-service's own resource metrics (cpu_pct, memory_pct, db_pool_in_use, GC) and its WARN/ERROR logs were never queried, although the metric list exists; cannot directly confirm pool exhaustion as opposed to other in-service saturation — this is the biggest gap in supporting H2.",
+    "No telemetry for ledger-db or redis-cache (connection-pool saturation, IOPS, GC); H3 cannot be excluded from data, only from the absence of a recorded change.",
+    "Deployment records exist only for api-gateway; an unrecorded binary/config rollout on the shared datastores cannot be fully ruled out.",
+    "No explicit effective-propagation time for cfg-2207 (commit vs pod reload of db.pool.max_size), so the 09:52 commit cannot be perfectly reconciled with the 09:50 metric bucket onset.",
+    "Blast-radius confirmation for non-portfolio routes relied on a truncated log-pattern summary (40 of 252 rows returned); absence of other routes in the timeout signature is well-supported but not exhaustively verified.",
+    "No post-change validation data exists for a rollback of cfg-2207 or dep-5220; no remediation event appears in the change list, so neither candidate change has been causally validated by recovery."
+  ],
+  "what_would_change_the_conclusion": [
+    "portfolio-service db_pool_in_use rising to/near the new limit of 5 at 09:50Z with no evidence of a datastore-side fault would strongly confirm H2 and raise confidence to high.",
+    "Latency persisting unchanged after reverting cfg-2207 would falsify H2 as the sole cause and shift weight to H1 (gateway HTTP/2) or H3 (datastore degradation).",
+    "Evidence of ledger-db failover, connection refusals, or I/O throttling beginning at ~09:50Z (HIST-102/HIST-110 pattern) while portfolio-service's pool was never saturated would overturn H2 in favor of H3.",
+    "Finding that cfg-2207's pool resize only takes effect at next pod restart (i.e., it had not yet applied by 10:05Z) would remove it as the cause and strengthen H1 or H3.",
+    "A delayed gateway-side HTTP/2 effect (e.g., connection-reuse exhaustion or a stream-limit hit appearing only after ~110 minutes of traffic, or evidence of upstream resets in gateway logs) would overturn the timing argument and support H1.",
+    "Portfolio-service p99 rising strictly before gateway p99 with matching service-internal metrics would confirm the latency originates inside portfolio-service; the reverse (gateway-first) would point to the gateway or the network path in front of it (H4)."
+  ],
+  "findings": [
+    {
+      "statement": "Deployment dep-5220: api-gateway v9.3.0 deployed 2026-03-10T08:00:00Z by platform-team, 'Upgrade envoy filter chain; enable HTTP/2 to upstreams' (envoy 1.29 -> 1.30, upstream protocol h2 for portfolio-service and order-service), status live, rolled_back_at null.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "enable HTTP/2 to upstreams"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T08:00:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Config change cfg-2207: portfolio-service key 'db.pool.max_size' changed 50 -> 5 at 2026-03-10T09:52:00Z by infra-automation, description 'Apply cost-optimisation profile small to service datasource'. This is the latest change before the 10:05Z report and touches the reported call path's own service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "db.pool.max_size"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:52:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Config change cfg-2199: order-service 'log.sampling_rate' 0.1 -> 0.2 at 2026-03-10T07:00:00Z by config-bot ('More request log sampling'). order-service is a downstream of api-gateway but not on the /v1/portfolio/* path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "log.sampling_rate"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-10T07:00:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The /v1/portfolio/* chain is api-gateway -> portfolio-service -> {ledger-db (db), market-data-service (http), redis-cache (cache)}; market-data-service -> redis-cache and exchange-gateway. ledger-db is shared by order-service, portfolio-service, payment-service and settlement-service; redis-cache is shared by auth-service, portfolio-service and market-data-service. Both datastores are flagged shared:true, owner platform.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "portfolio-service"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"from\":\"settlement-service\",\"to\":\"ledger-db\""
+        }
+      ],
+      "services": [
+        "api-gateway",
+        "portfolio-service",
+        "ledger-db",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Precedent HIST-116 (2025-12-18) 'HTTP/2 resets after gateway envoy upgrade' on api-gateway with symptoms '504 at gateway','upstream resets','timeouts', root cause 'Envoy upgrade changed HTTP/2 max concurrent streams default', resolution 'Rolled back gateway'. Also HIST-115 (2025-09-25) 'Datasource pool size overridden by a wrong environment profile' on order-service with symptoms 'connection is not available','request timed out','pool exhausted'. These are leads only.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "Envoy upgrade changed HTTP/2 max concurrent streams default"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "Datasource pool size overridden by a wrong environment profile"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No deployment in the window was rolled back (get_deployments returned only dep-5220 with rolled_back_at null) and no changes were logged for ledger-db, redis-cache, DNS, load balancer or service mesh in the config-change result.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "rolled_back_at\":null"
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"count\":2"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "api-gateway p99 latency was flat at ~200-230 ms from 08:00 to 09:45Z, then jumped in the 09:50Z bucket (avg 1849.99 ms, max 4418.76 ms) and stayed at ~4300 ms through 11:55Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":204.03,\"max\":210.22"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-10T09:50:00Z\",\"avg\":1849.99,\"max\":4418.76"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:50:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Zooming api-gateway p99 to 2-minute buckets pins onset to 09:50-09:52Z: 09:50 avg 201.4 ms (max 201.64), 09:52 avg 2309.55 ms (max 4418.76), 09:54 avg 4293.88 ms.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-10T09:50:00Z\",\"avg\":201.4,\"max\":201.64"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-10T09:52:00Z\",\"avg\":2309.55,\"max\":4418.76"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:52:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "api-gateway error_rate was 0.17-0.31% from 08:00 through 09:45Z, then rose to 1.66% avg (max 7.18) in the 09:50Z bucket and held ~7.1-7.3% thereafter.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":0.21,\"max\":0.31"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-03-10T09:50:00Z\",\"avg\":1.66,\"max\":7.18"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:50:00Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "All gateway 504/timeout errors are confined to a single route: 252 matched WARN entries, top pattern \"upstream timeout portfolio-service GET /v<n>/portfolio/holdings -> <n> (trace <n>)\" (count 252), first_seen 2026-03-10T09:53:53Z. No other route appears.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "upstream timeout portfolio-service GET /v<n>/portfolio/holdings -> <n> (trace <n>)"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "\"total_matched\":252"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-03-10T09:53:53Z\",\"level\":\"WARN\",\"message\":\"upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504 (trace 4ad3127e)\"}"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:53:53Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "api-gateway emitted zero ERROR-level logs in the reported window (09:30-11:59Z, total_matched 0); the only other WARN besides 504 timeouts was a single 'clock drift ... resyncing with NTP' at 10:38:45Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "clock drift <n>ms detected, resyncing with NTP"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:53:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "portfolio-service p99 was flat at ~170-190 ms from 08:00 to 09:45Z, then rose in the SAME 09:50Z bucket as the gateway (avg 1865.15 ms, max 4546.3 ms) and stayed ~4100-4300 ms. Its p99 tracks the gateway almost exactly, so the added latency is inside the portfolio-service path, not introduced at the gateway edge.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":176.42,\"max\":178.16"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-10T09:50:00Z\",\"avg\":1865.15,\"max\":4546.3"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:50:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Full change list in the window 2026-03-09T22:00Z–11:59Z contains exactly one deployment and two config changes: dep-5220 api-gateway v9.3.0 at 08:00Z ('envoy 1.29 -> 1.30', 'upstream protocol h2 for portfolio-service and order-service', rolled_back_at null, status live), cfg-2199 order-service log.sampling_rate 0.1->0.2 at 07:00Z, cfg-2207 portfolio-service db.pool.max_size 50->5 at 09:52Z ('Apply cost-optimisation profile small to service datasource'). No change to ledger-db, redis-cache, DNS, LB or mesh, and no rollback.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "{\"id\":\"dep-5220\",\"service\":\"api-gateway\",\"version\":\"v9.3.0\",\"deployed_at\":\"2026-03-10T08:00:00Z\""
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"changed_at\":\"2026-03-10T09:52:00Z\",\"author\":\"infra-automation\",\"description\":\"Apply cost-optimisation profile 'small' to service datasource\""
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"rolled_back_at\":null"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F13",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Timing correlation: onset (gateway/portfolio-service first anomaly in the 09:50Z bucket, 09:50–09:52Z) is 110 minutes AFTER the 08:00Z gateway HTTP/2 deploy but coincides (same minute) with cfg-2207 portfolio-service db.pool.max_size 50->5 at 09:52:00Z. The gateway deploy cannot explain a 09:50 onset without a delayed trigger; the pool cut is the only change at onset.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"deployed_at\":\"2026-03-10T08:00:00Z\""
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"changed_at\":\"2026-03-10T09:52:00Z\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent with the closest signature match is HIST-116 (2025-12-18, api-gateway, match_score 6): 'HTTP/2 resets after gateway envoy upgrade', symptoms '504 at gateway','upstream resets','timeouts', category bad_deployment, prior root cause 'Envoy upgrade changed HTTP/2 max concurrent streams default', fix 'Rolled back gateway'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "\"id\":\"HIST-116\",\"date\":\"2025-12-18\",\"title\":\"HTTP/2 resets after gateway envoy upgrade\""
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "root cause 'Envoy upgrade changed HTTP/2 max concurrent streams default'"
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"resolution\":\"Rolled back gateway\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "A second precedent that matches the current service path rather than the gateway: HIST-115 (2025-09-25, order-service, match_score 7): symptoms 'connection is not available','request timed out','pool exhausted', category config_change, root cause 'Datasource pool size overridden by a wrong environment profile', fix 'Reverted config; added validation'. This mirrors cfg-2207 (pool size cut via a profile) on the portfolio-service->ledger-db edge.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "\"id\":\"HIST-115\",\"date\":\"2025-09-25\",\"title\":\"order-service connection pool misconfiguration\""
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "\"root_cause\":\"Datasource pool size overridden by a wrong environment profile\""
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "\"resolution\":\"Reverted config; added validation\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Precedent HIST-102 (2025-09-02, portfolio-service + ledger-db) shows the exact symptom pair 'portfolio page timeouts','504 at gateway' with prior root cause 'Unplanned ledger-db primary failover; 6 min of refused connections' and fix 'Failover completed; added retry'; HIST-110 (2026-01-15) shows ledger-db-side slowness ('statement timeouts','slow queries', root cause 'Cloud volume burst credits exhausted; IOPS throttled') propagating to order latency. Both are leads showing a datastore fault can surface as gateway 504s on this path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"id\":\"HIST-102\",\"date\":\"2025-09-02\",\"title\":\"Portfolio timeouts during ledger-db failover\""
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"root_cause\":\"Unplanned ledger-db primary failover; 6 min of refused connections\""
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"id\":\"HIST-110\",\"date\":\"2026-01-15\",\"title\":\"Slow orders from ledger-db IOPS throttling\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Dependency graph confirms the /v1/portfolio/* chain and its shared components: portfolio-service -> ledger-db (db, shared:true, owner platform), market-data-service (http), redis-cache (cache, shared:true, owner platform); market-data-service -> redis-cache and exchange-gateway; api-gateway -> portfolio-service. ledger-db and redis-cache are the two shared nodes through which a neighbour could injure portfolio-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "{\"from\":\"portfolio-service\",\"to\":\"ledger-db\",\"kind\":\"db\""
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "{\"name\":\"ledger-db\",\"type\":\"postgres\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "{\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    }
+  ],
+  "termination_reason": "critic_disabled",
+  "stats": {
+    "latency_s": 130.54,
+    "llm_calls": 12,
+    "prompt_tokens": 69538,
+    "completion_tokens": 16033,
+    "total_tokens": 85571,
+    "tool_calls": 22,
+    "tool_attempts": 22,
+    "tool_failures": 0,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 3,
+    "tasks_failed": 0,
+    "findings": 18,
+    "findings_verified": 18,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 1,
+        "prompt_tokens": 828,
+        "completion_tokens": 639
+      },
+      "observability": {
+        "calls": 4,
+        "prompt_tokens": 36080,
+        "completion_tokens": 3690
+      },
+      "dependency": {
+        "calls": 5,
+        "prompt_tokens": 22641,
+        "completion_tokens": 4907
+      },
+      "reasoning": {
+        "calls": 1,
+        "prompt_tokens": 4767,
+        "completion_tokens": 2697
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 5222,
+        "completion_tokens": 4100
+      }
+    }
+  },
+  "warnings": [
+    "critic disabled (ablation); analysis unreviewed, confidence capped at 0.6",
+    "fact demoted to assumption: Onset (09:50-09:52Z) is 110 minutes after the 08:00Z gateway HTTP/2 deploy but c"
+  ]
+}

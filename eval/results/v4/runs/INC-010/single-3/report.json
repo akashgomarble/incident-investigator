@@ -1,0 +1,599 @@
+{
+  "incident_id": "INC-010",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "settlement-service stopped posting settlements because order-service's v2.16.0 deploy (dep-6010, 07:40) renamed the OrderExecuted field qty->quantity and bumped the schema header to v2, while settlement-service still deserializes v1. Every v2 message fails with 'missing required field qty (schema v1 expected, header says v2)', and the first bad offset (orders-3@8841207) becomes a poison message that blocks partition orders-3, halting consumption. Consumer lag grew from ~40 to ~60,713 and request_rate collapsed from ~62 to ~0.4 req/s starting in the 07:42 bucket — exactly matching the 07:40 deploy, 7 minutes AFTER the settlement config change (07:35), which produced no degradation. The reported config change (consumer.max.poll.records 500->200) is a red herring. Resource metrics are flat (memory ~50%, db_pool ~6, restarts 0, order-service error_rate ~0.2%), ruling out resource/infra causes. Root cause: bad_deployment originating in order-service.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "order-service v2.16.0 schema change broke settlement-service consumer (field rename qty->quantity)",
+      "statement": "order-service deploy dep-6010 (v2.16.0) renamed OrderExecuted.qty to 'quantity' and bumped the event header to schema v2 at 07:40. settlement-service still expects v1 (qty), so every v2 message fails deserialization; the offending offset orders-3@8841207 becomes a poison message that blocks partition orders-3, halting the consumer and causing lag to grow unbounded while zero settlements post.",
+      "category": "bad_deployment",
+      "root_cause_service": "order-service",
+      "trigger_change_id": "dep-6010",
+      "confidence": 0.86,
+      "pre_cap_confidence": 0.86,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-6010 (v2.16.0) renames qty->quantity and sets header v2",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "settlement-service deserializer expects v1 -> 'missing required field qty'",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "failed offset becomes poison message, partition orders-3 blocked",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "consumer stops -> request_rate collapses to ~0.4",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "consumer_lag grows monotonically; zero settlements posted",
+          "finding_ids": [
+            "F4"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F12"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "settlement-service is the only/handling consumer of OrderExecuted on orders-3",
+        "no consumer-side v2 support was deployed (no settlement-service deploy found)"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "settlement-service poll-settings change cfg-3004 caused stall",
+      "statement": "The consumer.max.poll.records change (500->200) at 07:35 slowed polling enough to grow lag.",
+      "category": "config_change",
+      "root_cause_service": "settlement-service",
+      "trigger_change_id": "cfg-3004",
+      "confidence": 0.06,
+      "pre_cap_confidence": 0.06,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "cfg-3004 lowers poll size",
+          "finding_ids": [
+            "F6"
+          ]
+        },
+        {
+          "claim": "reduced polling would slowly grow lag",
+          "finding_ids": []
+        }
+      ],
+      "supporting_evidence": [
+        "F6"
+      ],
+      "contradicting_evidence": [
+        "F2",
+        "F4",
+        "F5",
+        "F12"
+      ],
+      "assumptions": [],
+      "rejection_reason": "cfg-3004 at 07:35 did NOT change lag/throughput: lag stayed flat (~40-64) through 07:33 and request_rate stayed ~62; divergence starts only at 07:42, matching the 07:40 order-service deploy. A poll-batch change cannot produce 'missing required field qty' deserialization errors. Also cfg-3004 reduces batch size, which cannot explain a totally blocked partition."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Kafka broker/partition failure blocked the consumer",
+      "statement": "A broker or partition infrastructure failure blocked consumption of orders-3.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "kafka",
+      "trigger_change_id": null,
+      "confidence": 0.04,
+      "pre_cap_confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F2",
+        "F3",
+        "F10"
+      ],
+      "assumptions": [],
+      "rejection_reason": "kafka logs show only one unrelated connection-reset WARN; no broker errors. The block is explained by a deterministic app-level poison message (orders-3@8841207) with explicit deserialize errors, not a broker outage."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Resource exhaustion on settlement-service",
+      "statement": "CPU/memory/DB pool exhaustion stalled the consumer.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "settlement-service",
+      "trigger_change_id": null,
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F8",
+        "F9"
+      ],
+      "assumptions": [],
+      "rejection_reason": "memory ~50% flat, db_pool ~6 flat, restarts 0. CPU rose only after 07:42, consistent with a hot poison-message retry loop downstream of the deserialize failure, not a cause."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "order-service dep-6010 v2.16.0 deployed 07:40 renamed qty->quantity and set schema header v2.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "settlement-service logged 'missing required field qty (schema v1 expected, header says v2)' starting 07:42:14Z.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "The failed offset became a poison message blocking partition orders-3.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "settlement-service consumer_lag jumped from flat ~40 to 2169 avg in the 07:42 bucket and reached 60713.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "settlement-service request_rate collapsed from ~62 to ~0.4 req/s at 07:42.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "settlement config change cfg-3004 lowered max.poll.records 500->200 at 07:35, before the divergence.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "order-service stayed healthy (flat request_rate ~231 req/s, ~0.2% error rate).",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "settlement-service resource metrics show no exhaustion (memory ~50%, db_pool ~6, restarts 0).",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "settlement-service CPU rose to ~70% only after 07:42 (retry-loop symptom).",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "kafka logs show no broker failure signal.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "No settlement-service deployments occurred in the window.",
+      "finding_ids": [
+        "F11"
+      ]
+    }
+  ],
+  "assumptions": [
+    "settlement-service is the consumer of the orders topic and the only handler of OrderExecuted on orders-3",
+    "no settlement-service-side v2 deserializer support was shipped (no settlement deploy found in window)",
+    "order-service continued publishing v2-format events throughout the window (it was healthy and processing traffic)"
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-12T07:35:00Z",
+      "event": "settlement-service config cfg-3004: consumer.max.poll.records 500->200 (no immediate effect)",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:40:00Z",
+      "event": "order-service deploys v2.16.0 (dep-6010): qty->quantity, schema header v2",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:42:14Z",
+      "event": "settlement-service first deserialization error 'missing required field qty (v1 expected, header v2)' on orders-3@8841207",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:42:00Z",
+      "event": "consumer_lag spikes to avg 2169; request_rate collapses to ~0.4 req/s",
+      "finding_ids": [
+        "F4",
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:44:51Z",
+      "event": "poison-message retries with 'partition blocked' on orders-3@8841207 begin",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-05-12T08:22:00Z",
+      "event": "Incident reported (settlements stuck ~40 min)",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-05-12T09:57:00Z",
+      "event": "consumer_lag reaches 60713 and still climbing",
+      "finding_ids": [
+        "F4"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back or hotfix order-service dep-6010 to emit qty (v1) or dual-write both fields, and simultaneously ship a v2-aware deserializer in settlement-service",
+      "priority": "immediate",
+      "rationale": "The v2 messages are the direct cause of deserialize failures; restoring a compatible contract unblocks consumption.",
+      "finding_ids": [
+        "F1",
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Skip/quarantine the poison offset orders-3@8841207 (or DLQ the offending event) so partition orders-3 can resume",
+      "priority": "immediate",
+      "rationale": "The single blocked offset is halting the entire partition; bypassing it restores throughput for the rest of the stream.",
+      "finding_ids": [
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add consumer schema-compatibility/contract tests and a schema registry so producer field renames cannot silently break consumers",
+      "priority": "long_term",
+      "rationale": "A rename with a version header mismatch should be caught in CI or enforced by a registry.",
+      "finding_ids": [
+        "F1",
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add poison-message/DLQ alerting and a max-retry cap so a stuck partition pages before lag reaches tens of thousands",
+      "priority": "short_term",
+      "rationale": "Retries ran into the tens of thousands of attempts before anyone noticed; earlier detection limits blast radius.",
+      "finding_ids": [
+        "F3",
+        "F4"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Do NOT attribute the incident to cfg-3004; document it as a red herring and keep the poll-settings change",
+      "priority": "short_term",
+      "rationale": "Timing shows cfg-3004 predates divergence and produced no degradation; reverting it would not fix the incident.",
+      "finding_ids": [
+        "F6",
+        "F12"
+      ],
+      "hypothesis_id": "H2"
+    }
+  ],
+  "data_gaps": [
+    "settlement-service log query returned truncated:true (409 ERROR matches, 40 shown) — full set not inspected, though the two dominant patterns are consistent across the window",
+    "No direct producer-side record of the message bytes on orders-3 was available; the v1/v2 mismatch is inferred from the consumer's explicit error message plus the deploy's change summary",
+    "No explicit metric for settlements posted count was available; zero-settlement symptom is taken from the incident report and the request_rate collapse"
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service deployed v2.16.0 at 07:40:00Z which renamed the OrderExecuted field 'qty'->'quantity', added field 'venue', and set event schema version header v2.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "rename field qty -> quantity"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-12T07:40:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service began emitting deserialization errors at 07:42:14Z: 'missing required field qty (schema v1 expected, header says v2)' on orders-3@8841207.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "missing required field 'qty' (schema v1 expected, header says v2)"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:14Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service then logged poison-message retries with 'partition blocked' on the same offset orders-3@8841207 starting 07:44:51Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "poison message: retrying orders-3@8841207"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:44:51Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service consumer_lag was flat (~40-64) through 07:33:00Z, then jumped to avg 2169 (max 3865) in the 07:42 bucket and climbed monotonically to 60713 at 09:57.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":2169.37,\"max\":3865.43}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service request_rate collapsed from ~62 req/s through 07:33 to ~0.4 req/s from the 07:42 bucket onward.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":0.4,\"max\":0.44}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A config change cfg-3004 on settlement-service lowered consumer.max.poll.records from 500 to 200 at 07:35:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"key\":\"consumer.max.poll.records\",\"old_value\":500,\"new_value\":200"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:35:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service remained healthy after its deploy: request_rate stayed flat (~231 req/s) and error_rate stayed ~0.2% across the incident window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"last\":249.07"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"mean\":0.22"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-12T09:57:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "settlement-service resource metrics show no exhaustion: memory_pct ~50% flat, db_pool_in_use ~6 flat, restarts 0 throughout.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"mean\":49.87"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "\"mean\":5.99"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"max\":0.0"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:57:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "settlement-service CPU rose from ~28% to ~70% in the 07:42 bucket and stayed elevated, consistent with a hot retry loop rather than a resource shortage.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":69.34,\"max\":72.4}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "kafka logs contain only a single unrelated WARN (idempotent retry after connection reset at 09:51) — no broker/partition failure signal.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "retrying idempotent request (attempt 2) after connection reset"
+        }
+      ],
+      "services": [
+        "kafka"
+      ],
+      "time": "2026-05-12T09:51:04Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "There were no deployments to settlement-service in the window (count 0).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Lag/throughput divergence onset (07:42) coincides with the order-service v2 deploy (07:40) and is 7 minutes after the settlement config change (07:35), which itself produced no immediate degradation.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"avg\":2169.37"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "2026-05-12T07:40:00Z"
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "order-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 47.5,
+    "llm_calls": 5,
+    "prompt_tokens": 49580,
+    "completion_tokens": 6656,
+    "total_tokens": 56236,
+    "tool_calls": 19,
+    "tool_attempts": 19,
+    "tool_failures": 0,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 12,
+    "findings_verified": 12,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 5,
+        "prompt_tokens": 49580,
+        "completion_tokens": 6656
+      }
+    }
+  },
+  "warnings": []
+}

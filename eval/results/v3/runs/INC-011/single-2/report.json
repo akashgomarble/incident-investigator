@@ -1,0 +1,537 @@
+{
+  "incident_id": "INC-011",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order quote timeouts originate in pricing-engine, not the reported order-service or market-data-service. A config/feature-flag change cfg-3120 at 12:04Z ramped flags.pricing.greeks_v2.rollout_pct from 5% to 100%, routing all quote traffic through the expensive GreeksV2 Monte-Carlo calculator (2.9-8.9s per quote). pricing-engine CPU jumped from ~40% to ~99% (with request rate flat), quote deadlines (2000ms budget) were exceeded, p99 rose to ~2.6s and 5xx to ~12.5%, and order-service quote calls timed out at 2500ms starting 12:06:10Z. The market-data-service protobuf serialization deploy (dep-6111, 11:56Z) is a temporal red herring: its latency/CPU stayed flat and the onset follows the flag ramp, not the deploy. Root cause category: config_change.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "greeks_v2 flag ramp to 100% saturated pricing-engine CPU, causing quote deadline misses",
+      "statement": "Config change cfg-3120 at 12:04Z ramped flags.pricing.greeks_v2.rollout_pct from 5% to 100%, so the expensive GreeksV2 Monte-Carlo calculator (2.9-8.9s per quote) ran for all traffic, pinning pricing-engine CPU at ~99%. Quotes exceeded the 2000ms budget and pricing-engine returned latency/errors, so order-service quote calls hit their 2500ms timeout. Fault originates at pricing-engine (config_change).",
+      "category": "config_change",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": "cfg-3120",
+      "confidence": 0.88,
+      "pre_cap_confidence": 0.88,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-3120 ramps greeks_v2 to 100% at 12:04Z",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "GreeksV2 Monte-Carlo runs for all traffic, taking multi-second per quote",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "pricing-engine CPU saturates ~99% with flat request rate",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "quote deadline (2000ms) exceeded -> p99 ~2.6s, 5xx ~12.5%",
+          "finding_ids": [
+            "F4",
+            "F6"
+          ]
+        },
+        {
+          "claim": "order-service quote calls time out at 2500ms",
+          "finding_ids": [
+            "F1",
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F10",
+        "F11"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The 5%->100% ramp is what newly routed the expensive GreeksV2 path; the calculator itself was already deployed but only sampled."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "market-data-service protobuf serialization deploy degraded quote path",
+      "statement": "Deployment dep-6111 (market-data-service v5.2.0, protobuf quote serialization) at 11:56Z caused pricing-engine quote slowdowns leading to order-service timeouts.",
+      "category": "bad_deployment",
+      "root_cause_service": "market-data-service",
+      "trigger_change_id": "dep-6111",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "dep-6111 deploys protobuf serialization at 11:56Z",
+          "finding_ids": [
+            "F8"
+          ]
+        },
+        {
+          "claim": "market-data-service would show latency degradation",
+          "finding_ids": []
+        },
+        {
+          "claim": "pricing-engine quote latency rises",
+          "finding_ids": [
+            "F4"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F8"
+      ],
+      "contradicting_evidence": [
+        "F7",
+        "F3",
+        "F2"
+      ],
+      "assumptions": [
+        "Serialization overhead could be CPU-bound in pricing-engine even without market-data-service degradation."
+      ],
+      "rejection_reason": "market-data-service latency (~40ms) and CPU (~45%) are flat across the window (F7); onset is 12:05-12:06 (F3), ~10 min after the 11:56 deploy and ~immediately after the 12:04 flag ramp (F2). The deploy is a temporal red herring."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Capacity saturation from market-open load",
+      "statement": "pricing-engine was overwhelmed by organic request-volume growth (as in HIST-113), exhausting provisioned capacity.",
+      "category": "capacity_saturation",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": null,
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "request volume grew, saturating pricing-engine",
+          "finding_ids": []
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F5"
+      ],
+      "assumptions": [],
+      "rejection_reason": "request_rate is flat ~635-661 req/s before and after onset (F5/tc-013); the CPU rise coincides with the flag ramp, not with a traffic increase."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "order-service quote timeouts started 12:06:10Z (225 errors of 'pricing-engine quote call timed out after 2500ms').",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "Config change cfg-3120 ramped greeks_v2.rollout_pct 5->100 at 12:04:00Z.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "GreeksV2 Monte-Carlo computations took 2.9-8.9s and quote deadlines (2000ms budget) began being exceeded at 12:05:21Z.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "pricing-engine p99 latency rose from ~60ms to ~2600-2800ms and error_rate to ~12.5%, while request_rate stayed flat ~640 req/s.",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F6"
+      ]
+    },
+    {
+      "statement": "market-data-service latency and CPU stayed flat across the incident window.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "The only deployment was market-data-service dep-6111 at 11:56Z (protobuf serialization), preceding symptoms by ~10 minutes.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "pricing-engine memory stayed ~49% and restarts stayed 0, indicating no node/memory failure.",
+      "finding_ids": [
+        "F9"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The greeks_v2 flag controls whether quotes use the GreeksV2 calculator; at 5% only a fraction of traffic paid the cost, so CPU stayed ~40%.",
+    "The 2000ms pricing-engine deadline and 2500ms order-service timeout are as logged."
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-20T11:56:00Z",
+      "event": "market-data-service dep-6111 (protobuf serialization) deployed",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:04:00Z",
+      "event": "cfg-3120 ramps greeks_v2 rollout_pct 5->100 on pricing-engine",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:05:21Z",
+      "event": "First GreeksV2 Monte-Carlo slow log (6465ms) on pricing-engine",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:06:10Z",
+      "event": "First order-service quote timeout (2500ms)",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:10:00Z",
+      "event": "pricing-engine CPU ~99%, p99 ~2.6s, 5xx ~12.5% sustained",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F6"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back cfg-3120 (set flags.pricing.greeks_v2.rollout_pct back toward 5%) to restore pricing-engine CPU and quote latency.",
+      "priority": "immediate",
+      "rationale": "Onset coincides exactly with the 5%->100% ramp; reverting should remove the CPU saturation.",
+      "finding_ids": [
+        "F2",
+        "F4",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "If rollback is not possible, shed/limit GreeksV2 traffic or scale pricing-engine replicas temporarily.",
+      "priority": "immediate",
+      "rationale": "CPU is pinned at ~99%; adding capacity or reducing load restores headroom.",
+      "finding_ids": [
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Optimize or bound the GreeksV2 Monte-Carlo calculator (reduce paths or cache) before re-ramping.",
+      "priority": "short_term",
+      "rationale": "20000-path Monte-Carlo takes multi-second per quote, far above the 2000ms budget.",
+      "finding_ids": [
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a canary/gradual-ramp guard with CPU and p99 SLO gates for pricing feature-flag rollouts.",
+      "priority": "long_term",
+      "rationale": "A 5%->100% single-step ramp on a CPU-heavy path bypassed any staged validation.",
+      "finding_ids": [
+        "F2",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "config-audit shard 2/3 did not respond on first query (tc-004 partial); a second query returned the single cfg-3120 change, but a config change in the missing shard cannot be fully excluded.",
+    "No pre-12:04 log lines explicitly stating the greeks_v2 effective rollout percentage beyond the single applied-change line (tc-016)."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service began emitting 'pricing-engine quote call timed out after 2500ms' errors at 12:06:10Z, sustained through 13:58Z (225 such errors).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "pricing-engine quote call timed out after 2500ms orderId=4bd44879"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-20T12:06:10Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Config change cfg-3120 on pricing-engine ramped feature flag flags.pricing.greeks_v2.rollout_pct from 5 to 100 at 12:04:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "Ramp Greeks v2 experiment to all traffic"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "config change cfg-3120 applied: flags.pricing.greeks_v2.rollout_pct=100"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:04:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine logs show GreeksV2Calculator Monte-Carlo computations taking 2964-8942ms (paths=20000), and 'request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2' errors, starting at 12:05:21Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "GreeksV2Calculator: Monte-Carlo paths=20000 took 6465ms for symbol opt-41547"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:21Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/2 refs verified (tc-016: quote not found in tool output)"
+    },
+    {
+      "statement": "pricing-engine latency_p99_ms jumped from ~60ms (11:30-11:50) to 1325ms avg in the 12:00 bucket and ~2600-2700ms sustained thereafter, max 2849ms.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "\"ts\":\"2026-05-20T12:00:00Z\",\"avg\":1325.03,\"max\":2849.25"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:00:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine cpu_pct rose from ~40% (11:30-11:50) to avg 99.27% at 12:10 and stayed ~99% through 13:59 (max 100%), while request_rate remained flat ~635-661 req/s.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":99.27,\"max\":100.0"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":642.33,\"max\":686.94"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:10:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine error_rate (HTTP 5xx) rose from ~0.2% to 12.55% avg at 12:10 and stayed ~12.4-12.7% through 13:59.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":12.55,\"max\":13.25"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:10:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service latency_p99_ms stayed flat ~40ms and cpu_pct flat ~45% across 11:30-13:59 (no degradation).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":39.34,\"max\":40.77"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":45.73,\"max\":46.9"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T12:10:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only deployment in window is dep-6111 (market-data-service v5.2.0, 'Switch quote serialization to protobuf') deployed at 11:56:00Z, not rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"deployed_at\":\"2026-05-20T11:56:00Z\",\"author\":\"v.rao\",\"summary\":\"Switch quote serialization to protobuf\""
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T11:56:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine memory_pct stayed flat ~49% and restarts stayed at 0 across the whole window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "\"ts\":\"2026-05-20T12:10:00Z\",\"avg\":49.18,\"max\":50.84"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"avg\":0.0,\"max\":0.0"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:10:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service depends on pricing-engine via HTTP; pricing-engine depends on market-data-service via HTTP.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"from\":\"order-service\",\"to\":\"pricing-engine\",\"kind\":\"http\"}"
+        }
+      ],
+      "services": [
+        "order-service",
+        "pricing-engine",
+        "market-data-service"
+      ],
+      "time": null,
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Inference: the fault propagates order-service -> pricing-engine, where the CPU-bound GreeksV2 Monte-Carlo calculator exceeds the 2000ms quote deadline, so order-service quote calls hit their 2500ms timeout.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "pricing-engine quote call timed out after 2500ms"
+        }
+      ],
+      "services": [
+        "order-service",
+        "pricing-engine"
+      ],
+      "time": null,
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 38.95,
+    "llm_calls": 5,
+    "prompt_tokens": 52938,
+    "completion_tokens": 6480,
+    "total_tokens": 59418,
+    "tool_calls": 19,
+    "tool_attempts": 19,
+    "tool_failures": 0,
+    "tool_partial": 1,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 11,
+    "findings_verified": 11,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 5,
+        "prompt_tokens": 52938,
+        "completion_tokens": 6480
+      }
+    }
+  },
+  "warnings": []
+}

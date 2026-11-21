@@ -1,0 +1,955 @@
+{
+  "incident_id": "INC-011",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The top hypothesis (confidence 0.55, medium) is that config change cfg-3120 on pricing-engine — ramping flags.pricing.greeks_v2.rollout_pct from 5 to 100 at 12:04Z — moved all quote computation onto the CPU-expensive GreeksV2 calculator path, saturating pricing-engine CPU (~40%→99%) and pushing p99 from ~60ms to ~2.6s, which blew order-service's 2000ms quote budget. This is clearly ahead of the field (next: organic capacity saturation at 0.30) and is supported by co-timed CPU/latency onset, an error signature explicitly naming calculator=GreeksV2, and the market-data-service deploy (dep-6111) showing zero errors. Confidence is capped at medium because the metric bucket size (420s) prevents ordering cfg-3120's 12:04 timestamp against the true onset within the 11:58→12:05 interval, so a purely organic volume-driven saturation cannot be fully excluded. We recommend an immediate rollback of cfg-3120 to 5% (or pausing the GreeksV2 ramp) as a safe, reversible mitigation, with request_rate/depth checks run in parallel to discriminate H1 from H2.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "cfg-3120 GreeksV2 100% ramp saturated pricing-engine CPU",
+      "statement": "Config change cfg-3120 on pricing-engine ramped flags.pricing.greeks_v2.rollout_pct from 5 to 100 at 12:04Z, switching all quote computation to the GreeksV2 calculator path. GreeksV2 is materially more CPU-expensive than the prior default, so pricing-engine CPU went from ~40% to ~99% and per-request compute latency rose to ~2.6s, blowing the 2000ms quote budget. order-service, which calls pricing-engine synchronously for quotes, then timed out.",
+      "category": "config_change",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": "cfg-3120",
+      "confidence": 0.55,
+      "pre_cap_confidence": 0.55,
+      "confidence_label": "medium",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-3120 ramps greeks_v2.rollout_pct 5->100 on pricing-engine at 12:04Z, routing all quote traffic to the GreeksV2 calculator",
+          "finding_ids": [
+            "F8",
+            "F14"
+          ]
+        },
+        {
+          "claim": "GreeksV2 computation is more expensive, driving pricing-engine CPU from ~40% to 99-100% saturated",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "CPU saturation raises per-request quote compute time, p99 60ms -> ~2600ms, exceeding the 2000ms budget",
+          "finding_ids": [
+            "F4",
+            "F2"
+          ]
+        },
+        {
+          "claim": "order-service's synchronous pricing-engine quote call then exceeds its 2500ms client timeout",
+          "finding_ids": [
+            "F1",
+            "F10",
+            "F15"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F8",
+        "F14",
+        "F5",
+        "F4",
+        "F2",
+        "F1",
+        "F10",
+        "F15"
+      ],
+      "contradicting_evidence": [
+        "F6"
+      ],
+      "assumptions": [
+        "GreeksV2 is more CPU-expensive than the preceding default path (not directly measured)",
+        "request_rate/depth did not also rise sharply at the same time (not checked)"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Organic capacity saturation (market-open quote volume) on pricing-engine, HIST-113-like",
+      "statement": "A surge in quote request volume/recursion depth exceeded provisioned pricing-engine capacity (CPU), pinning it at 99-100% and pushing p99 to ~2.6s. The GreeksV2 ramp is a coincidental bystander; the true trigger is load outgrowing provisioned capacity, exactly matching historical incident HIST-113 (same symptom pair, capacity_saturation, fixed by raising replicas).",
+      "category": "capacity_saturation",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": "null",
+      "confidence": 0.3,
+      "pre_cap_confidence": 0.3,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Quote request volume/load rises beyond provisioned pricing-engine capacity",
+          "finding_ids": []
+        },
+        {
+          "claim": "pricing-engine CPU saturates to 99-100%",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "p99 latency rises ~43x to ~2600ms, exceeding budget and client timeout",
+          "finding_ids": [
+            "F4",
+            "F2",
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F5",
+        "F4",
+        "F2",
+        "F1",
+        "F12",
+        "F17"
+      ],
+      "contradicting_evidence": [
+        "F8",
+        "F14"
+      ],
+      "assumptions": [
+        "A load/volume increase occurred in the 11:58-12:05 window (request_rate not queried)",
+        "cfg-3120's 12:04 timing is coincidental rather than causal"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "dep-6111 protobuf serialization change broke pricing-engine's parsing of market-data-service quotes",
+      "statement": "market-data-service v5.2.0 switched quote serialization to protobuf at 11:56Z. pricing-engine, which calls market-data-service on the quote path, cannot correctly parse the new payload, causing retries/wasteful fallback compute that saturates CPU and blows the compute deadline. The reporter's stated suspicion.",
+      "category": "bad_deployment",
+      "root_cause_service": "market-data-service",
+      "trigger_change_id": "dep-6111",
+      "confidence": 0.15,
+      "pre_cap_confidence": 0.15,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-6111 switches market-data-service quote payloads to protobuf at 11:56Z",
+          "finding_ids": [
+            "F7",
+            "F13"
+          ]
+        },
+        {
+          "claim": "pricing-engine (the caller) cannot parse/handle the new format, retrying or falling back and burning CPU",
+          "finding_ids": []
+        },
+        {
+          "claim": "pricing-engine CPU saturates and quote compute exceeds deadline",
+          "finding_ids": [
+            "F5",
+            "F2"
+          ]
+        },
+        {
+          "claim": "order-service quote call times out",
+          "finding_ids": [
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F7",
+        "F13",
+        "F10"
+      ],
+      "contradicting_evidence": [
+        "F3",
+        "F2",
+        "F14"
+      ],
+      "assumptions": [
+        "pricing-engine parses market-data-service payloads in a way incompatible with protobuf",
+        "the (de)serialization breakage manifests only as CPU-bound retries rather than parse errors"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Shared redis-cache degradation (cold cache / failover) on the quote path",
+      "statement": "redis-cache, shared by pricing-engine and market-data-service, degraded (cold cache or failover), forcing pricing-engine to recompute quotes from source and saturating CPU. Matches HIST-107 cold-cache storm precedent.",
+      "category": "dependency_failure",
+      "root_cause_service": "redis-cache",
+      "trigger_change_id": "null",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "redis-cache cold/failed, cache misses on the quote path",
+          "finding_ids": []
+        },
+        {
+          "claim": "pricing-engine recomputes from source, driving CPU to 99%",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "quote latency blows budget -> order-service timeout",
+          "finding_ids": [
+            "F2",
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F11",
+        "F12",
+        "F17"
+      ],
+      "contradicting_evidence": [
+        "F16",
+        "F2"
+      ],
+      "assumptions": [
+        "redis-cache actually degraded (no redis metrics were queried)"
+      ],
+      "rejection_reason": null
+    }
+  ],
+  "facts": [
+    {
+      "statement": "The first order-service quote timeout occurred at 12:06:10Z, with the message 'pricing-engine quote call timed out after 2500ms'; all 225 error logs in the window share a single timeout pattern (no serialization errors).",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "pricing-engine latency_p99_ms was stable at ~59-60ms through 11:58, then jumped to ~2600ms (max 2849ms) in the 12:05 bucket and stayed there.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "pricing-engine cpu_pct was ~40% through 11:58, then saturated to ~99% (max 100%) starting in the same 12:05 bucket and stayed pinned for the rest of the window.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "order-service latency_p99_ms rose from ~150ms baseline to ~2400-2970ms in the same 12:05 bucket, tracking the pricing-engine onset.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "Exactly one config/flag change existed in the window: cfg-3120 on pricing-engine, key flags.pricing.greeks_v2.rollout_pct 5 -> 100 at 12:04:00Z by pm-experiments ('Ramp Greeks v2 experiment to all traffic').",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "Only one deployment occurred across all services in 11:30-13:59: dep-6111, market-data-service v5.2.0 ('Switch quote serialization to protobuf'), deployed 11:56:00Z, status live, rolled_back_at null.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "market-data-service logged zero errors between 08:00Z and 13:59Z; its only log in that span was a benign TLS WARN at 11:43:53Z — no error or latency symptom despite the report blaming its serialization change.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "order-service's quote path is order-service -> pricing-engine -> market-data-service; order-service does not call market-data-service directly.",
+      "finding_ids": [
+        "F10",
+        "F15"
+      ]
+    },
+    {
+      "statement": "cfg-3120's timestamp (12:04:00Z) sits between the 11:58-12:05 latency/CPU onset bucket and is ~2 minutes before the first order-service quote timeout at 12:06:10Z.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "statement": "Historical precedents match the 'quote timeouts' + 'cpu 99%' pattern (HIST-113 capacity saturation; HIST-107 redis cold-cache storm; HIST-101 bad deployment); these are leads, not evidence about this incident.",
+      "finding_ids": [
+        "F17"
+      ]
+    },
+    {
+      "statement": "A complete retried get_config_changes returned exactly one config change (cfg-3120), following an initial partial result due to a config-audit shard being down.",
+      "finding_ids": [
+        "F9"
+      ]
+    }
+  ],
+  "assumptions": [
+    "ASSUMPTION: GreeksV2 is materially more CPU-expensive than the preceding default calculator path (statically inferred, not directly measured).",
+    "ASSUMPTION: request_rate / recursion depth did not also rise sharply at the same time (not checked), which is required to separate H1 from H2.",
+    "ASSUMPTION: cfg-3120 took effect promptly at 12:04:00Z rather than being batched/delayed.",
+    "ASSUMPTION: The absence of serialization errors established for ERROR-level streams of the three named services generalizes sufficiently to weaken H3.",
+    "ASSUMPTION: The retried complete get_config_changes (count 1) accurately enumerates the window's config changes despite the initial shard outage.",
+    "(demoted from facts: no verified observation backs it) Pricing-engine's first error at 12:06:41Z was a request deadline exceeded on the quote path (2000ms budget) with calculator=GreeksV2; all 276 pricing-engine errors share this identical pattern.",
+    "(demoted from facts: no verified observation backs it) redis-cache is a shared component of both pricing-engine and market-data-service; the pricing-engine failure mode is CPU saturation on the calculator, which a cache-miss storm would not by itself explain.",
+    "(demoted from facts: no verified observation backs it) The ranked candidate assessment identifies cfg-3120 as the leading candidate based on timing alignment with the CPU/latency onset, ownership of the degraded dependency, and the error naming calculator=GreeksV2."
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-20T11:43:53Z",
+      "event": "market-data-service emits its only log in the window — a benign TLS cipher WARN; no errors.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-05-20T11:56:00Z",
+      "event": "dep-6111 deployed: market-data-service v5.2.0 'Switch quote serialization to protobuf' (status live, never rolled back).",
+      "finding_ids": [
+        "F7",
+        "F13"
+      ]
+    },
+    {
+      "time": "2026-05-20T11:58:00Z",
+      "event": "Last baseline bucket: pricing-engine CPU ~40% (39.89) and p99 ~59ms (58.97); order-service p99 ~151ms.",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:04:00Z",
+      "event": "cfg-3120 applied on pricing-engine: flags.pricing.greeks_v2.rollout_pct ramped 5 -> 100 ('Ramp Greeks v2 experiment to all traffic').",
+      "finding_ids": [
+        "F8",
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:05:00Z",
+      "event": "Onset bucket: pricing-engine CPU saturates to ~99% (max 100%) and p99 jumps to ~2600ms in the same 420s bucket; order-service p99 rises to ~2400-2970ms.",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:06:10Z",
+      "event": "First order-service quote timeout: 'pricing-engine quote call timed out after 2500ms'.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:06:41Z",
+      "event": "Pricing-engine first error: 'request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2'.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:16:00Z",
+      "event": "Incident INC-011 reported by on-call SRE; pricing-engine CPU remained pinned ~99% and p99 ~2600-2700ms through end of window.",
+      "finding_ids": [
+        "F4",
+        "F5"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Immediately roll back cfg-3120: revert flags.pricing.greeks_v2.rollout_pct from 100 back to 5 (or 0) on pricing-engine to take traffic off the GreeksV2 calculator path.",
+      "priority": "immediate",
+      "rationale": "cfg-3120 is the only change aligned with the 11:58->12:05 CPU/latency onset and the 12:06:10 product failure; reverting is reversible, low-risk, and directly tests H1 by restoring the prior calculator path.",
+      "finding_ids": [
+        "F8",
+        "F14",
+        "F2",
+        "F4",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "In parallel, query pricing-engine request_rate / recursion depth / quote volume for 11:50-12:10 at the finest available resolution to test whether load rose independently of cfg-3120.",
+      "priority": "immediate",
+      "rationale": "Discriminates H1 (flag-driven CPU) from H2 (organic capacity saturation); without this the two remain indistinguishable on CPU metrics alone.",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F12",
+        "F17"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "After rollback, confirm recovery: verify pricing-engine cpu_pct returns toward ~40% and p99 returns to ~60ms, and that order-service quote timeouts cease.",
+      "priority": "short_term",
+      "rationale": "Validates that cfg-3120 was the cause; failure to recover would point to H2 (capacity) or a shared-component cause (H4).",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F1",
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Do NOT roll back dep-6111 (market-data-service v5.2.0) as a first action; if it remains suspect, first check pricing-engine for parse/(de)serialization errors on the market-data-service call path before acting.",
+      "priority": "short_term",
+      "rationale": "market-data-service shows zero errors (F3) and is only transitively on order-service's path (F10/F15), so it is a weak candidate; an unwarranted rollback could destabilize other callers.",
+      "finding_ids": [
+        "F3",
+        "F7",
+        "F10",
+        "F15",
+        "F13"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Query redis-cache (and ledger-db/kafka) cache-hit/miss, latency, and availability metrics for the window to confirm/deny a shared-datastore contribution.",
+      "priority": "short_term",
+      "rationale": "Closes the shared-component hypothesis (H4, HIST-107 precedent); a cache-miss storm would show miss/latency symptoms, not calculator CPU saturation.",
+      "finding_ids": [
+        "F11",
+        "F12",
+        "F16",
+        "F17"
+      ],
+      "hypothesis_id": "H4"
+    },
+    {
+      "action": "If load (not the flag) is the driver, raise pricing-engine replica count / CPU allocation as the mitigation, mirroring the HIST-113 resolution.",
+      "priority": "short_term",
+      "rationale": "Provides the alternative remedy if request_rate confirms organic capacity saturation (H2).",
+      "finding_ids": [
+        "F12",
+        "F17"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Adopt guarded rollout for CPU-heavy calculator experiment flags: require canary/staged ramp with CPU and p99 SLO gates and automatic rollback instead of a 5->100 jump.",
+      "priority": "long_term",
+      "rationale": "Prevents recurrence of an instant all-traffic ramp onto a CPU-expensive path (the cfg-3120 5->100 change).",
+      "finding_ids": [
+        "F8",
+        "F14"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Instrument pricing-engine per-calculator CPU cost/latency and alarm on calculator-path CPU saturation and quote p99 breaching budget, with correlation to in-flight config changes.",
+      "priority": "long_term",
+      "rationale": "Would have caught the GreeksV2 CPU cost directly and made CPU/flag correlation explicit, addressing the measurement gap behind the H1/H2 ambiguity.",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "pricing-engine memory_pct, error_rate, request_rate, restarts, and thread/pool metrics were not queried; memory/pool/thread exhaustion or restarts on the quote path cannot be ruled out.",
+    "Metric bucketing at 420s prevents resolving the true onset below the 11:58->12:05 interval, so cfg-3120 (12:04) cannot be definitively ordered against onset — the key limitation for H1 vs H2.",
+    "No metric queries were run for pricing-engine, market-data-service, redis-cache, ledger-db, or kafka dependencies, so no dependency-level metric evidence exists to confirm/deny a shared-component cause.",
+    "Serialization-error absence is established only for ERROR-level streams of the three named services; a broad multi-service/multi-level scan was not performed.",
+    "The initial get_config_changes was partial (config-audit shard 2/3 down); enumeration relies on the retry, leaving residual risk of an unseen config change.",
+    "No deployment diff/compatibility data for the dep-6111 protobuf switch, so whether it broke internal callers (e.g. pricing-engine parsing) is unconfirmed.",
+    "No historical precedent with a serialization/payload-incompatibility root cause was found, so H3 has no confirming precedent either way."
+  ],
+  "what_would_change_the_conclusion": [
+    "Evidence that quote request_rate/recursion depth rose sharply at ~12:04-12:05 independent of cfg-3120, which would favor organic capacity saturation (H2) and demote the config change to a coincidental bystander.",
+    "Demonstration that reverting cfg-3120 does NOT restore CPU/p99/latency, which would falsify H1.",
+    "Pricing-engine logs/metrics showing parse or (de)serialization errors on the market-data-service call path, which would revive H3.",
+    "redis-cache (or ledger-db/kafka) metrics showing a cold-cache/failover storm coincident with onset, which would support H4.",
+    "Pricing-engine memory/thread/pool saturation or restarts coincident with onset, indicating a cause other than the GreeksV2 computation path.",
+    "Finer-resolution metrics showing CPU/latency onset clearly BEFORE 12:04 (i.e. before cfg-3120), which would undercut H1's causal timing."
+  ],
+  "findings": [
+    {
+      "statement": "First order-service quote timeout occurred at 2026-05-20T12:06:10Z (\"pricing-engine quote call timed out after 2500ms orderId=4bd44879\"), about 10 minutes before the 12:16 report. All 225 error logs in the window share the single pattern 'pricing-engine quote call timed out after <n>ms'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "2026-05-20T12:06:10Z"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-20T12:06:10Z",
+      "id": "F1",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Pricing-engine emitted its first error at 2026-05-20T12:06:41Z — 'request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2' — all 276 errors share this identical pattern; the downstream-error signature is a deadline/timeout, not a (de)serialization failure.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "computed quote (2000ms budget) calculator=GreeksV"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:06:41Z",
+      "id": "F2",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": false,
+      "verification_note": "0/1 refs verified (tc-006: quote not found in tool output)"
+    },
+    {
+      "statement": "market-data-service logged ZERO errors between 08:00Z and 13:59Z; its only log of any level in this span is a single benign WARN 'deprecated TLS cipher offered by client' at 11:43:53Z. It shows no error/latency symptom despite the report blaming its serialization change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "total_matched\":0"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "deprecated TLS cipher offered by client"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T11:43:53Z",
+      "id": "F3",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine latency_p99_ms was stable ~59-60ms through 11:58 (11:58 avg 58.97), then jumped to avg 2609.71 / max 2849.25 in the 12:05 bucket and stayed ~2600-2700ms thereafter. Onset is between 11:58 and 12:05, and 2600ms is ~43x the baseline. (420s buckets, so exact minute within 12:05-12:12 is not resolvable at this resolution.)",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "11:58:00Z\",\"avg\":58.97"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "12:05:00Z\",\"avg\":2609.71"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F4",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine cpu_pct was ~40% through 11:58 (11:58 avg 39.89), then saturated to avg 99.11-99.33% / max 100% starting in the 12:05 bucket and remained pinned ~99% for the rest of the window — i.e. CPU saturation and the latency jump start in the same 12:05 bucket.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "12:05:00Z\",\"avg\":99.11"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F5",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service latency_p99_ms rose from ~149-154ms baseline (11:58 avg 150.91) to avg 2433-2972ms in the same 12:05 bucket, tracking the pricing-engine onset; order-service available metrics include db_pool_in_use and restarts (not yet examined).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "12:05:00Z\",\"avg\":2433.45"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F6",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Only one deployment occurred across ALL services in 11:30-13:59: dep-6111, market-data-service v5.2.0, deployed 2026-05-20T11:56:00Z by v.rao, 'Switch quote serialization to protobuf' / 'protobuf quote payloads for internal callers', status live, rolled_back_at null (i.e., NOT rolled back as of 13:59).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "dep-6111"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "Switch quote serialization to protobuf"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T11:56:00Z",
+      "id": "F7",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Exactly one config/flag change was found in the window across all services: cfg-3120 on pricing-engine, key flags.pricing.greeks_v2.rollout_pct, changed 5 -> 100 at 2026-05-20T12:04:00Z by pm-experiments ('Ramp Greeks v2 experiment to all traffic') -- 8 minutes after the market-data-service deploy and 12 minutes before the incident was reported at 12:16Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "cfg-3120"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "flags.pricing.greeks_v2.rollout_pct"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "changed_at\":\"2026-05-20T12:04:00Z"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:04:00Z",
+      "id": "F8",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The first get_config_changes call was INCOMPLETE (config-audit shard 2/3 did not respond); the retry returned partial:false with scope 'all services' and count 1, so the single cfg-3120 change is from a complete result.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "config-audit shard 2/3 did not respond"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"partial\":false"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": null,
+      "id": "F9",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service quote path dependency graph: order-service -> pricing-engine (http), -> ledger-db (db), -> exchange-gateway (http), -> kafka (queue-produce); pricing-engine -> market-data-service (http) and -> redis-cache (cache). So order-service's quote does NOT call market-data-service directly -- it goes order-service -> pricing-engine -> market-data-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"from\":\"order-service\",\"to\":\"pricing-engine\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"market-data-service\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [
+        "order-service",
+        "pricing-engine",
+        "market-data-service"
+      ],
+      "time": null,
+      "id": "F10",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Shared components in the quote path: redis-cache is marked shared:true and is a dependency of BOTH pricing-engine (cache) and market-data-service (cache); ledger-db and kafka are also shared:true. market-data-service additionally calls exchange-gateway (http) and is called by portfolio-service and api-gateway.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "{\"from\":\"market-data-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "market-data-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F11",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Historical precedent search for quote-timeout/serialization patterns returned: HIST-113 (2026-01-28) pricing-engine CPU saturation at market open -> 'quote timeouts','cpu 99%', root cause 'Record market-open volume exceeded provisioned capacity' (capacity_saturation); HIST-107 (2025-12-09) Cold cache storm after redis failover, services redis-cache+market-data-service, symptoms 'cache miss storm','quote latency', root cause 'Redis primary failure promoted an empty replica'; HIST-101 (2025-08-14) auth-service bad_deployment root cause 'bcrypt cost factor raised 10->14 in release v6.4.0'. These are leads only.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "HIST-113"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "Cold cache storm after redis failover"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "bcrypt cost factor raised 10->14 in release v6.4.0"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F12",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The only code deployment in 11:30-13:59 across ALL services is dep-6111: market-data-service v5.2.0, deployed 2026-05-20T11:56:00Z by v.rao, summary 'Switch quote serialization to protobuf', status 'live', rolled_back_at null. It precedes the first order-service quote timeout (12:06:10Z) by ~10 minutes but is NOT on order-service's direct call path (order-service does not call market-data-service directly; it reaches it only via pricing-engine).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "dep-6111"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "Switch quote serialization to protobuf"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "2026-05-20T11:56:00Z"
+        }
+      ],
+      "services": [],
+      "time": "2026-05-20T11:56:00Z",
+      "id": "F13",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The only config/flag change in the window is cfg-3120 on pricing-engine: flags.pricing.greeks_v2.rollout_pct changed 5 -> 100 at 2026-05-20T12:04:00Z by pm-experiments, 'Ramp Greeks v2 experiment to all traffic'. This timestamp sits BETWEEN the 11:58-12:05 latency/CPU onset bucket and is ~2 minutes before the first order-service quote timeout at 12:06:10Z. Note the pricing-engine error signature explicitly names the ramped calculator: 'calculator=GreeksV2'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "flags.pricing.greeks_v2.rollout_pct"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "12:04:00Z"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "Ramp Greeks v2 experiment to all traffic"
+        }
+      ],
+      "services": [],
+      "time": "2026-05-20T12:04:00Z",
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Dependency graph confirms order-service's quote path is order-service -> pricing-engine -> market-data-service (http), with pricing-engine also depending on redis-cache (cache) and market-data-service also depending on redis-cache. So market-data-service is only reachable from order-service transitively through pricing-engine.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"market-data-service\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "{\"from\":\"order-service\",\"to\":\"pricing-engine\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "{\"from\":\"market-data-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "redis-cache is a shared:true datastore with multiple upstream consumers (auth-service, portfolio-service, pricing-engine, market-data-service), so it is a plausible shared-component path; however T1 reported no serialization/deserialization errors and the pricing-engine failure mode is CPU saturation (99-100%) on GreeksV2 computation, which a cache miss storm would not by itself explain. A cold-cache storm (HIST-107) would be expected to show cache-miss symptoms, not 100% CPU pinned on the calculator.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"shared\":true"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedents for the exact symptom pair ('quote timeouts' + 'cpu 99%' on pricing-engine) exist: HIST-113 (2026-01-28) root cause 'Record market-open volume exceeded provisioned capacity' (capacity_saturation, resolution raised replica count). HIST-107 (2025-12-09) is a shared-redis cold-cache storm with 'quote latency'. HIST-101 (2025-08-14) is a bad_deployment whose symptom included 'high cpu'. These are leads only, not evidence about this incident.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "HIST-113"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "Record market-open volume exceeded provisioned capacity"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "HIST-107"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "RANKED CANDIDATE ASSESSMENT — (1) cfg-3120 GreeksV2 100% ramp at 12:04 is the leading candidate: it is the only change whose timing aligns with the 11:58->12:05 CPU/latency onset and the 12:06:10 product-visible failure, its owner service is the degraded dependency, and the error names calculator=GreeksV2. Supporting: pricing-engine CPU 40%->99% and p99 60ms->2600ms in the same bucket. (2) dep-6111 protobuf deploy at 11:56 is a weaker candidate: it predates onset by ~8 min and market-data-service shows zero errors (F3), contradicting a serialization defect there; the serialization change would also be expected to produce (de)serialization errors, which T1 found none of. (3) shared redis-cache is a lower-ranked shared-component hypothesis, unsupported so far because no cache-miss/latency signal from market-data-service or auth/portfolio was reported. (4) pure capacity saturation (HIST-113-like) cannot be excluded and would be indistinguishable from the flag ramp on CPU metrics alone.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "Ramp Greeks v2 experiment to all traffic"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "Switch quote serialization to protobuf"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "{\"from\":\"order-service\",\"to\":\"pricing-engine\",\"kind\":\"http\"}"
+        }
+      ],
+      "services": [],
+      "time": "2026-05-20T12:04:00Z",
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    }
+  ],
+  "termination_reason": "critic_disabled",
+  "stats": {
+    "latency_s": 97.2,
+    "llm_calls": 12,
+    "prompt_tokens": 55049,
+    "completion_tokens": 14327,
+    "total_tokens": 69376,
+    "tool_calls": 22,
+    "tool_attempts": 22,
+    "tool_failures": 0,
+    "tool_partial": 1,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 3,
+    "tasks_failed": 0,
+    "findings": 18,
+    "findings_verified": 17,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 1,
+        "prompt_tokens": 802,
+        "completion_tokens": 572
+      },
+      "dependency": {
+        "calls": 6,
+        "prompt_tokens": 26793,
+        "completion_tokens": 5284
+      },
+      "observability": {
+        "calls": 3,
+        "prompt_tokens": 17114,
+        "completion_tokens": 2856
+      },
+      "reasoning": {
+        "calls": 1,
+        "prompt_tokens": 5073,
+        "completion_tokens": 2075
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 5267,
+        "completion_tokens": 3540
+      }
+    }
+  },
+  "warnings": [
+    "critic disabled (ablation); analysis unreviewed, confidence capped at 0.6",
+    "fact demoted to assumption: Pricing-engine's first error at 12:06:41Z was a request deadline exceeded on the",
+    "fact demoted to assumption: redis-cache is a shared component of both pricing-engine and market-data-service",
+    "fact demoted to assumption: The ranked candidate assessment identifies cfg-3120 as the leading candidate bas"
+  ]
+}

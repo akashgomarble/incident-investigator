@@ -1,0 +1,658 @@
+{
+  "incident_id": "INC-001",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order placement on POST /v1/orders began returning HTTP 500 at ~12:12Z, ~2 minutes after order-service deployment dep-5101 (v2.14.0) completed its rollout at 12:10:08Z. The deploy added a new MarginCheckValidator and removed the legacy OrderRules.validateMargin(); its signature error is 'NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO' / 'marginProfile is null for account <n>', matching the reported derivatives (F&O) failures. The deploy is the only change correlated with onset and was never rolled back, so error_rate stayed at ~18.5% (vs ~0.2% before) through the latest data. All alternatives were excluded: latency/CPU/memory/db-pool/restarts and traffic are flat (not resource/capacity), and downstream dependencies (pricing-engine, exchange-gateway, portfolio-service, ledger-db) are healthy with zero error logs (not dependency failure). Root cause is a bad deployment in order-service.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "order-service deploy dep-5101 v2.14.0 introduced a NPE-prone MarginCheckValidator for F&O orders",
+      "statement": "The v2.14.0 refactor that replaced legacy OrderRules.validateMargin() with a new MarginCheckValidator left the margin profile unpublished/null for F&O orders, so MarginCheckValidator.validate() dereferences a null marginProfile and throws NullPointerException, causing POST /v1/orders to return HTTP 500. Because only F&O orders flow through the new code path, the failure is scoped to derivatives orders (~18% of traffic), and the deploy was never rolled back, so the failure persists.",
+      "category": "bad_deployment",
+      "root_cause_service": "order-service",
+      "trigger_change_id": "dep-5101",
+      "confidence": 0.92,
+      "pre_cap_confidence": 0.92,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5101 v2.14.0 deployed to order-service at 12:10:00Z, rollout complete 12:10:08Z",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "New MarginCheckValidator added to validation chain; legacy margin validation removed",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "Threshold: order-service error_rate rises 0.2% -> 18.5% in the 12:12 bucket",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "First MarginCheckValidator NPE logged at 12:12:31Z, only ~2.3 min after rollout",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "NPE 'marginProfile is null' is thrown on F&O (derivatives) orders, matching the reported derivatives-order 500s",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "No rollback (status live) so errors continue through 13:58Z",
+          "finding_ids": [
+            "F4",
+            "F5"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The marginProfile was previously populated for F&O orders under the removed legacy path, so this is a regression in the new validator rather than a pre-existing data gap",
+        "No exogenous change to upstream margin data occurred at ~12:12 (not directly observed)"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Downstream/dependency failure (portfolio/market-data providing null margin profile)",
+      "statement": "A downstream service (e.g. portfolio-service or market-data-service) stopped returning margin profiles, leaving marginProfile null and triggering the NPE.",
+      "category": "dependency_failure",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": null,
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "portfolio-service dep-5088 v4.2.1 deployed 09:36Z",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "portfolio-service error_rate flat ~0.21% and zero ERROR logs",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "dep-5088 predates onset by ~2.5h with no correlated impact",
+          "finding_ids": [
+            "F5"
+          ]
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F5",
+        "F7"
+      ],
+      "assumptions": [
+        "marginProfile originates from portfolio-service (dependency graph from order-service does not show an explicit portfolio/margin edge)"
+      ],
+      "rejection_reason": "portfolio-service and all order-service downstreams (pricing-engine, exchange-gateway, ledger-db) show flat error/latency/CPU and zero error logs; dep-5088 predates onset with no impact. No upstream-provider degradation observed."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Resource exhaustion or capacity saturation on order-service",
+      "statement": "CPU/memory/connection-pool exhaustion or traffic outgrowing capacity caused order failures.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "order-service",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "order-service cpu ~40%, memory ~60%, db_pool ~14 conns, request_rate ~232/s all flat",
+          "finding_ids": [
+            "F6"
+          ]
+        },
+        {
+          "claim": "latency_p99 ~150ms flat and restarts 0",
+          "finding_ids": [
+            "F6"
+          ]
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F6"
+      ],
+      "assumptions": [],
+      "rejection_reason": "All resource/load metrics are flat across onset; no saturation, exhaustion, latency increase or restarts. The fault began exactly at deploy time, not with load."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Config/feature-flag change caused the failures",
+      "statement": "A configuration or feature-flag change disabled margin-profile population or enabled the new validation path incorrectly.",
+      "category": "config_change",
+      "root_cause_service": "order-service",
+      "trigger_change_id": null,
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Only config change in window is notification-service email.batch_size (cfg-2101)",
+          "finding_ids": [
+            "F9"
+          ]
+        },
+        {
+          "claim": "order-service logged 'config reloaded (no changes)' at 12:07:51Z",
+          "finding_ids": [
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F9"
+      ],
+      "assumptions": [],
+      "rejection_reason": "The sole config change is on notification-service and is unrelated; order-service reported no config changes. Fault correlates with a code deployment, not a config change."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "order-service v2.14.0 (dep-5101) deployed 12:10:00Z, rollout complete 12:10:08Z, change = new MarginCheckValidator added, legacy OrderRules.validateMargin() removed.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "First MarginCheckValidator NullPointerException logged at 12:12:31Z with message 'marginProfile is null', orderType=FNO.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "order-service error_rate rose from ~0.2% to 18.49% at the 12:12 bucket and remained ~18% through 13:57Z.",
+      "finding_ids": [
+        "F3",
+        "F4"
+      ]
+    },
+    {
+      "statement": "dep-5101 status is 'live' with rolled_back_at null; no rollback occurred.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "order-service cpu_pct, memory_pct, db_pool_in_use, request_rate, latency_p99_ms and restarts are all flat across the incident.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "pricing-engine, exchange-gateway, portfolio-service and ledger-db are all healthy (flat error_rate, no error logs).",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "Only config change was notification-service email.batch_size; order-service had no config change.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "api-gateway error_rate rose only to ~3.4%, consistent with propagated order-service failures.",
+      "finding_ids": [
+        "F8"
+      ]
+    }
+  ],
+  "assumptions": [
+    "Under the removed legacy OrderRules.validateMargin(), F&O margin profiles were handled correctly, so the NPE represents a regression introduced by dep-5101 rather than a pre-existing latent data gap.",
+    "No simultaneous exogenous change affected upstream margin data at ~12:12Z (not directly observable from available telemetry).",
+    "The ~18% error rate corresponds to the F&O/derivatives subset of order traffic, consistent with the reported 'mostly derivatives orders'."
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-03T09:36:00Z",
+      "event": "portfolio-service dep-5088 (v4.2.1) deployed; no subsequent impact.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-03-03T11:21:00Z",
+      "event": "notification-service config change cfg-2101 (email.batch_size 200->250); unrelated.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:07:51Z",
+      "event": "order-service logs 'config reloaded (no changes)'.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:10:00Z",
+      "event": "order-service deployment dep-5101 (v2.14.0) begins; new MarginCheckValidator added.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:10:08Z",
+      "event": "dep-5101 rollout complete, all pods ready.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:12:00Z",
+      "event": "order-service error_rate jumps from ~0.2% to 18.49%.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:12:31Z",
+      "event": "First MarginCheckValidator NPE (marginProfile null, orderType=FNO) logged.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:22:00Z",
+      "event": "Incident reported by on-call SRE (SEV-1).",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-03-03T13:58:50Z",
+      "event": "Same NPE errors still occurring at high volume; no rollback.",
+      "finding_ids": [
+        "F4"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back order-service from v2.14.0 (dep-5101) to the previous version immediately.",
+      "priority": "immediate",
+      "rationale": "The failure began at this deploy, the deploy is still 'live' with no rollback, and persisting errors are caused by the new MarginCheckValidator code path.",
+      "finding_ids": [
+        "F1",
+        "F2",
+        "F3",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Fix MarginCheckValidator to handle a null/absent marginProfile for F&O orders (restore legacy validateMargin behavior or publish margin profiles before validation).",
+      "priority": "short_term",
+      "rationale": "The NPE is 'marginProfile is null for account <n>'; null handling is missing in the new validator.",
+      "finding_ids": [
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a regression test covering F&O order validation with an unpopulated margin profile, plus a canary/staged rollout gate that watches order-service error_rate.",
+      "priority": "long_term",
+      "rationale": "The change shipped straight to all pods (rollout complete) and error_rate alert fired only after ~12 minutes of failures.",
+      "finding_ids": [
+        "F1",
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Confirm whether margin profiles for F&O accounts are populated at all (check the source of marginProfile) to ensure the fix addresses the true null source.",
+      "priority": "short_term",
+      "rationale": "Distinguishes a validator code bug from a missing-data dependency without blocking the rollback.",
+      "finding_ids": [
+        "F2"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "Exact source of 'marginProfile' for F&O orders is not shown in telemetry; the order-service dependency graph shows no explicit portfolio/margin-service edge, so where the null originates (code regression vs missing upstream data) is inferred, not proven.",
+    "No post-rollback data exists yet, so recovery after reverting dep-5101 is unverified.",
+    "ledger-db error_rate metric does not exist (only connections/cpu/disk/replication/slow_queries were available), so DB error behavior could not be checked directly; slow_queries and cpu were normal.",
+    "The single GC-pause WARN at 12:37Z and portfolio-service WARNs were not investigated further as they do not correlate with onset."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service deployment dep-5101 (v2.14.0) was deployed at 2026-03-03T12:10:00Z and its rollout completed at 12:10:08Z; its change summary is 'Refactor order validation; add margin check for F&O orders' with changes 'new MarginCheckValidator in validation chain' and 'remove legacy OrderRules.validateMargin()'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "new MarginCheckValidator in validation chain"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "deployment dep-5101 (v2.14.0) rollout complete, all pods ready"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:10:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service began throwing NullPointerException in MarginCheckValidator.validate at 12:12:31Z (first occurrence), with dominant patterns 'NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO' and 'order rejected with 500: java.lang.NullPointerException: marginProfile is null for account <n>'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO orderId=9326cc69"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:12:31Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service error_rate jumped from ~0.2% (buckets 11:30–12:05) to 18.49% in the 12:12 bucket and stayed elevated (~17.9–18.97%) through 13:57, with no recovery.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-03-03T12:12:00Z\",\"avg\":18.49,\"max\":19.63}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:12:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The errors continue at high volume through the latest data: 12:59–13:59 window logged 238 ERROR entries, same MarginCheckValidator NPE patterns first_seen 12:59:08.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "\"total_matched\":238"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO orderId=37dce2b5"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T13:58:50Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Deployment dep-5101 was NOT rolled back: status 'live', rolled_back_at null. The only other recent deployment was portfolio-service dep-5088 at 09:36 (dependency bumps, grpc 1.62->1.63), which predates onset by ~2.5h and was followed by no impact.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"id\":\"dep-5101\",\"service\":\"order-service\",\"version\":\"v2.14.0\""
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "order-service",
+        "portfolio-service"
+      ],
+      "time": "2026-03-03T12:10:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service resource/load metrics are flat across the incident: cpu_pct ~40%, memory_pct ~60%, db_pool_in_use ~14 connections, request_rate ~232 req/s, latency_p99 ~150ms, restarts 0 — no saturation, exhaustion or restart.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "\"avg\":40.5,\"max\":42.87"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "\"avg\":60.08"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "\"avg\":14.04"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"mean\":232.73"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"mean\":150.01"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "\"max\":0.0"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T13:59:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "4/6 refs verified (tc-023: quote not found in tool output; tc-015: quote not found in tool output)"
+    },
+    {
+      "statement": "Downstream dependencies are healthy: pricing-engine error_rate ~0.22%, exchange-gateway error_rate ~0.21% with zero ERROR logs, portfolio-service error_rate ~0.21% with zero ERROR logs, ledger-db slow_queries_per_min ~1.0 and cpu_pct ~30% — all unchanged across the incident window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"mean\":0.22"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"mean\":0.21"
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "\"avg\":1.0"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "\"mean\":30.09"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "exchange-gateway",
+        "portfolio-service",
+        "ledger-db"
+      ],
+      "time": "2026-03-03T13:59:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "6/6 refs verified"
+    },
+    {
+      "statement": "api-gateway error_rate rose from ~0.2% to ~3.4% starting in the 12:10 bucket, consistent with propagated order-service failures (its own metrics and downstreams otherwise normal).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-03-03T12:10:00Z\",\"avg\":2.75,\"max\":3.66}"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-03T12:10:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only config/feature-flag change in the window was notification-service cfg-2101 (email.batch_size 200->250) at 11:21Z, unrelated to order-service. order-service log shows 'config reloaded (no changes)' at 12:07:51Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"id\":\"cfg-2101\",\"service\":\"notification-service\",\"key\":\"email.batch_size\""
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "config reloaded (no changes)"
+        }
+      ],
+      "services": [
+        "notification-service",
+        "order-service"
+      ],
+      "time": "2026-03-03T11:21:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical incidents include similar past cases: HIST-115 order-service connection pool misconfiguration (config_change) and HIST-109 token validation regression after library upgrade (bad_deployment, resolved by rollback).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "Token validation regression after auth library upgrade"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "order-service connection pool misconfiguration"
+        }
+      ],
+      "services": [],
+      "time": "2026-03-03T12:22:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Ambiguous/unrelated noise present: a single WARN 'GC pause <n>ms exceeded <n>ms target' at 12:37:35Z on order-service, and portfolio-service WARNs 'slow request 865ms on /internal/metrics' (11:41) and 'deprecated TLS cipher offered by client' (13:40) — none correlate with onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "GC pause <n>ms exceeded <n>ms target"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "slow request 865ms on /internal/metrics"
+        }
+      ],
+      "services": [
+        "order-service",
+        "portfolio-service"
+      ],
+      "time": "2026-03-03T12:37:35Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 71.81,
+    "llm_calls": 6,
+    "prompt_tokens": 77052,
+    "completion_tokens": 8503,
+    "total_tokens": 85555,
+    "tool_calls": 25,
+    "tool_attempts": 25,
+    "tool_failures": 1,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 11,
+    "findings_verified": 11,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 6,
+        "prompt_tokens": 77052,
+        "completion_tokens": 8503
+      }
+    }
+  },
+  "warnings": []
+}

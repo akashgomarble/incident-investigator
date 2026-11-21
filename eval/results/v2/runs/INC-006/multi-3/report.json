@@ -1,0 +1,1579 @@
+{
+  "incident_id": "INC-006",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The incident is a redis-cache availability failure, not a pricing-engine defect or a change-driven regression: at 13:22:10 redis-cache-2 failed three consecutive PING timeouts and was marked down, and at 13:22:52 the failover promoted redis-cache-3, which was still resyncing and therefore EMPTY. The resulting cache-wide read-side collapse (hit ratio 95.9%->10.82%, dataset memory 70.54%->6.38%, connected_clients 304->40, with evictions flat) forced market-data-service to rebuild quote entries from the exchange feed (cache-miss storm at 13:22:25, CPU stepping to ~90% at flat inbound request rate), and pricing-engine's synchronous market-data call then breached its computation deadline from 13:23:57, surfacing 2-3s quote loads. Confidence in this as the root cause is high (0.75, critic-accepted): the two alternative origins are contradicted by their own telemetry (exchange feed hop flat throughout onset; no load/retry spike) and the change set is empty in the causal window (the only deployment, dep-5604, is ~108 min early and on the unrelated auth path). Residual uncertainty is limited to why redis-cache-2 died and to sub-bucket ordering, which caps but does not overturn the conclusion.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "redis-cache primary node failure with failover to an EMPTY, under-resynced replica wipes the shared quote cache, forcing market-data-service rebuilds that blow pricing-engine deadlines",
+      "statement": "At 13:22:10 redis-cache's primary (redis-cache-2) failed three consecutive PING timeouts and was marked down; at 13:22:52 the failover promoted replica redis-cache-3, whose dataset was EMPTY because it was still resyncing. Keyspace hit-ratio collapsed from ~95.9% (13:20 bucket) to 10.82% (13:22 bucket) and dataset memory dropped 70.54%->6.38% — reads now miss cache-wide. market-data-service, which serves quotes from redis-cache, logged a cache-miss storm from 13:22:25 and its p99 (already stepping at 13:18) climbed to 665-1908ms as it rebuilt quote entries from the exchange feed snapshot, driving its CPU from ~45% to ~90% (work signature, not inbound load: request_rate flat at ~950 req/s). pricing-engine, which calls market-data-service synchronously, breached its computation deadline from 13:23:57 and surfaced 2-3s quote loads. Origin is the redis-cache failover to an empty replica — not pricing-engine code/config and not a change-driven event.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "redis-cache",
+      "trigger_change_id": "null",
+      "confidence": 0.75,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "redis-cache primary redis-cache-2 fails health check (3 consecutive PING timeouts) at 13:22:10 and is marked down; no WARN/ERROR exists between 13:00 and 13:22:10",
+          "finding_ids": [
+            "F19",
+            "F23"
+          ]
+        },
+        {
+          "claim": "Failover at 13:22:52 promotes redis-cache-3, an EMPTY, still-resyncing replica, so the shared quote keyspace is wiped",
+          "finding_ids": [
+            "F19",
+            "F22"
+          ]
+        },
+        {
+          "claim": "redis-cache keyspace hit_ratio collapses as a step 95.9%->10.82% at the 13:22 bucket and dataset memory falls 70.54%->6.38%, i.e. reads miss cache-wide on a fresh empty instance (connection collapse 304->40 then reconnect churn is the reconnect signature)",
+          "finding_ids": [
+            "F20",
+            "F34",
+            "F22",
+            "F24"
+          ]
+        },
+        {
+          "claim": "market-data-service logs a cache-miss storm against redis-cache from 13:22:25 ('quote:<n> not in redis-cache, rebuilding from exchange feed snapshot'), ~15s after the failover",
+          "finding_ids": [
+            "F10",
+            "F23"
+          ]
+        },
+        {
+          "claim": "market-data-service p99 steps to 665-1908ms and its CPU jumps to ~90% doing rebuild work while inbound request_rate stays flat (~950 req/s), so the load is self-inflicted rebuild, not inbound saturation",
+          "finding_ids": [
+            "F11",
+            "F32",
+            "F31"
+          ]
+        },
+        {
+          "claim": "pricing-engine's synchronous market-data-service call breaches its deadline (827ms-8456ms) from 13:23:57, stepping p99 to ~1.8s and 5xx to ~3-4%, which is what trading screens see as 2-3s quotes",
+          "finding_ids": [
+            "F9",
+            "F7",
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F19",
+        "F22",
+        "F20",
+        "F34",
+        "F10",
+        "F11",
+        "F32",
+        "F31",
+        "F9",
+        "F7",
+        "F8",
+        "F5",
+        "F16",
+        "F21",
+        "F24",
+        "F6",
+        "F17"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The 'not in redis-cache' misses are reads of keys that the empty-replica failover removed, rather than market-data-service never having written them — supported by the fact that memory_pct collapsed to 6.38% and hit_ratio to 10.82% on the redis side itself, and by evictions_per_min staying flat (so keys vanished via instance loss, not eviction); no write_rate metric exists to prove it directly",
+        "Which PING-timeout root cause (node death vs network partition vs prior resync) killed redis-cache-2 remains unexplained — no redis restart or latency metric exists",
+        "market-data-service rebuild latency (~665-1908ms) is dominated by the exchange snapshot fetch path rather than by the now-reconnected redis round-trips"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "External exchange feed / exchange-gateway degradation slowed market-data-service quote rebuilds and cascaded into pricing-engine deadlines",
+      "statement": "The origin is outside the platform: the external exchange-api (vendor-owned, has_telemetry:false) or exchange-gateway degraded around 13:1xZ, so market-data-service's exchange-feed snapshot fetch became slow. Because cache misses are served by rebuilding from that feed, each rebuild took hundreds of ms to seconds, pricing-engine's synchronous call breached its deadline, and trading screens showed 2-3s quotes.",
+      "category": "dependency_failure",
+      "root_cause_service": "exchange-gateway",
+      "trigger_change_id": "null",
+      "confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "External exchange-api / exchange-gateway latency rises at ~13:1xZ",
+          "finding_ids": []
+        },
+        {
+          "claim": "market-data-service rebuilds quote entries from the exchange feed snapshot on cache miss, and that fetch is now slow",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "market-data-service p99 steps to 665-1908ms beginning in the 13:18 bucket",
+          "finding_ids": [
+            "F11"
+          ]
+        },
+        {
+          "claim": "pricing-engine's market-data-service call breaches the quote computation deadline from 13:23:57",
+          "finding_ids": [
+            "F9"
+          ]
+        },
+        {
+          "claim": "pricing-engine p99/error rate step up, producing slow quotes in the trading app",
+          "finding_ids": [
+            "F7",
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F4",
+        "F15"
+      ],
+      "contradicting_evidence": [
+        "F25",
+        "F26",
+        "F27",
+        "F28",
+        "F29",
+        "F30"
+      ],
+      "assumptions": [
+        "exchange-gateway/exchange-api had a latency or availability event at onset",
+        "market-data-service rebuild is bound by the feed fetch rather than redis round-trips",
+        "the exchange-api slowdown is confined entirely inside its own processing, invisible to the gateway-observed upstream latency metric"
+      ],
+      "rejection_reason": "The feed hop is now directly measured and flat across onset: exchange-gateway latency_p99 (F25) and its upstream_latency_ms (F26) both show no step at 13:18/13:22, exchange-gateway error_rate/upstream_error_rate stayed at baseline (F27), request_rate/CPU show no change (F28), and its logs contain zero snapshot/feed-failure entries (F29) with a complete observable metric set (F30). The only remaining escape (a slowdown purely inside telemetry-less exchange-api) is unfalsifiable and has no supporting evidence, so the hypothesis is rejected rather than merely weakened."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Traffic/retry spike saturates market-data-service (and its redis path), inflating quote latency",
+      "statement": "A traffic surge or client retry storm pushed market-data-service past provisioned capacity around 13:1xZ, increasing its latency and causing cache-miss rebuilds under load, which drove pricing-engine deadlines.",
+      "category": "capacity_saturation",
+      "root_cause_service": "market-data-service",
+      "trigger_change_id": "null",
+      "confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Request rate on market-data-service (or its callers) spikes at onset, possibly amplified by retries",
+          "finding_ids": []
+        },
+        {
+          "claim": "market-data-service saturates, its p99 steps to 665-1908ms from 13:18",
+          "finding_ids": [
+            "F11"
+          ]
+        },
+        {
+          "claim": "Elevated latency slows quote rebuilds and produces cache-miss rebuild messages",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "pricing-engine deadline breaches on the market-data-service call from 13:23:57",
+          "finding_ids": [
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F11"
+      ],
+      "contradicting_evidence": [
+        "F31",
+        "F32",
+        "F12",
+        "F34",
+        "F19",
+        "F21"
+      ],
+      "assumptions": [
+        "A load spike occurred that is invisible in the measured request_rate",
+        "the CPU step is inbound-load-driven rather than rebuild-driven"
+      ],
+      "rejection_reason": "market-data-service inbound request_rate is now measured and completely flat across 12:30-14:00Z (~950 req/s, F31), with no retry amplification; its CPU step (F32) occurs in the same 13:22 bucket as the cache-miss storm and is consistent with rebuild work, not inbound saturation; pricing-engine's own CPU/memory stay flat (F12); and the redis-side empty-replica failover (F19/F34) plus flat evictions (F21) provide a concrete non-load mechanism for the misses. There is no load evidence left supporting this origin."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "auth-service v7.2.0 'SameSite=strict' cookie hardening (dep-5604) is the trigger",
+      "statement": "The only deployment in the window, auth-service v7.2.0 (SameSite=strict, dep-5604 at 11:30Z) changed cookie semantics in a way that broke session reuse or cache-key sharing across services, indirectly degrading the shared quote path. This is the reporter-adjacent 'change in a different service' theory, included because it is the only candidate change in the change set.",
+      "category": "bad_deployment",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "dep-5604",
+      "confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "auth-service v7.2.0 with SameSite=strict deploys at 11:30Z",
+          "finding_ids": [
+            "F1",
+            "F14"
+          ]
+        },
+        {
+          "claim": "Cookie/session change causes auth or cache-key churn propagating into the shared quote path",
+          "finding_ids": []
+        },
+        {
+          "claim": "market-data-service / pricing-engine latency rises",
+          "finding_ids": [
+            "F11",
+            "F7"
+          ]
+        },
+        {
+          "claim": "Slow quotes appear on trading screens",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F14"
+      ],
+      "contradicting_evidence": [
+        "F14",
+        "F18",
+        "F13",
+        "F17",
+        "F12",
+        "F9",
+        "F19",
+        "F20"
+      ],
+      "assumptions": [
+        "auth-service participates causally in the quote latency path",
+        "cookie semantics could affect quote-path caching"
+      ],
+      "rejection_reason": "Timing rules it out: dep-5604 precedes onset by ~108 minutes with a step (not drift) onset (F14, F7). Scope rules it out: the failure is confined to the redis/market-data/pricing path and auth-service failures present with login/401/high-CPU symptoms, not quote latency (F17). Mechanism rules it out: pricing-engine blames market-data-service (F9), there is no auth edge in the quote dependency map (F4/F15), and the actual onset is explained by a redis-cache failover event at 13:22:10 (F19, F20)."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "redis-cache logged its primary node failing health check and a failover that promoted an EMPTY, still-resyncing replica: 13:22:10 'node redis-cache-2 failed health check (3 consecutive PING timeouts); marking primary as down', 13:22:52 'failover: promoting replica redis-cache-3 to primary; dataset on new primary is empty (replica was resyncing)'; this is the earliest redis-side anomaly in the window (no WARN/ERROR between 13:00 and 13:22:10).",
+      "finding_ids": [
+        "F19"
+      ]
+    },
+    {
+      "statement": "redis-cache keyspace hit ratio collapsed as a step in the 13:22 bucket: 96.53 (13:10), 95.64 (13:14), 95.33 (13:18) -> 11.55 (13:22), then only slow recovery to 24.59 by 13:58; baseline 12:30-13:18 was flat 95.3-96.5% with no pre-onset drift.",
+      "finding_ids": [
+        "F20"
+      ]
+    },
+    {
+      "statement": "redis-cache hit_ratio_pct fell from a flat ~94.7-97.3% baseline (13:20 = 95.9%) to 10.82% in the 13:22 bucket, climbing only to 25.37% by 14:00 and never recovering, i.e. reads were missing cache-wide rather than for one service.",
+      "finding_ids": [
+        "F34"
+      ]
+    },
+    {
+      "statement": "redis-cache connected_clients collapsed 304.47 (13:18) -> 40.28 (13:22) -> 309.63 (13:26), and memory_pct collapsed 70.54 (13:18) -> 6.38 (13:22) -> 7.54 (13:26), rebuilding only to 15.65 by 13:58 - the signature of connection loss/reconnect to a fresh empty instance rather than resource saturation.",
+      "finding_ids": [
+        "F22"
+      ]
+    },
+    {
+      "statement": "redis-cache evictions_per_min stayed flat at ~2.0-4.9 keys/min across the whole window including 13:22 (avg 3.11 at 13:22, 3.29 at 13:18); it is the only redis metric that does not move at onset, so keys were lost via instance loss, not eviction pressure.",
+      "finding_ids": [
+        "F21"
+      ]
+    },
+    {
+      "statement": "market-data-service logged a cache-miss storm against redis-cache - 'quote:<n> not in redis-cache, rebuilding from exchange feed snapshot (<n>ms)' - 289 occurrences, first_seen 13:22:25, which precedes pricing-engine's first deadline-exceeded (13:23:57) by ~90s.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "market-data-service CPU_pct stepped from a ~41-47% baseline straight to 90.0% avg (max 93.99) in the 13:22 bucket - the same bucket as the cache-miss storm - then held 82-92% through 14:00, consistent with expensive rebuild work rather than inbound saturation.",
+      "finding_ids": [
+        "F32"
+      ]
+    },
+    {
+      "statement": "market-data-service inbound request_rate was completely flat across 12:30-14:00Z (mean 950.24 req/s, range 878.88-1044.69, buckets 13:16=946.42, 13:18=932.99, 13:20=992.73, 13:22=965.29, 13:24=937.32), excluding a traffic/retry spike as the trigger.",
+      "finding_ids": [
+        "F31"
+      ]
+    },
+    {
+      "statement": "market-data-service p99 latency stepped from a ~36-40ms baseline to 664.95ms avg in the 13:18 bucket (max 1979.98ms) and 1908ms in the 13:24 bucket, remaining elevated (947.88ms avg at 14:54); its onset bucket (13:18) is at or before pricing-engine's (13:20).",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "market-data-service error_rate stepped from ~0.15% (13:20 bucket) to 3.21% in the 13:22 bucket and held ~3.0-3.4% through 14:00 - the same bucket as the miss storm.",
+      "finding_ids": [
+        "F33"
+      ]
+    },
+    {
+      "statement": "pricing-engine p99 latency was flat at ~58-66ms through 13:10, then jumped to avg 1794ms / max 2310ms in the 13:20 bucket - a step change - and receded only slowly (1769ms at 14:00, 1172ms at 14:50) while staying far above baseline.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "pricing-engine error_rate stepped from ~0.2% baseline to 3.02% in the 13:20 bucket and held ~4.0-4.2% for the rest of the window.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "The earliest pricing-engine error is 13:23:57 and its dominant signature is 'quote computation deadline exceeded: market-data-service took <n>ms' (192 of 196 matched entries, values 827ms to 8456ms), so pricing-engine's deadline breaches are attributed to its market-data-service call.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "pricing-engine CPU stayed ~39-40% and memory ~48-50% flat across the onset window (12:30-14:54) with no restart and no saturation, i.e. pricing-engine is a victim rather than a cause; cpu_pct, error_rate, latency_p99_ms, memory_pct, request_rate and restarts are its only available metrics (no upstream-latency breakdown metric).",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "statement": "pricing-engine's dependency chain is pricing-engine -> market-data-service (http), pricing-engine -> redis-cache (cache), market-data-service -> redis-cache (cache), market-data-service -> exchange-gateway (http), exchange-gateway -> exchange-api (external, has_telemetry:false); there is no pricing-engine deployment in the change set, so every candidate trigger lies downstream of pricing-engine.",
+      "finding_ids": [
+        "F15",
+        "F4"
+      ]
+    },
+    {
+      "statement": "redis-cache is a single shared component (type redis, shared:true, owner platform) consumed as a cache by four services - auth-service, portfolio-service, pricing-engine and market-data-service - so a fault in it can hurt pricing-engine from outside the pricing/market-data path.",
+      "finding_ids": [
+        "F16",
+        "F5"
+      ]
+    },
+    {
+      "statement": "exchange-gateway latency_p99_ms was flat across 12:30-14:00Z with no step at onset (all 4-min buckets 119.96-143.91ms, mean 130.86; 127.89ms at 13:18, 136.81ms at 13:22, vs 12:30 baseline 131.68ms).",
+      "finding_ids": [
+        "F25"
+      ]
+    },
+    {
+      "statement": "exchange-gateway's external feed hop upstream_latency_ms - the metric most directly relevant to the external-feed hypothesis - was flat through onset: 117.33ms avg at 13:18, 120.75ms at 13:22, vs 12:30 baseline 118.44ms (overall range 111.76-130.39ms).",
+      "finding_ids": [
+        "F26"
+      ]
+    },
+    {
+      "statement": "exchange-gateway error_rate stayed at baseline (~0.18-0.29%) through 12:30-14:00Z and upstream_error_rate was near-constant ~0.30% (0.30 at both 13:18 and 13:22), so there was no error escalation on the gateway or its upstream at onset.",
+      "finding_ids": [
+        "F27"
+      ]
+    },
+    {
+      "statement": "exchange-gateway request_rate (~266-284 req/s; 275.62 at 13:18) and cpu_pct (~29-31%; 29.52% at 13:20) show no load or saturation change at onset versus the 12:30 baseline (272.43 req/s, 30.68%), so the gateway itself was not overloaded.",
+      "finding_ids": [
+        "F28"
+      ]
+    },
+    {
+      "statement": "The exchange-gateway log stream in 12:30-14:00Z contains exactly one WARN - a benign clock-drift notice at 13:19:38Z - and zero entries matching 'snapshot' (total_matched 0, truncated false), i.e. no feed/snapshot fetch failures or slowdowns were logged at onset.",
+      "finding_ids": [
+        "F29"
+      ]
+    },
+    {
+      "statement": "exchange-gateway is fully queryable with the complete metric set cpu_pct, error_rate, latency_p99_ms, memory_pct, request_rate, restarts, upstream_error_rate, upstream_latency_ms, so its feed-facing hop is observable (unlike the telemetry-less exchange-api), and every one of those metrics stayed flat across onset.",
+      "finding_ids": [
+        "F30"
+      ]
+    },
+    {
+      "statement": "Across all services in the 48h window (2026-04-07T14:00Z -> 2026-04-09T15:00Z) exactly one deployment exists: auth-service v7.2.0 (dep-5604), deployed 2026-04-09T11:30:00Z, changes ['SameSite=strict'], status live, not rolled back; there is no pricing-engine release in the window.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "The 48h deployment inventory is confirmed complete and empty apart from dep-5604: the earlier window 2026-04-07T14:00Z->2026-04-09T00:00Z returned count 0 (partial:false) and 2026-04-09T00:00Z->15:00Z returned only dep-5604, so the initial partial shard failure did not hide a second release.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "No deployment and no config change occurred anywhere in the 12:00-15:00Z window on 2026-04-09, i.e. around the onset (market-data-service step 13:18, pricing-engine step 13:20): both queries returned count 0 with partial:false.",
+      "finding_ids": [
+        "F13"
+      ]
+    },
+    {
+      "statement": "No config/flag changes were recorded for any service in the full 48h window (and specifically none on 2026-04-09); both full-window and same-day queries returned count 0 changes with partial:false, ruling out a config/feature-flag trigger.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "The only deployment in the preceding 24h, dep-5604 at 11:30:00Z, is ~108 minutes before market-data-service's first elevated p99 bucket (13:18Z) and ~110 minutes before pricing-engine's (13:20Z) - not temporally adjacent to onset.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "statement": "Redis-side anomaly timing relative to market-data-service: redis's last log before the incident is 13:18:40 ('background saving terminated with success') and its first fault event is 13:22:10 (primary marked down) / 13:22:52 (empty-replica promotion); redis metrics are bucketed at 240s, so redis's earliest anomaly (13:22:10) precedes the 13:22:25 miss storm by only ~15s and the sub-bucket ordering is not resolvable from metrics alone.",
+      "finding_ids": [
+        "F23"
+      ]
+    },
+    {
+      "statement": "redis-cache is confirmed type 'redis' with only these metrics available - connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct (no latency_p99_ms, no restarts) - and the post-failover window shows cascading connection churn: 3x 'client reconnect storm' first at 13:30:20 (15048 new connections in 10s, then 29623, then 92851) plus 2x 'MASTER <-> REPLICA sync started (full resync) for redis-cache-2' first at 13:28:42.",
+      "finding_ids": [
+        "F24",
+        "F35"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The 'not in redis-cache' misses are reads of keys removed by the empty-replica failover rather than keys market-data-service never wrote - supported by the redis-side memory_pct collapse to 6.38% and hit_ratio collapse to 10.82% plus flat evictions (so keys vanished via instance loss, not eviction); no write_rate metric exists to prove this directly, and this assumption is required for the conclusion.",
+    "The write-vs-never-written distinction is inferred, not directly measured: redis-cache exposes no write_rate/set_rate/read-miss-rate metric (F35), so the conclusion rests on the observed empty-replica promotion and memory collapse rather than a write-rate comparison.",
+    "Which specific root cause killed redis-cache-2 (node death vs network partition vs a prior in-progress resync) is unexplained; no redis restart or latency metric exists, so this assumption does not affect the mechanism but leaves the upstream trigger of the failover unknown.",
+    "market-data-service's rebuild latency (~665-1908ms) is assumed to be dominated by the exchange snapshot fetch path rather than by redis round-trips now that the new primary is empty and reconnect churn is in progress.",
+    "The precise ordering of the redis failover (13:22:10) before the market-data-service miss storm (13:22:25) rests on the single redis log line, because all redis metrics are 240s-bucketed; the metric evidence confirms only that both events land in the 13:22 bucket.",
+    "The deployment inventory is treated as complete despite the initial partial shard failure (F2 covers the re-query agreement), so the change set is assumed to contain no hidden release near onset.",
+    "The 12:00-15:00Z empty change window is assumed to mean no operational/config action (e.g. an unrecorded cache flush or a manual manipulation) caused the empty replica; the change stores returned partial:false and count 0.",
+    "(demoted from facts: no verified observation backs it) Precedent HIST-107 (2025-12-09, score 11) is the closest match to the current symptom pair (services redis-cache + market-data-service; symptoms ['cache miss storm','quote latency']; root cause 'Redis primary failure promoted an empty replica'), while precedent HIST-101 shows auth-service bad releases present with login/'401'/high-CPU symptoms, not quote latency. These are leads, not evidence about the current incident.",
+    "(demoted from facts: no verified observation backs it) The temporal order is market-data-service latency step -> cache hit-ratio collapse + miss storm + MDS CPU/error step -> pricing-engine deadline breaches, with no inbound-load step: this is consistent with a redis read-side availability loss driving the miss storm rather than inbound saturation."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-09T11:30:00Z",
+      "event": "Only deployment in the 48h window: auth-service v7.2.0 (dep-5604, 'Session cookie hardening', SameSite=strict), on the unrelated auth path - ~108 min before onset, ruled out by timing and scope.",
+      "finding_ids": [
+        "F1",
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:18:00Z",
+      "event": "market-data-service p99 steps from a ~36-40ms baseline to 664.95ms avg (max 1979.98ms); its earliest anomalous bucket, at or before pricing-engine's.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:18:00Z",
+      "event": "redis-cache last pre-incident log event: 'background saving terminated with success' at 13:18:40; no WARN/ERROR between 13:00 and 13:22:10.",
+      "finding_ids": [
+        "F23",
+        "F19"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:20:00Z",
+      "event": "pricing-engine p99 jumps to avg 1794ms / max 2310ms (from ~58-66ms flat); error_rate steps to 3.02% while CPU/memory stay flat ~39-40% / ~48-50%.",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:22:10Z",
+      "event": "redis-cache ERROR: node redis-cache-2 failed health check (3 consecutive PING timeouts); primary marked down - earliest redis-side anomaly.",
+      "finding_ids": [
+        "F19"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:22:00Z",
+      "event": "redis-cache 13:22 bucket: hit ratio 95.9%->10.82%, memory_pct 70.54%->6.38%, connected_clients 304->40, while evictions_per_min stays flat (~3.1/min) - instance loss, not eviction pressure.",
+      "finding_ids": [
+        "F34",
+        "F22",
+        "F21",
+        "F20"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:22:25Z",
+      "event": "market-data-service 'cache miss storm': 289 x 'quote:<n> not in redis-cache, rebuilding from exchange feed snapshot (<n>ms)' - ~90s before pricing-engine's first deadline error.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:22:52Z",
+      "event": "redis-cache WARN: failover promoting replica redis-cache-3 to primary; dataset on new primary is empty (replica was resyncing).",
+      "finding_ids": [
+        "F19"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:22:00Z",
+      "event": "market-data-service CPU steps to 90.0% avg (max 93.99) and error_rate steps to 3.21% in the same 13:22 bucket, while inbound request_rate stays flat (~950 req/s).",
+      "finding_ids": [
+        "F32",
+        "F33",
+        "F31"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:23:57Z",
+      "event": "Earliest pricing-engine error: 'quote computation deadline exceeded: market-data-service took <n>ms' (192 of 196 matched entries, 827-8456ms); trading screens show 2-3s quote loads.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:28:42Z",
+      "event": "redis-cache 'MASTER <-> REPLICA sync started (full resync) for redis-cache-2' begins; connection churn follows.",
+      "finding_ids": [
+        "F24"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:30:20Z",
+      "event": "redis-cache client reconnect storm: 15048 new connections in 10s, later 29623 then 92851.",
+      "finding_ids": [
+        "F24"
+      ]
+    },
+    {
+      "time": "2026-04-09T13:30:00Z",
+      "event": "Incident INC-006 reported by on-call SRE: quotes taking 2-3s, pricing-engine deadline-exceeded alerts firing, no known pricing releases.",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-04-09T14:54:00Z",
+      "event": "Degradation persists but is receding: pricing-engine p99 1172ms at 14:50 and market-data-service p99 947.88ms avg at 14:54, both well above baseline; redis hit ratio only ~25% by 14:00.",
+      "finding_ids": [
+        "F7",
+        "F11",
+        "F34"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Immediate mitigation: force a full deterministic re-sync/heal of the cache rather than waiting for organic warm-up. Trigger market-data-service's quote-cache backfill/warm-up routine (the HIST-107 fix pattern: explicit cache warm after redis failover) and verify the redis-cache-3 dataset is actually receiving writes (monitor redis memory_pct rising from ~6-15% and hit_ratio_pct recovering above ~50% for several consecutive buckets).",
+      "priority": "immediate",
+      "rationale": "The root mechanism is an EMPTY promoted replica (F19) that wiped the shared quote cache; hit ratio fell 95.9%->10.82% (F34) and dataset memory 70.54%->6.38% (F22) and has only recovered to ~25% by 14:00, so organic warming is too slow to protect pricing-engine's deadline. Re-warming is the exact mitigation used in the matching precedent HIST-107 (F17).",
+      "finding_ids": [
+        "F19",
+        "F34",
+        "F22",
+        "F17"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Immediate: stop the post-failover reconnect churn from amplifying the outage - verify redis-cache-3 (and re-added redis-cache-2 once its full resync completes, first 13:28:42) is not being re-joined as an unstable primary, and confirm no client is repeatedly reconnecting (reconnect storm of 15048/29623/92851 connections; F24) so the new primary is not destabilising under connection load while it resyncs.",
+      "priority": "immediate",
+      "rationale": "The observed cascading reconnects (F24) sit on top of the empty primary and can prolong the slow hit-ratio recovery seen in F34/F20; stabilising the topology prevents the incident from re-triggering while the cache refills.",
+      "finding_ids": [
+        "F24",
+        "F20",
+        "F19"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Short term: fix the failover path so an EMPTY, mid-resync replica cannot be promoted - add a promotion guard requiring a completed full resync and a minimum non-zero dataset (replica sync checks from the HIST-107 fix) before redis-cache-3 can take over, and validate it in a controlled failover test.",
+      "priority": "short_term",
+      "rationale": "The direct cause is the failover promoting a replica that was still resyncing (F19); the same empty-replica promotion is the documented cause in precedent HIST-107 (F17), so guarding the promotion is the durable fix.",
+      "finding_ids": [
+        "F19",
+        "F17"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Short term: add redis-cache write-side and latency observability - instrument write_rate/set_rate, read-miss-rate and a redis serving-latency/restart metric (currently only connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct exist) so the next failover can be detected by metric rather than by a single log line and the write-vs-never-written question can be answered directly.",
+      "priority": "short_term",
+      "rationale": "The only read-side evidence available was hit_ratio_pct (F34, F35); with no latency or restart metric the failover is visible only via logs (F23, F24), which is the main residual uncertainty capping confidence.",
+      "finding_ids": [
+        "F35",
+        "F24",
+        "F23"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Short term: verify the mitigation by confirming (a) redis-cache hit_ratio_pct sustained >90%, (b) market-data-service p99 back to its ~36-40ms baseline and CPU back to ~41-47%, (c) pricing-engine p99 back to ~58-66ms and error_rate to ~0.2%, and (d) no further pricing-engine 'quote computation deadline exceeded' entries.",
+      "priority": "short_term",
+      "rationale": "These are the exact onset-step metrics (F7, F8, F11, F20/F34, F32) and they define an objective recovery gate; pricing-engine degradation is currently only slowly receding (still 1172ms at 14:50).",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F11",
+        "F32",
+        "F34"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Long term: eliminate the single point of failure and its latency amplification - re-architect redis-cache as replicated-with-durable-warm-standby (or add a read-through layer / local quote cache at market-data-service with bounded rebuild cost) so that losing one cache instance cannot wipe 100% of the shared quote cache and cascade into synchronous pricing-engine deadlines.",
+      "priority": "long_term",
+      "rationale": "redis-cache is the single shared cache for four services including pricing-engine and market-data-service (F5, F16), so any empty-primary failover reproduces this blast radius; pricing-engine calls market-data-service synchronously and has no datastore of its own (F4, F9).",
+      "finding_ids": [
+        "F5",
+        "F16",
+        "F4",
+        "F9"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Long term: determine and fix the underlying cause of redis-cache-2's PING timeouts - add redis-side node health/latency and pre-failover replication-lag/resync monitoring and alerting so a node degrading into 3 consecutive PING timeouts is caught and drained before failover.",
+      "priority": "long_term",
+      "rationale": "The trigger that killed redis-cache-2 (node death vs network partition vs prior resync) remains unexplained because redis exposes no restart or latency metric (F24, F35); without it the same failover can recur.",
+      "finding_ids": [
+        "F24",
+        "F35",
+        "F19"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Long term: review the pricing-engine -> market-data-service synchronous call contract - add a degraded-mode/timeout-budget so that cache-miss-driven rebuild latency at market-data-service cannot propagate into pricing-engine computation deadlines (the deadline-exceeded signature 'market-data-service took <n>ms', 192 of 196 errors, 827-8456ms).",
+      "priority": "long_term",
+      "rationale": "The customer-visible impact originates in pricing-engine's synchronous dependency (F9) while pricing-engine itself stays healthy (F12), so a bulkhead/timeout budget would contain future cache-miss storms without a pricing-engine change.",
+      "finding_ids": [
+        "F9",
+        "F12"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "redis-cache exposes no latency_p99_ms and no restart metric and its logs required 3 attempts, so redis-side serving latency and the exact node-down transition cannot be quantified by metric - the failover is visible only via log lines (13:22:10 / 13:22:52).",
+    "All redis-cache metrics are 240s-bucketed, so the ~15s lead of the 13:22:10 failover over the 13:22:25 miss storm rests on a single log line; sub-bucket ordering between redis's degradation and market-data-service's miss storm is not resolvable from metrics.",
+    "No redis write_rate/set_rate/read-miss-rate metric exists and market-data-service exposes no connection_pool_utilization or consumer_lag, so the missing-keys (empty replica) vs never-written-keys (write failure) distinction is inferred from the empty-replica promotion, memory collapse and flat evictions rather than measured directly.",
+    "The root cause of redis-cache-2's three consecutive PING timeouts (node death vs network partition vs a pre-incident resync/replication problem) is not established; the 11:00-12:30 window was not exhaustively searched for pre-onset replica-sync or lag events.",
+    "trading-api (trading screens backend) logs and any message-bus/queue or exchange-feed component telemetry were not retrieved, so the blast radius to the screens backend and any queue-based contributor to the rebuild latency remain unconfirmed from their own data.",
+    "exchange-api (external exchange feed) is vendor-owned with has_telemetry:false, so a slowdown confined entirely inside its own processing, invisible to exchange-gateway's upstream_latency_ms/upstream_error_rate, cannot be fully excluded - only the hop as measured from the gateway was flat.",
+    "The initial all-services deployment query returned partial:true (one backend shard did not respond); although re-queried in two agreeing halves, a deployment outside the responding shards during the incident cannot be fully excluded.",
+    "exchange-gateway restarts and redis-side eviction counters were not all queried (budget exhaustion / not_found), so a gateway restart or eviction event exactly at onset is not directly confirmed, though flat CPU/memory and one benign WARN argue against a gateway restart."
+  ],
+  "what_would_change_the_conclusion": [
+    "Evidence that the price-path keys were NEVER written by market-data-service (a write-side failure) rather than removed by the empty-replica failover - e.g. equivalent hit-ratio/miss behaviour on a peer redis instance serving the same keys, or a write-rate metric showing MDS stopped setting keys before 13:22 - would move the root cause to market-data-service's write path rather than the redis failover.",
+    "A redis-cache log/metric showing disk full, an admin FLUSHALL, key expiry or an eviction storm at ~13:22 (instead of the '3 consecutive PING timeouts' + 'empty replica was resyncing' lines) would replace the failover-to-empty-replica mechanism with a different cache-loss cause and change the fix.",
+    "Direct evidence of exchange-api-side degradation (a feed latency/error spike or snapshot-fetch failures that exchange-gateway's upstream_latency_ms does not capture) coinciding with onset would revive the external-feed hypothesis and redirect remediation to the vendor feed rather than redis-cache.",
+    "A traffic/retry step on market-data-service's own request rate or connection pool (hidden because a request_rate query returned budget_exhausted and pool metrics do not exist) coinciding with 13:18-13:22 would revive the capacity-saturation hypothesis and point to rate-limiting/scaling instead of cache recovery.",
+    "A deployment or config change inside the 12:00-15:00Z window (ruled out only because the change stores returned count 0 with partial:false, and one shard was unavailable in an earlier query) would reopen the change-driven hypothesis, particularly if it touched redis-cache, market-data-service or pricing-engine.",
+    "Proof that redis-cache served all reads correctly through 13:22 (e.g. a redis-side latency metric showing normal service while MDS reported misses) would break the causal ordering and imply the misses originated on the market-data-service side."
+  ],
+  "findings": [
+    {
+      "statement": "Across ALL services in the last 48h (2026-04-07T14:00Z -> 2026-04-09T15:00Z) exactly one deployment exists: auth-service v7.2.0, deployed 2026-04-09T11:30:00Z, author ci-bot, summary 'Session cookie hardening', changes ['SameSite=strict'], status live, rolled_back_at null. No pricing-engine release in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"id\":\"dep-5604\",\"service\":\"auth-service\",\"version\":\"v7.2.0\",\"deployed_at\":\"2026-04-09T11:30:00Z\",\"author\":\"ci-bot\",\"summary\":\"Session cookie hardening\",\"changes\":[\"SameSite=strict\"],\"status\":\"live\",\"rolled_back_at\":null}"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T11:30:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The 48h deployment window is confirmed complete and empty apart from dep-5604: the earlier windows 2026-04-07T14:00Z->2026-04-09T00:00Z returned count 0 with partial:false, and 2026-04-09T00:00Z->15:00Z returned only dep-5604. So no second, unrelated release was hidden by the initial partial shard failure.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"count\":0,\"deployments\":[],\"scope\":\"all services\"}"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"count\":1,\"deployments\":[{\"id\":\"dep-5604\""
+        }
+      ],
+      "services": [],
+      "time": "2026-04-09T15:00:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No config/flag changes were recorded for any service in the 48h window (and specifically none on 2026-04-09): both full-window and same-day queries returned count 0 changes. This rules out a config/feature-flag change as the trigger, assuming the config store reported completely (partial:false).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"count\":0,\"changes\":[],\"scope\":\"all services\"}"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [],
+      "time": "2026-04-09T15:00:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine dependency map (caller -> callee): pricing-engine -> market-data-service (http) and pricing-engine -> redis-cache (cache); market-data-service -> redis-cache (cache) and market-data-service -> exchange-gateway (http); order-service -> pricing-engine (http); api-gateway -> order-service (http). So pricing-engine's upstream supplier is market-data-service and it has no datastore of its own.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "{\"from\":\"pricing-engine\",\"to\":\"market-data-service\",\"kind\":\"http\"},{\"from\":\"pricing-engine\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "market-data-service",
+        "order-service",
+        "api-gateway",
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:30:00Z",
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "redis-cache is the single shared component in the pricing path: shared=true, owner=platform, and it is consumed as a cache by FOUR services — auth-service, portfolio-service, pricing-engine and market-data-service — all via kind=cache. A fault or eviction storm in redis-cache can therefore hurt pricing-engine from outside the pricing/market-data path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "{\"from\":\"auth-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"},{\"from\":\"portfolio-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"},{\"from\":\"pricing-engine\",\"to\":\"redis-cache\",\"kind\":\"cache\"},{\"from\":\"market-data-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "pricing-engine",
+        "market-data-service",
+        "auth-service",
+        "portfolio-service"
+      ],
+      "time": "2026-04-09T13:30:00Z",
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Historical precedents for quote latency / deadline-exceeded (leads, not evidence): HIST-107 (2025-12-09) 'Cold cache storm after redis failover' on redis-cache + market-data-service with symptom 'quote latency', root cause redis primary promoted an empty replica, fix warmed cache + replica sync checks; HIST-113 (2026-01-28) pricing-engine CPU saturation at market open (quote timeouts, cpu 99%, capacity); HIST-110 (2026-01-15) IOPS throttling on ledger-db producing slow queries. The same symptom class has at least three different known causes.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"title\":\"Cold cache storm after redis failover\",\"services\":[\"redis-cache\",\"market-data-service\"],\"symptoms\":[\"cache miss storm\",\"quote latency\"]"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"title\":\"pricing-engine CPU saturation at market open\",\"services\":[\"pricing-engine\"],\"symptoms\":[\"quote timeouts\",\"cpu 99%\"]"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service",
+        "pricing-engine"
+      ],
+      "time": "2025-12-09",
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine p99 latency was flat at ~58-66ms through 13:10, then jumped to avg 1794ms / max 2310ms in the 13:20 bucket — a step change, not a gradual ramp. It then slowly recedes (1769ms at 14:00 → 1172ms at 14:50) but stays far above baseline.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-04-09T13:10:00Z\",\"avg\":60.14,\"max\":66.23},{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":1794.4,\"max\":2309.91}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine error_rate (HTTP 5xx %) was ~0.2% baseline through 13:10 and stepped to 3.02% in the 13:20 bucket, holding ~4.0-4.2% for the rest of the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-04-09T13:10:00Z\",\"avg\":0.24,\"max\":0.31},{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":3.02,\"max\":4.37}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The earliest pricing-engine error is at 13:23:57 and the dominant signature is 'quote computation deadline exceeded: market-data-service took <n>ms' (192 of 196 matched entries, first_seen 13:23:57) with values from 827ms to 8456ms — i.e. pricing-engine's deadline breaches are attributed to the market-data-service call.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "quote computation deadline exceeded: market-data-service took 5171ms"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"pattern\":\"quote computation deadline exceeded: market-data-service took <n>ms\",\"count\":192,\"first_seen\":\"2026-04-09T13:23:57Z\""
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T13:23:57Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "market-data-service logs a 'cache miss storm' against redis-cache — 'quote:<n> not in redis-cache, rebuilding from exchange feed snapshot (<n>ms)' — 289 occurrences, first_seen 13:22:25, which precedes pricing-engine's first deadline-exceeded (13:23:57) by ~90s.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "{\"pattern\":\"cache miss storm: quote:<n> not in redis-cache, rebuilding from exchange feed snapshot (<n>ms)\",\"count\":289,\"first_seen\":\"2026-04-09T13:22:25Z\""
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "cache miss storm: quote:84685 not in redis-cache, rebuilding from exchange feed snapshot (6864ms)"
+        }
+      ],
+      "services": [
+        "market-data-service",
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:25Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "market-data-service p99 latency mirrors pricing-engine: ~36-40ms baseline through 13:12, then a step to 664.95ms avg in the 13:18 bucket (max 1979.98ms) and 1908ms in the 13:24 bucket, remaining elevated (947.88ms avg at 14:54). Its onset bucket (13:18) is at or before pricing-engine's (13:20).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-04-09T13:12:00Z\",\"avg\":40.45,\"max\":41.67},{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":664.95,\"max\":1979.98},{\"ts\":\"2026-04-09T13:24:00Z\",\"avg\":1908.21,\"max\":1959.32}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-04-09T13:18:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine CPU stayed ~39-40% and memory ~48-50% flat across the onset window (12:30-14:54), i.e. no CPU/memory saturation or restart on pricing-engine accompanies the latency step — the service itself is a victim. (CPU/memory are the only resource metrics available: cpu_pct, error_rate, latency_p99_ms, memory_pct, request_rate, restarts.)",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":40.07,\"max\":42.44},{\"ts\":\"2026-04-09T13:26:00Z\",\"avg\":39.78,\"max\":40.97}"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-04-09T13:10:00Z\",\"avg\":49.82,\"max\":54.93},{\"ts\":\"2026-04-09T13:26:00Z\",\"avg\":49.57,\"max\":51.21}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/2 refs verified (tc-013: quote not found in tool output)"
+    },
+    {
+      "statement": "No deployment and no config change occurred anywhere in the 12:00-15:00Z window on 2026-04-09, i.e. in the ±2h around the onset (market-data-service step at 13:18, pricing-engine step at 13:20): get_deployments returned count 0 and get_config_changes returned count 0 for all services, both with partial:false.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "{\"count\":0,\"deployments\":[],\"scope\":\"all services\"}"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "{\"count\":0,\"changes\":[],\"scope\":\"all services\"}"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "market-data-service",
+        "redis-cache",
+        "auth-service"
+      ],
+      "time": "2026-04-09T12:00:00Z",
+      "id": "F13",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only deployment in the preceding 24h was dep-5604: auth-service v7.2.0, deployed 2026-04-09T11:30:00Z ('Session cookie hardening', changes ['SameSite=strict'], status live, rolled_back_at null). That is ~108 minutes before market-data-service's first elevated p99 bucket (13:18Z) and ~110 minutes before pricing-engine's (13:20Z) — it is not temporally adjacent to the onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"id\":\"dep-5604\",\"service\":\"auth-service\",\"version\":\"v7.2.0\",\"deployed_at\":\"2026-04-09T11:30:00Z\""
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"summary\":\"Session cookie hardening\",\"changes\":[\"SameSite=strict\"],\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-09T11:30:00Z",
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine's dependency chain is pricing-engine -> market-data-service (http), pricing-engine -> redis-cache (cache), market-data-service -> redis-cache (cache), market-data-service -> exchange-gateway (http), exchange-gateway -> exchange-api (external, has_telemetry:false); there is no pricing-engine deployment in the change set, so every candidate trigger lies downstream of pricing-engine rather than in its own code/config.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "{\"from\":\"market-data-service\",\"to\":\"exchange-gateway\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "{\"name\":\"exchange-api\",\"type\":\"external\",\"owner\":\"vendor\",\"has_telemetry\":false}"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "market-data-service",
+        "redis-cache",
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache (type redis, shared:true, owner platform) is the single shared component in the pricing path and is consumed as kind=cache by four services — auth-service, portfolio-service, pricing-engine and market-data-service. The blast radius seen in T1 (affecting at least market-data-service and pricing-engine) is consistent with a shared-component fault, but the change data does NOT record any redis-cache deployment, config change or failover: no change was recorded on any service in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "\"service\":{\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "{\"from\":\"auth-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "pricing-engine",
+        "market-data-service",
+        "auth-service",
+        "portfolio-service"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Precedent HIST-107 (2025-12-09, score 11) is the closest match to the current symptom pair by search relevance: services [redis-cache, market-data-service], symptoms ['cache miss storm','quote latency'], root_cause 'Redis primary failure promoted an empty replica'. Precedent HIST-101 (auth-service bad release) shows that auth-service failures present with login/'401'/high-cpu symptoms, not quote latency — so the one pending auth change has no precedent for this symptom class. These are leads, not evidence about the current incident.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "\"id\":\"HIST-107\",\"date\":\"2025-12-09\",\"title\":\"Cold cache storm after redis failover\""
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "\"symptoms\":[\"cache miss storm\",\"quote latency\"]"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "\"symptoms\":[\"login p99 4s\",\"503 on login\",\"high cpu\"]"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service",
+        "auth-service"
+      ],
+      "time": "2025-12-09",
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Correlation against the confirmed onset (13:18 market-data-service / 13:20 pricing-engine) leaves NO deployment or config change inside the plausible causal window: dep-5604 at 11:30Z is ~108 min early and targets a different path (auth), and the 12:00-15:00 window is empty with partial:false. Therefore the change set does not contain a plausible trigger for this incident — the most plausible explanation consistent with the timing is a non-change-driven failure of a shared dependency (redis-cache) in the pricing/market-data path, matching the HIST-107 pattern, while dep-5604 is ruled out by timing (~108 min gap, no auth-path symptoms) and all other changes are ruled out by non-existence.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"count\":0,\"deployments\":[]"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"deployed_at\":\"2026-04-09T11:30:00Z\""
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "market-data-service",
+        "redis-cache",
+        "auth-service"
+      ],
+      "time": "2026-04-09T13:20:00Z",
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "redis-cache logged its primary node failing health check and a failover promoting an EMPTY replica: 13:22:10 ERROR 'node redis-cache-2 failed health check (3 consecutive PING timeouts); marking primary as down' and 13:22:52 WARN 'failover: promoting replica redis-cache-3 to primary; dataset on new primary is empty (replica was resyncing)'. This is the earliest redis-side anomaly event in the queried window; no WARN/ERROR exists between 13:00 and 13:22:10.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-046",
+          "quote": "node redis-cache-2 failed health check (3 consecutive PING timeouts); marking primary as down"
+        },
+        {
+          "call_id": "tc-046",
+          "quote": "failover: promoting replica redis-cache-3 to primary; dataset on new primary is empty (replica was resyncing)"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "failover: promoting replica redis-cache-<n> to primary; dataset on new primary is empty (replica was resyncing"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:10Z",
+      "id": "F19",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "redis-cache keyspace hit-rate collapsed as a step at the 13:22 bucket: 96.53 (13:10), 95.64 (13:14), 95.33 (13:18) -> 11.55 (13:22), recovering only slowly to 24.59 by 13:58. Baseline 12:30-13:18 was flat 95.3-96.5%, i.e. no slow degradation before 13:22.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-033",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":11.55,\"max\":12.56}"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":95.33,\"max\":96.34}"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F20",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache had NO eviction storm and no memory-pressure eviction pressure: evictions_per_min stayed flat at ~2.0-4.9 keys/min across the whole window including 13:22 (avg 3.11 at 13:22, 3.29 at 13:18), and it is the only metric that does NOT move at onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-034",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":3.11,\"max\":3.62}"
+        },
+        {
+          "call_id": "tc-034",
+          "quote": "\"summary\":{\"min\":1.96,\"max\":4.87,\"mean\":3.1"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F21",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache's client connections and dataset memory both collapsed at the 13:22 bucket, consistent with a connection-loss/reconnect to a fresh empty instance rather than resource saturation: connected_clients 304.47 (13:18) -> 40.28 (13:22) -> back to 309.63 (13:26); memory_pct 70.54 (13:18) -> 6.38 (13:22) -> 7.54 (13:26), then slowly rebuilding to 15.65 by 13:58.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-044",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":40.28,\"max\":43.2}"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":304.47,\"max\":314.11}"
+        },
+        {
+          "call_id": "tc-045",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":6.38,\"max\":6.81}"
+        },
+        {
+          "call_id": "tc-045",
+          "quote": "\"summary\":{\"min\":6.0,\"max\":78.5,\"mean\":44.64"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F22",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "TIMING vs market-data-service's 13:22:25 cache-miss storm: redis's last log event before the incident is 13:18:40 ('background saving terminated with success') and its first fault event is 13:22:10 (primary marked down) / 13:22:52 (empty-replica promotion). redis's metric collapse is bucketed at 13:22 (240s bucket). So redis's earliest anomaly (13:22:10) precedes market-data-service's cache-miss storm (13:22:25) by only ~15 seconds, and the sub-bucket ordering is not resolvable from 240s buckets.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-046",
+          "quote": "2026-04-09T13:22:10Z"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "{\"ts\":\"2026-04-09T13:18:40Z\",\"level\":\"INFO\",\"message\":\"background saving terminated with success\"}"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "\"bucket_seconds\":240"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:10Z",
+      "id": "F23",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "redis-cache is confirmed 'redis' type with only these metrics available (no latency_p99_ms, no restarts): connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct — so redis-side latency itself cannot be measured directly; and the post-failover window shows cascading connection churn: 3x 'client reconnect storm: <n> new connections in <n>s' first at 13:30:20 (15048 in 10s, then 29623, then 92851) plus 2x 'MASTER <-> REPLICA sync started (full resync) for redis-cache-2' first at 13:28:42.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-025",
+          "quote": "available_metrics\":[\"connected_clients\",\"cpu_pct\",\"evictions_per_min\",\"hit_ratio_pct\",\"memory_pct\"]"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "client reconnect storm: 15048 new connections in 10s"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "MASTER <-> REPLICA sync started (full resync) for redis-cache-2"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:28:42Z",
+      "id": "F24",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "exchange-gateway latency_p99_ms was flat across 2026-04-09T12:30-14:00Z with no step at or before 13:18-13:22Z: every 4-min bucket sits between 119.96ms and 143.91ms (mean 130.86), e.g. 127.89ms at 13:18 and 136.81ms at 13:22 -- the same level as the 12:30 baseline (131.68ms).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-027",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":127.89,\"max\":133.48}"
+        },
+        {
+          "call_id": "tc-027",
+          "quote": "\"mean\":130.86"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F25",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway's upstream (external exchange feed) hop, upstream_latency_ms, is the metric most directly relevant to H2 and it is FLAT through the onset: 117.33ms avg at 13:18, 120.75ms at 13:22, versus a 12:30 baseline of 118.44ms; overall range 111.76-130.39ms, mean 119.77. No latency increase at or before 13:18-13:22.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-040",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":120.75,\"max\":124.78}"
+        },
+        {
+          "call_id": "tc-040",
+          "quote": "\"mean\":119.77"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F26",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway error_rate stayed at baseline (~0.18-0.29%) throughout 12:30-14:00Z (13:18 = 0.19, 13:22 = 0.19), and upstream_error_rate was a near-constant 0.30% (range 0.27-0.33, e.g. 0.30 at 13:18 and 13:22) -- no error escalation on the gateway or its upstream at onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-028",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":0.19,\"max\":0.31}"
+        },
+        {
+          "call_id": "tc-041",
+          "quote": "{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":0.3,\"max\":0.31}"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F27",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway request_rate (~266-284 req/s) and cpu_pct (~29-31%) show no load or saturation change at onset: 13:18 = 275.62 req/s and 13:20 = 29.52% CPU, matching the 12:30 baseline (272.43 req/s, 30.68% CPU). No restart-driven signal either. This rules out exchange-gateway itself being overloaded as the feed-slowdown mechanism.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-042",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":275.62,\"max\":287.58}"
+        },
+        {
+          "call_id": "tc-048",
+          "quote": "{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":29.52,\"max\":31.49}"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F28",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The exchange-gateway log stream contains exactly ONE WARN in 12:30-14:00Z -- a benign clock-drift notice at 13:19:38Z ('clock drift 38ms detected, resyncing with NTP') -- and ZERO entries matching 'snapshot' for the same window, i.e. the gateway logged no feed/snapshot fetch failures or slowdowns at onset (total_matched 0, truncated false). The gateway therefore exposes no evidence of a degraded exchange feed via logs.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-029",
+          "quote": "clock drift 38ms detected, resyncing with NTP"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "\"total_matched\":0"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:19:38Z",
+      "id": "F29",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Exchange-gateway is fully queryable and its complete metric set is cpu_pct, error_rate, latency_p99_ms, memory_pct, request_rate, restarts, upstream_error_rate, upstream_latency_ms -- so its feed-facing hop IS observable (upstream_latency_ms, upstream_error_rate), unlike exchange-api (has_telemetry:false). Every one of those gateway metrics that was queried stayed flat across onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-040",
+          "quote": "\"available_metrics\":[\"cpu_pct\",\"error_rate\",\"latency_p99_ms\",\"memory_pct\",\"request_rate\",\"restarts\",\"upstream_error_rate\",\"upstream_latency_ms\"]"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F30",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service inbound request_rate was completely flat across 12:30-14:00Z: mean 950.24 req/s, range 878.88-1044.69, 0 missing points, and the buckets straddling onset are unremarkable (13:16 = 946.42, 13:18 = 932.99, 13:20 = 992.73, 13:22 = 965.29, 13:24 = 937.32). There is no step up in inbound load or retry amplification at the 13:18-13:22 onset; MDS request rate stays in its normal ~900-990 band before and after. This argues against H3 (load/traffic spike or retry saturation of market-data-service) as the trigger.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-030",
+          "quote": "{\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":932.99,\"max\":936.97},{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":992.73,\"max\":997.46},{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":965.29,\"max\":983.54}"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "\"mean\":950.24"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-04-09T13:18:00Z",
+      "id": "F31",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "market-data-service CPU_pct stepped from a ~41-47% baseline straight to 90.0% avg (max 93.99) in the 13:22 bucket — the same bucket as the cache-miss storm and MDS error step — then held 82-92% through 14:00. This is the signature of MDS doing expensive work (rebuilding quotes from the exchange snapshot on cache misses) rather than being saturated by inbound load, since request_rate did not change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-039",
+          "quote": "{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":44.85,\"max\":45.18},{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":90.0,\"max\":93.99}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F32",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service error_rate (HTTP 5xx %) was flat at ~0.13-0.31% through the 13:20 bucket (13:20 = 0.15%), then stepped to 3.21% in the 13:22 bucket and held ~3.0-3.4% through 14:00. The MDS error step (13:22) is the same bucket as the miss storm and precedes pricing-engine's 3.02% error step (13:20 bucket, first error log 13:23:57).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-038",
+          "quote": "{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":0.15,\"max\":0.18},{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":3.21,\"max\":3.22}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F33",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "redis-cache hit_ratio_pct collapsed from a flat ~94.7-97.3% baseline through the 13:20 bucket (13:20 = 95.9%) to 10.82% in the 13:22 bucket, then climbed slowly (12.28 at 13:24, 18.29 at 13:40, 25.37 at 14:00) but never recovered. This is the cache-level confirmation that the 13:22:25 miss storm corresponds to a redis-side hit-ratio collapse, i.e. reads are missing cache-wide, not just for one service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-09T13:20:00Z\",\"avg\":95.9,\"max\":96.34},{\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":10.82,\"max\":11.2}"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F34",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "redis-cache metric set is ['connected_clients','cpu_pct','evictions_per_min','hit_ratio_pct','memory_pct'] — there is NO write_rate / set_rate / read-miss-rate metric, and market-data-service exposes only ['cpu_pct','error_rate','latency_p99_ms','memory_pct','request_rate','restarts'] with NO connection_pool_utilization or consumer_lag. So the requested write/set-rate vs read-miss-rate comparison (and pool/lag checks) cannot be made directly from the metric store; the hit_ratio_pct collapse is the only cache-level read-side evidence available.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-036",
+          "quote": "service 'redis-cache' has no metric 'write_rate'"
+        },
+        {
+          "call_id": "tc-036",
+          "quote": "available_metrics\":[\"connected_clients\",\"cpu_pct\",\"evictions_per_min\",\"hit_ratio_pct\",\"memory_pct\"]"
+        },
+        {
+          "call_id": "tc-031",
+          "quote": "service 'market-data-service' has no metric 'connection_pool_utilization'"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service"
+      ],
+      "time": "2026-04-09T14:00:00Z",
+      "id": "F35",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The redis hit_ratio collapse (13:22, 95.9%->10.82%) and the MDS miss storm (first_seen 13:22:25, F10) land in the same 120s bucket, immediately after MDS p99 first stepped (13:18 bucket, F11) but before pricing-engine's first deadline-exceeded log (13:23:57, F9). Combined with flat inbound request_rate, the temporal order is: MDS latency step -> cache hit-ratio collapse + miss storm + MDS CPU/error step -> pricing-engine deadline breaches; this is consistent with an inbound-load-driven trigger being absent and with a redis read-side availability/eviction event driving the miss storm (H1), rather than H3.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "\"ts\":\"2026-04-09T13:22:00Z\",\"avg\":10.82"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "\"ts\":\"2026-04-09T13:18:00Z\",\"avg\":932.99"
+        }
+      ],
+      "services": [
+        "market-data-service",
+        "redis-cache",
+        "pricing-engine"
+      ],
+      "time": "2026-04-09T13:22:00Z",
+      "id": "F36",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_accepted",
+  "stats": {
+    "latency_s": 177.59,
+    "llm_calls": 29,
+    "prompt_tokens": 200660,
+    "completion_tokens": 39089,
+    "total_tokens": 239749,
+    "tool_calls": 48,
+    "tool_attempts": 53,
+    "tool_failures": 6,
+    "tool_partial": 1,
+    "tool_recovered_by_retry": 2,
+    "rounds": 2,
+    "tasks": 6,
+    "tasks_failed": 0,
+    "findings": 36,
+    "findings_verified": 36,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 2,
+        "prompt_tokens": 3227,
+        "completion_tokens": 1291
+      },
+      "observability": {
+        "calls": 16,
+        "prompt_tokens": 123743,
+        "completion_tokens": 15267
+      },
+      "dependency": {
+        "calls": 6,
+        "prompt_tokens": 25080,
+        "completion_tokens": 5830
+      },
+      "reasoning": {
+        "calls": 2,
+        "prompt_tokens": 16609,
+        "completion_tokens": 6124
+      },
+      "critic": {
+        "calls": 2,
+        "prompt_tokens": 21131,
+        "completion_tokens": 3358
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 10870,
+        "completion_tokens": 7219
+      }
+    }
+  },
+  "warnings": [
+    "fact demoted to assumption: Precedent HIST-107 (2025-12-09, score 11) is the closest match to the current sy",
+    "fact demoted to assumption: The temporal order is market-data-service latency step -> cache hit-ratio collap"
+  ]
+}

@@ -1,0 +1,1992 @@
+{
+  "incident_id": "INC-008",
+  "system": "multi_agent",
+  "outcome": "inconclusive",
+  "summary": "Login degradation on auth-service (p99 ~3.8s, 503s on /v1/auth/login) began in the 06:48-06:52Z bucket and persists through 08:59Z; the 503s are self-generated accept-queue overflows from auth-service itself. The best-supported hypothesis is H3, auth-service-local CPU saturation (CPU pinned ~97%, no external load or change driver), but at 0.46 confidence it is below the 0.50 bar for a root-cause verdict, so this report is inconclusive. The reporter's bcrypt-regression framing (H1) is falsified: auth-service had zero deployments in 2026-04-15→04-22 (F3, F16) and the only change anywhere in the window is a logging-verbosity config edit (F2, F15). The shared redis-cache branches (H2/H4) are strongly weakened by flat redis-cache resource/health metrics and a clean co-consumer (F26, F29, F31-F37, F44, F45), but H3's own driver (genuine surge vs retry feedback vs an unknown CPU-bound code path) remains unresolved.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H3",
+      "title": "Auth-service-local CPU saturation (pathological CPU-bound work in auth-service) with no external load or change driver",
+      "statement": "Something inside auth-service began consuming essentially all available CPU at 06:52Z, pinning cpu_pct at ~96-98% and starving request acceptance so the accept queue overflowed and auth-service self-generated 503s on POST /v1/auth/login, with p99 rising to ~3.8s. The driver is auth-service-local; it is NOT shared-cache degradation (redis-cache telemetry is flat and co-consumers are clean), NOT a new auth-service release (none exists), and the load rise is a consequence (retry/feedback), not a preceding cause. The exact nature of the CPU-bound work (hashing path, lock/queue spin, retry feedback loop) is unresolved.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "null",
+      "confidence": 0.46,
+      "pre_cap_confidence": 0.46,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "At 06:48-06:52Z auth-service CPU steps from a 36-40% baseline to ~97% and stays pinned through 08:59Z; memory and restarts stay flat, so this is compute-bound, non-crashing saturation",
+          "finding_ids": [
+            "F9",
+            "F11"
+          ]
+        },
+        {
+          "claim": "Latency rises in the same bucket: p99 goes from ~88-94ms to ~3.8s and stays there",
+          "finding_ids": [
+            "F8"
+          ]
+        },
+        {
+          "claim": "The saturated CPU starves request acceptance, so the accept queue overflows and auth-service rejects its OWN requests with 'accept queue full, returning 503' (372 occurrences, first 06:55:42Z)",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "auth-service begins mass-limiting/self-rejecting: rate_limited_per_min explodes >400x (>400x from ~2 to ~900 req/min) in the same 06:52Z bucket",
+          "finding_ids": [
+            "F41",
+            "F43"
+          ]
+        },
+        {
+          "claim": "The request-rate rise is an EFFECT, not a cause: auth-service request_rate is flat ~374-406 req/s from the first available point (03:00Z) through 06:44Z, with no pre-onset ramp",
+          "finding_ids": [
+            "F39",
+            "F27",
+            "F38"
+          ]
+        },
+        {
+          "claim": "The post-onset ~3.6-3.8x rate amplification is mirrored at the HTTP caller api-gateway (stable ~1.18-1.27k req/s -> ~4.9k req/s at the same onset), the signature of a self-amplifying retry/feedback loop rather than an external surge",
+          "finding_ids": [
+            "F40",
+            "F42",
+            "F43"
+          ]
+        },
+        {
+          "claim": "Blast radius is confined to the api-gateway -> auth-service HTTP chain: the three other redis-cache consumers / neighbours (pricing-engine, portfolio-service, market-data-service) are completely flat across 06:45-07:15Z",
+          "finding_ids": [
+            "F48",
+            "F29",
+            "F44",
+            "F45"
+          ]
+        },
+        {
+          "claim": "The shared cache is not the transmission path because redis-cache shows no step at onset in any stored metric (cpu_pct, hit_ratio_pct, evictions_per_min, connected_clients, memory_pct) and no added load attributable to dep-5803 was visible between 05:50Z and onset",
+          "finding_ids": [
+            "F26",
+            "F34",
+            "F37",
+            "F31",
+            "F32",
+            "F33",
+            "F35",
+            "F46",
+            "F47"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F41",
+        "F43",
+        "F48",
+        "F29",
+        "F44",
+        "F45",
+        "F26",
+        "F34",
+        "F37",
+        "F31",
+        "F32",
+        "F33",
+        "F35",
+        "F46",
+        "F47"
+      ],
+      "contradicting_evidence": [
+        "F12",
+        "F27",
+        "F39",
+        "F40",
+        "F3",
+        "F16"
+      ],
+      "assumptions": [
+        "No autoscaling, scale-out, node-placement or cgroup CPU-throttle event fired at ~06:52Z (never checked); if one did, the 'static capacity floor' framing breaks and the trigger would be external, not auth-local",
+        "auth-service has a fixed CPU allotment that ~400 req/s of plain login traffic did not previously saturate — supported only indirectly by the 03:00-06:44Z flat-baseline period",
+        "The flat 03:00-06:44Z baseline generalises: the 00:00-03:00Z hours are genuinely absent from the series (F38) and could not be checked",
+        "The elevated ~1.5k req/s is retry amplification; no per-endpoint breakdown exists to prove the login endpoint is the sole amplified path (though the 503 log pattern points that way)",
+        "The absence of a bcrypt-style config/release change is complete for this window (residual env-var/flag gap)"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "portfolio-service v4.4.0 (dep-5803) loads shared redis-cache, degrading auth-service as a co-consumer",
+      "statement": "The only deployment in the window, portfolio-service v4.4.0 (dep-5803, 05:50Z, new CSV export endpoint), imposes new load on the SHARED redis-cache; auth-service, a co-consumer, loses its fast cache path and burns CPU ~97% on a cache-miss fallback, producing accept-queue 503s and ~3.8s p99. This remains the only change anywhere that precedes onset and can structurally reach auth-service.",
+      "category": "bad_deployment",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": "dep-5803",
+      "confidence": 0.09,
+      "pre_cap_confidence": 0.09,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5803 (portfolio-service v4.4.0) is the ONLY change of any kind across all services in the incident window, deployed 05:50Z, ~62 min before onset, still live (not rolled back)",
+          "finding_ids": [
+            "F1",
+            "F14",
+            "F22",
+            "F20"
+          ]
+        },
+        {
+          "claim": "portfolio-service and auth-service share redis-cache (shared=true, four consumers); portfolio-service also reaches the shared ledger-db and market-data-service — multiple shared channels exist",
+          "finding_ids": [
+            "F5",
+            "F17",
+            "F18",
+            "F21",
+            "F4"
+          ]
+        },
+        {
+          "claim": "The new CSV-export endpoint drives substantial NEW load onto the shared redis-cache and/or ledger-db in the 05:50-06:52Z window",
+          "finding_ids": []
+        },
+        {
+          "claim": "The shared cache degrades for co-consumers, so auth-service's cache-dependent auth work collapses onto an expensive CPU-bound fallback",
+          "finding_ids": []
+        },
+        {
+          "claim": "auth-service CPU pins ~97%, accept queue overflows, self-generated 503s appear, p99 ~3.8s",
+          "finding_ids": [
+            "F9",
+            "F10",
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F14",
+        "F22",
+        "F20",
+        "F5",
+        "F17",
+        "F18",
+        "F21",
+        "F4"
+      ],
+      "contradicting_evidence": [
+        "F26",
+        "F34",
+        "F31",
+        "F32",
+        "F33",
+        "F35",
+        "F37",
+        "F46",
+        "F47",
+        "F29",
+        "F44",
+        "F45",
+        "F48",
+        "F14",
+        "F22"
+      ],
+      "assumptions": [
+        "portfolio-service v4.4.0 was actually invoked and generated measurable new shared-component load (never measured; the CSV endpoint's traffic footprint is unknown)",
+        "A shared-cache load increase of that kind would manifest as auth-service CPU saturation rather than redis-side latency/hit-ratio change — a direction the redis data actively argues against",
+        "The ~62-minute quiet gap between the deploy and onset is compatible with a load-driven cause (a load increase should track invocation, not appear an hour later)"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H4",
+      "title": "Independent shared redis-cache failure (e.g. failover to empty replica) hits auth-service as a victim",
+      "statement": "The shared redis-cache failed over or degraded independently at ~06:52Z (HIST-107 cold-cache-storm shape), emptying the cache; consumers that hadn't warmed yet would do expensive fallback work, and auth-service's fallback is CPU-bound so it pins at ~97% and 503s its own logins. auth-service's own deploys are clean, so it would be a victim.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "redis-cache",
+      "trigger_change_id": "null",
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "The shared redis-cache undergoes an infrastructure event (failover / replica promotion / restart) at ~06:48-06:52Z",
+          "finding_ids": []
+        },
+        {
+          "claim": "All redis-cache consumers lose hits and do expensive fallback work",
+          "finding_ids": [
+            "F4",
+            "F17"
+          ]
+        },
+        {
+          "claim": "auth-service's fallback path is CPU-bound, pinning CPU ~97% and overflowing the accept queue with self-generated 503s",
+          "finding_ids": [
+            "F9",
+            "F10"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F7",
+        "F5",
+        "F17",
+        "F4"
+      ],
+      "contradicting_evidence": [
+        "F26",
+        "F34",
+        "F31",
+        "F32",
+        "F33",
+        "F35",
+        "F37",
+        "F46",
+        "F47",
+        "F29",
+        "F44",
+        "F45",
+        "F48"
+      ],
+      "assumptions": [
+        "A redis-cache failover/restart occurred at onset — no redis restart/replication/failover metric exists in available_metrics, so it can only be excluded indirectly",
+        "redis-cache could be serving slow responses while its five stored aggregate metrics stay flat (redis-cache latency_p99_ms is not stored at all)",
+        "A cold-cache event would leave hit_ratio_pct flat (only ~5 minutes of emptied cache before buckets recover) — an unverified premise"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H1",
+      "title": "Recurrence of the HIST-101 bcrypt cost-factor regression in auth-service",
+      "statement": "An auth-service change raised bcrypt cost factor (10->14 as in HIST-101), making each /v1/auth/login CPU-bound: CPU pins ~97%, acceptance starves, the accept queue overflows returning 503, p99 climbs to ~3.8s — an exact fingerprint match to HIST-101.",
+      "category": "bad_deployment",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "null",
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "A bcrypt cost/rounds change is introduced into auth-service",
+          "finding_ids": []
+        },
+        {
+          "claim": "Each login consumes far more CPU, driving auth-service CPU from ~38% to ~97% and pinning it",
+          "finding_ids": [
+            "F9"
+          ]
+        },
+        {
+          "claim": "The CPU-bound path starves request acceptance, the accept queue overflows, auth-service emits 503",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "p99 rises to ~3.8s and error rate to ~14%",
+          "finding_ids": [
+            "F8",
+            "F12"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F9",
+        "F10",
+        "F8",
+        "F6",
+        "F19"
+      ],
+      "contradicting_evidence": [
+        "F3",
+        "F16",
+        "F1",
+        "F14",
+        "F22",
+        "F2",
+        "F15",
+        "F20"
+      ],
+      "assumptions": [
+        "A bcrypt cost change could have arrived via an env-var/flag not modelled as a config_change (permanent residual gap)",
+        "auth-service deployment history back to 2026-04-15 is complete for this purpose"
+      ],
+      "rejection_reason": "The symptom fingerprint matches HIST-101, but the cause does not exist in this window: auth-service had ZERO deployments for 2026-04-15→04-22 (F3/F16), the only deployment anywhere in the window belongs to portfolio-service (F1/F14/F22), and the only config change anywhere is auth-service log.level INFO→WARN, a logging-verbosity-only change with no resource or dependency path to a CPU-bound failure (F2/F15/F20). No auth-service release, rollback, or hashing-cost change exists to match the reporter's framing; the mechanism is contradicted, not merely unsupported."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "Auth-service p99 latency rose from an ~88-94ms baseline to degraded values in the 06:52:00Z bucket (avg 1925.68 / max 3849.2 ms), with 06:56:00Z onward pinned at ~3700-3950ms; the 240s bucket places true onset in 06:48-06:52Z.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "Auth-service CPU jumped in the same 06:52:00Z bucket from a 36-40% baseline to ~97% (06:52 avg 96.76; 07:00 avg 97.49 max 98.35) and stayed ~96-98% through 08:59Z — sustained saturation, not a spike.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "The 503s are self-generated by auth-service: the only error pattern is 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)', 372 matches, first 06:55:42Z, last 08:58:57Z.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "Auth-service memory_pct stayed flat ~51-52% and restarts were 0.0 in every 06:00-08:59Z bucket, arguing against memory pressure or crash-looping.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "Auth-service request_rate was flat at ~375-406 req/s from the first available point (03:00Z) through the last pre-onset bucket (06:44Z avg 406.5) and stepped up in the SAME 06:52Z bucket (avg 1234.43/max 1813.74), then pinned ~1445-1526 req/s — the rise coincides with, not precedes, onset.",
+      "finding_ids": [
+        "F27",
+        "F39",
+        "F40"
+      ]
+    },
+    {
+      "statement": "Auth-service rate_limited_per_min was trivially small (~1.6-3.3 req/min) through 06:48Z, then exploded at the 06:52Z bucket (avg 226.53/max 902.06) and pinned ~880-930 req/min through 08:52Z — a >400x step, i.e. auth-service mass-rejecting its own requests at onset.",
+      "finding_ids": [
+        "F41"
+      ]
+    },
+    {
+      "statement": "Auth-service request_rate for 00:00-03:00Z is not present in the stored series: two separate queries both returned a first point of 03:00:00Z with missing_points=0, so the pre-03:00Z baseline is unverified.",
+      "finding_ids": [
+        "F38"
+      ]
+    },
+    {
+      "statement": "redis-cache cpu_pct is flat ~21-23% across 06:30-07:30Z (06:51 = 21.05, 06:52 = 21.99; summary min 20.59/max 25.59/mean 22.15, missing_points 0) — no step at the auth-service onset.",
+      "finding_ids": [
+        "F26",
+        "F34"
+      ]
+    },
+    {
+      "statement": "redis-cache hit_ratio_pct is flat across 06:30-07:15Z (06:48=95.41, 06:51=97.15, 06:52=96.89; min 94.44/max 97.4/mean 96.1) with no collapse at 06:48-06:52Z.",
+      "finding_ids": [
+        "F31"
+      ]
+    },
+    {
+      "statement": "redis-cache evictions_per_min shows no onset spike (06:48=3.78, 06:50=2.21, 06:52=4.25; min 1.17/max 4.42/mean 2.97) and is normally oscillating throughout.",
+      "finding_ids": [
+        "F32"
+      ]
+    },
+    {
+      "statement": "redis-cache connected_clients shows no connection surge at 06:48-06:52Z (06:51=307.38, 06:52=319.30; min 283.34/max 336.83/mean 309.16) — the 06:52 value is ordinary jitter.",
+      "finding_ids": [
+        "F33"
+      ]
+    },
+    {
+      "statement": "redis-cache memory_pct is flat with ordinary jitter across 06:30-07:15Z (06:52=72.0, 06:53=67.68; min 64.49/max 76.3/mean 69.97) — no memory-pressure step at onset.",
+      "finding_ids": [
+        "F35"
+      ]
+    },
+    {
+      "statement": "redis-cache stores exactly five metrics — connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct — and latency_p99_ms is NOT stored, so redis-cache internal latency is unreadable.",
+      "finding_ids": [
+        "F36"
+      ]
+    },
+    {
+      "statement": "pricing-engine (a redis-cache consumer that does NOT call auth-service) is completely unaffected at 06:45-07:15Z: latency_p99_ms stays 56-65ms and error_rate 0.12-0.32%, with no 06:52Z step.",
+      "finding_ids": [
+        "F29"
+      ]
+    },
+    {
+      "statement": "portfolio-service (the dep-5803 v4.4.0 target) shows no step at ~06:52Z: latency_p99_ms flat 164.72-190.67ms and error_rate flat 0.10-0.32% across 06:45-07:15Z.",
+      "finding_ids": [
+        "F44"
+      ]
+    },
+    {
+      "statement": "market-data-service (a redis-cache consumer and a service portfolio-service calls) shows no step at ~06:52Z: latency_p99_ms stays 35.67-42.56ms and error_rate 0.10-0.31%.",
+      "finding_ids": [
+        "F45"
+      ]
+    },
+    {
+      "statement": "api-gateway shows the same onset at 06:53Z (latency_p99_ms 06:51 avg 205.84/max 207.66 → 06:53 avg 2118.07/max 4024.51; error_rate 0.2% → 9.27%), expected as caller propagation since api-gateway calls auth-service.",
+      "finding_ids": [
+        "F28"
+      ]
+    },
+    {
+      "statement": "api-gateway's own request_rate shows the same amplified step at onset — from a flat ~1184-1267 req/s (03:00-06:30) to ~4858-4934 req/s pinned (07:00 avg 4888.46; 08:45 avg 4920.9) — mirroring downstream amplification across the HTTP tier.",
+      "finding_ids": [
+        "F42"
+      ]
+    },
+    {
+      "statement": "Auth-service had NO deployments in 2026-04-15→2026-04-22 (count 0), so no auth-service release precedes this incident and there is no rollback to point to.",
+      "finding_ids": [
+        "F3",
+        "F16"
+      ]
+    },
+    {
+      "statement": "Across all services in the incident window there was exactly ONE deployment: dep-5803, portfolio-service v4.4.0, at 2026-04-22T05:50:00Z by ci-bot ('CSV export endpoint'), status live, rolled_back_at null — ~62 min before the first degraded bucket.",
+      "finding_ids": [
+        "F1",
+        "F14",
+        "F22"
+      ]
+    },
+    {
+      "statement": "Exactly ONE config change existed across all services in the window: cfg-2801 on auth-service, log.level INFO→WARN at 2026-04-22T03:40:00Z by config-bot ('Reduce log volume') — a logging-verbosity change ~3h12m before onset with no resource path to a CPU-bound failure.",
+      "finding_ids": [
+        "F2",
+        "F15"
+      ]
+    },
+    {
+      "statement": "No redis-cache config changes were found in 2026-04-20→04-22 (count 0) and no portfolio-service config change existed 05:00-08:59Z (count 0); no change touched redis-cache or ledger-db in the 05:00-08:59Z window.",
+      "finding_ids": [
+        "F5",
+        "F17",
+        "F22",
+        "F23"
+      ]
+    },
+    {
+      "statement": "redis-cache is shared by FOUR services (auth-service, portfolio-service, pricing-engine, market-data-service), making it a common-path component through which dep-5803 could in principle affect auth-service; auth-service also depends on user-db (postgres, not shared) and kyc-provider (external, no telemetry).",
+      "finding_ids": [
+        "F4",
+        "F5",
+        "F17",
+        "F18"
+      ]
+    },
+    {
+      "statement": "redis-cache shows no added load attributable to the 05:50Z portfolio-service deploy: connected_clients flat ~296-322 across 05:50-07:15Z (05:50 avg 311.79; 06:50 avg 312.49) and hit_ratio_pct flat 94.0-98.08%; there is no per-service or command-level load metric attributable to portfolio-service.",
+      "finding_ids": [
+        "F46"
+      ]
+    },
+    {
+      "statement": "ledger-db cpu_pct (the shared DB portfolio-service writes to) shows no activity step around either the 05:50Z deploy or the 06:52Z onset: flat ~27.7-33.79% across 05:50-07:15Z.",
+      "finding_ids": [
+        "F47"
+      ]
+    },
+    {
+      "statement": "Historical incident HIST-101 (2025-08-14) 'Login latency after auth-service release' had the fingerprint login p99 4s + 503 on login + high cpu, root cause 'bcrypt cost factor raised 10->14 in release v6.4.0', resolved by rolling back v6.4.0 — matching current symptoms but requiring an auth-service release that does not exist in this window.",
+      "finding_ids": [
+        "F6"
+      ]
+    }
+  ],
+  "assumptions": [
+    "Assumed: no autoscaling, scale-out, node-placement or cgroup CPU-throttle event fired at ~06:52Z; this was never checked, and if one did fire, the 'static capacity floor' framing breaks and the trigger would be external rather than auth-local.",
+    "Assumed: auth-service has a fixed CPU allotment that ~400 req/s of plain login traffic did not previously saturate — supported only indirectly by the flat 03:00-06:44Z baseline, since pre-03:00Z data is absent.",
+    "Assumed: the flat 03:00-06:44Z baseline generalises to the 00:00-03:00Z hours, which are genuinely absent from the series and could not be checked.",
+    "Assumed: the post-onset ~1.5k req/s is retry amplification; no per-endpoint breakdown exists to prove the login endpoint is the sole amplified path, though the 503 log pattern points that way.",
+    "Assumed: the absence of a bcrypt-style config or release change is complete for this window, leaving a residual gap for an env-var/flag not modelled as a config_change.",
+    "Assumed: redis-cache could be serving slow responses while all five of its stored aggregate metrics stay flat, since redis-cache latency_p99_ms is not stored at all.",
+    "Assumed: no redis-cache restart/failover/replica-promotion occurred at onset — no such metric exists, so a HIST-107-type cold-cache event can only be excluded indirectly via flat hit_ratio and connected_clients.",
+    "Assumed: dep-5803 portfolio-service v4.4.0 either did not generate measurable new shared-component load or did so without leaving a trace in the five whole-cache redis metrics and ledger-db cpu_pct; its actual invocation rate is unknown.",
+    "Assumed: the ~62-minute gap between the 05:50Z deploy and 06:52Z onset is compatible with a load-driven cause; a load increase would normally track invocation rather than appear an hour later.",
+    "(demoted from facts: no verified observation backs it) Blast radius for 06:45-07:15Z: exactly TWO services step at ~06:52-06:53Z — auth-service (p99 88-94ms → ~3.8s, error ~0.2% → ~14%) and its HTTP caller api-gateway (p99 205.84 → 2118.07ms, error 0.2% → 9.27%); three services are flat through the same window (pricing-engine, portfolio-service, market-data-service). The degradation follows the api-gateway→auth-service call chain only, not the redis-cache fan-out.",
+    "(demoted from facts: no verified observation backs it) Historical precedents HIST-107 (2025-12-09, 'Cold cache storm after redis failover', empty replica promoted) and HIST-113 (2026-01-28, CPU saturation at volume) exist as the shared-cache-victim and CPU-saturation patterns, but neither establishes a mechanism for the current onset.",
+    "(demoted from facts: no verified observation backs it) The measured metrics support a retry/feedback-loop reading over an external-surge reading: auth-service's own request_rate is flat until the 06:52Z onset while its rate_limited_per_min saturates from ~2 to ~900 req/min at the same bucket and its caller api-gateway amplifies to ~4.9k req/s in that bucket, with no leading external ramp."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-22T03:00:00Z",
+      "event": "First available point of the auth-service request_rate / rate_limited_per_min series (00:00-03:00Z is absent); rate begins a tight ~374-406 req/s baseline that holds through 06:44Z.",
+      "finding_ids": [
+        "F38",
+        "F39"
+      ]
+    },
+    {
+      "time": "2026-04-22T03:40:00Z",
+      "event": "cfg-2801 applied to auth-service: log.level INFO→WARN ('Reduce log volume') — the only config change anywhere in the window.",
+      "finding_ids": [
+        "F2",
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-04-22T05:50:00Z",
+      "event": "dep-5803 deployed: portfolio-service v4.4.0 ('CSV export endpoint'), the only deployment anywhere in the window; status live, not rolled back.",
+      "finding_ids": [
+        "F1",
+        "F14",
+        "F22"
+      ]
+    },
+    {
+      "time": "2026-04-22T05:50:00Z",
+      "event": "redis-cache connected_clients and hit_ratio_pct flat from the deploy through 07:15Z; ledger-db cpu_pct also flat — no load step attributable to dep-5803.",
+      "finding_ids": [
+        "F46",
+        "F47"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:44:00Z",
+      "event": "Last pre-onset bucket: auth-service request_rate avg 406.5 req/s, still on baseline — no pre-onset traffic ramp.",
+      "finding_ids": [
+        "F39"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:48:00Z",
+      "event": "True onset window opens (240s metric bucket granularity); first degraded auth-service bucket reported at 06:52Z, so onset falls in 06:48-06:52Z.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "auth-service CPU steps 36-40% → ~97% (avg 96.76) and pins there through 08:59Z.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "auth-service p99 steps from ~88-94ms to 1925.68 avg / 3849.2 max ms in the same bucket.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "auth-service request_rate steps to 1234.43 avg / 1813.74 max and rate_limited_per_min explodes from ~2 to 226.53 avg — same bucket as the CPU/latency onset.",
+      "finding_ids": [
+        "F40",
+        "F41"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "redis-cache is flat across all five stored metrics in this bucket (cpu_pct 21.99, hit_ratio 96.89, evictions 4.25/min, clients 319.30, memory 72.0) — no shared-cache step at onset.",
+      "finding_ids": [
+        "F26",
+        "F31",
+        "F32",
+        "F33",
+        "F34",
+        "F35"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:53:00Z",
+      "event": "api-gateway (the HTTP caller of auth-service) steps in the same region: latency_p99_ms 205.84 → 2118.07 avg / 4024.51 max ms; error_rate 0.2% → 9.27%.",
+      "finding_ids": [
+        "F28"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "pricing-engine, portfolio-service and market-data-service show no step in the same 06:45-07:15Z window (all flat latency and error).",
+      "finding_ids": [
+        "F29",
+        "F44",
+        "F45",
+        "F48"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:55:42Z",
+      "event": "First self-generated 503 logged by auth-service: 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)'.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-04-22T07:06:00Z",
+      "event": "Incident INC-008 reported by on-call SRE (SEV-2): login latency ~4s and 503s, framed as suspected bcrypt regression after an auth-service release.",
+      "finding_ids": [
+        "F6",
+        "F16"
+      ]
+    },
+    {
+      "time": "2026-04-22T08:58:57Z",
+      "event": "Last recorded accept-queue-full 503 (372 matches total in the window).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-04-22T08:59:00Z",
+      "event": "End of observation: auth-service CPU still pinned ~96-98%, p99 ~3.8s, request_rate ~1515 req/s, rate_limited ~880-930 req/min; no auth-service deployment and no rollback exists to revert.",
+      "finding_ids": [
+        "F9",
+        "F40",
+        "F41",
+        "F3",
+        "F16"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Do NOT roll back or restart auth-service expecting a release fix: there is no auth-service deployment in the window (F3, F16) and no rollback target (F1/F14/F22 show the only artifact is portfolio-service v4.4.0, which is not implicated by its own telemetry — F44). Explicitly rule out H1/BCRYPT in the incident channel so responders do not chase the reporter's framing.",
+      "priority": "immediate",
+      "rationale": "The reported 'after an auth-service release' premise is factually unsupported; acting on it would waste mitigation time. F3/F16 falsify H1's required release; F44 shows the deploy target itself is healthy.",
+      "finding_ids": [
+        "F3",
+        "F16",
+        "F1",
+        "F14",
+        "F22",
+        "F44",
+        "F6"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Mitigate the observable failure mode at the edge: relieve auth-service intake pressure without changing auth-service code, e.g. shed/queue retries at api-gateway (and any internal client) for POST /v1/auth/login, since the 503s are self-generated accept-queue overflows (F10) and the post-onset ~1.5k req/s and ~900 req/min rate-limit are feedback amplification (F40, F41, F42, F43). Confirm the effect by watching auth-service request_rate / rate_limited_per_min and the 503 log count fall.",
+      "priority": "immediate",
+      "rationale": "The failure appears to include a self-amplifying retry loop; breaking the retry feedback at the caller is the safest lever and directly attacks the observed mechanism without touching an unverified root cause.",
+      "finding_ids": [
+        "F10",
+        "F40",
+        "F41",
+        "F42",
+        "F43",
+        "F28"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Obtain the auth-service CPU profile / stack and per-endpoint request breakdown during the pinned-CPU interval to identify the actual CPU-bound work (hashing path, lock/queue spin, or retry-loop processing). Auth-service exposes no goroutine/thread/pool metric (available_metrics = cpu_pct, error_rate, latency_p99_ms, memory_pct, rate_limited_per_min, request_rate, restarts), so this must come from a profiler or runtime introspection, not the metric store.",
+      "priority": "short_term",
+      "rationale": "H3's mechanism is grounded (F8/F9/F10/F41) but the specific CPU-bound work is explicitly unresolved; this is the single largest open question keeping confidence below threshold.",
+      "finding_ids": [
+        "F9",
+        "F8",
+        "F10",
+        "F41"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Verify the 'no external driver' claim directly: check for autoscaling, scale-out, node placement, cgroup CPU-throttle and capacity events on auth-service at ~06:48-06:52Z (only get_deployments/get_config_changes were used; these would not appear there). If a throttle or scale event exists at onset, the auth-local framing breaks.",
+      "priority": "short_term",
+      "rationale": "This is an explicitly listed assumption, never checked, and it is the main alternative explanation for a pinned-97% CPU floor.",
+      "finding_ids": [
+        "F9"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Close the redis-cache discrimination with data that was obtainable but never retrieved: (a) confirm via a cache-side probe (slowlog / INFO latency / monitoring) whether redis-cache served slow responses at 06:48-06:52Z, since latency_p99_ms is not stored (F36); (b) if the auth-service CPU-bound path is a cache-miss fallback, it would have been exercised by four consumers, yet only auth-service degraded (F48) — document this asymmetry. Keep H2/H4 as watch items until then.",
+      "priority": "short_term",
+      "rationale": "H2/H4 are contradicted by flat redis resource metrics and clean co-consumers (F26, F29, F31-F37, F44, F45, F46), but a slow-but-low-CPU cache cannot be excluded from stored metrics alone; the absence of a stored latency metric is the residual hole.",
+      "finding_ids": [
+        "F36",
+        "F26",
+        "F29",
+        "F31",
+        "F37",
+        "F46",
+        "F47",
+        "F48"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Instrument the missing observability permanently: store redis-cache latency_p99_ms and a restart/failover/replication metric (neither exists today — F36), add a per-service/command load breakdown for redis-cache and ledger-db (only whole-component aggregates exist — F46, F47), and add an auth-service connection-pool/goroutine metric plus a per-endpoint request breakdown so post-onset load can be attributed.",
+      "priority": "long_term",
+      "rationale": "Three of the decisive discriminators in this incident were unreadable purely because the metrics are not stored, forcing a by-elimination conclusion.",
+      "finding_ids": [
+        "F36",
+        "F46",
+        "F47"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Backfill or correct auth-service metric retention so the 00:00-03:00Z window exists (two queries returned a first point of 03:00:00Z with missing_points=0), and re-baseline the historical HIST-101/HIST-107 fingerprint detectors against the current artifact set so a bcrypt-style match cannot be triggered without a corresponding release.",
+      "priority": "long_term",
+      "rationale": "The 00:00-03:00Z blind spot blocks full verification of the no-pre-onset-surge claim, and the HIST-101 fingerprint match drove the initial misdiagnosis without the required release artifact.",
+      "finding_ids": [
+        "F38",
+        "F6",
+        "F19",
+        "F3",
+        "F16"
+      ],
+      "hypothesis_id": null
+    }
+  ],
+  "data_gaps": [
+    "No autoscaling, scale-out, node-placement or cgroup CPU-throttle telemetry was checked (only get_deployments/get_config_changes), so an alternative external cause of the pinned-97% auth-service CPU cannot be excluded.",
+    "auth-service request_rate and rate_limited_per_min have no datapoints before 2026-04-22T03:00:00Z (two queries both returned first point 03:00Z, missing_points=0), so the 375-405 req/s baseline and the 'no pre-onset surge' claim are UNVERIFIED for 00:00-03:00Z.",
+    "redis-cache latency_p99_ms is not a stored metric (only connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct), so a slow-but-resource-flat cache cannot be excluded and the 'no shared-cache degradation' conclusion rests on resource/health metrics plus the clean co-consumer pricing-engine.",
+    "No redis-cache restart/failover/replication metric exists, so a HIST-107-type empty-replica/cold-cache event at ~06:52Z cannot be directly confirmed or excluded from cache telemetry.",
+    "No per-service or command-level load metric exists for redis-cache or ledger-db (whole-component aggregates only), so a portfolio-service-specific load contribution from dep-5803 cannot be isolated or measured.",
+    "Whether the new portfolio-service v4.4.0 CSV export endpoint was invoked at all, and at what rate, is unknown (no request-log or per-endpoint metric available); its traffic footprint is unmeasured.",
+    "Portfolio-service CPU, request_rate and db_pool_in_use for 05:50-07:15Z, and ledger-db slow_queries_per_min, were not retrieved (budget exhausted), so a HIST-111-shape ledger-db read load from the new endpoint was neither confirmed nor excluded.",
+    "get_config_changes for user-db (2026-04-20→04-22) was never executed (budget exhausted), so config/db-level changes on auth-service's other direct dependency are unconfirmed.",
+    "No dependency graph was retrieved for portfolio-service beyond the redis-cache edge, so its other shared coupling (e.g. to user-db) is unverified.",
+    "kyc-provider is external with has_telemetry=false and no config/deployment feed, so an upstream external-dependency change affecting login latency cannot be ruled out.",
+    "auth-service exposes no connection-pool or goroutine/thread metric, so whether a pool/goroutine leak contributed alongside CPU saturation is unverified.",
+    "Blast-radius sweep is incomplete for 2 of 4 redis-cache consumers in the pre-round-3 state; portfolio-service and market-data-service were ultimately checked flat, but api-gateway has no rate_limited_per_min metric, so its retry/rate-limit path could not be compared to auth-service's.",
+    "Onset is only pinned to the 06:48-06:52Z 240s bucket; a sub-minute zoom was not run, so the first 503 log at 06:55:42Z is the only sub-5-minute anchor.",
+    "No verified observation of the specific CPU-bound work inside auth-service (profiling/stack) was obtained, so H3's exact mechanism remains unresolved."
+  ],
+  "what_would_change_the_conclusion": [
+    "Evidence that the post-onset ~1.5k req/s is a genuine external traffic surge that began BEFORE 06:48-06:52Z (e.g. a per-endpoint request series or load-balancer metrics showing a leading ramp) would move the onset driver outside auth-service and could promote H2-style shared-path or capacity explanations over auth-local saturation.",
+    "Discovery of an autoscaling, scale-out, node-placement or cgroup CPU-throttle event on auth-service at ~06:48-06:52Z would break the 'static capacity floor / auth-local' framing and indicate an external or platform trigger.",
+    "redis-cache telemetry showing a latency step, hit-ratio collapse, eviction storm, connection surge or a restart/failover at 06:48-06:52Z (none currently visible in stored metrics) would resurrect H2/H4 and make the shared cache the transmission path.",
+    "Per-service redis-cache command/request load attributable to portfolio-service rising between 05:50Z and 06:52Z would support H2's assumed hop from dep-5803 to auth-service.",
+    "A CPU profile or stack trace showing the pinned CPU is consumed by bcrypt/hashing work — combined with discovery of an unmodelled env-var/flag change to auth-service hashing cost — would rehabilitate H1 despite the zero-deployment record.",
+    "A user-db config change or DB-level event at ~06:48-06:52Z (never checked) would introduce a new candidate origin on auth-service's other direct dependency.",
+    "Evidence that a co-equal redis-cache consumer other than auth-service (pricing-engine/portfolio-service/market-data-service) was in fact degraded during 06:48-06:52Z, contradicting F29/F44/F45/F48, would indicate a shared-path cause and overturn the auth-local reading.",
+    "Any observable change or event at ~06:48-06:52Z (e.g. a config/flag push, a dependency restart, a network/DNS event) not present in the deployment and config feeds would name a new trigger and overturn the 'no external change driver' element of H3."
+  ],
+  "findings": [
+    {
+      "statement": "Across all services in the 2026-04-21T07:00Z→2026-04-22T08:59Z window there was exactly ONE deployment: dep-5803, portfolio-service v4.4.0, deployed 2026-04-22T05:50:00Z by ci-bot (\"CSV export endpoint\"), status \"live\", rolled_back_at null — i.e. ~76 min before the 07:06Z report.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "{\"id\":\"dep-5803\",\"service\":\"portfolio-service\",\"version\":\"v4.4.0\",\"deployed_at\":\"2026-04-22T05:50:00Z\",\"author\":\"ci-bot\",\"summary\":\"Holdings export\""
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-04-22T05:50:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Across all services in the same window there was exactly ONE config change: cfg-2801, auth-service, key log.level INFO→WARN at 2026-04-22T03:40:00Z by config-bot, described as \"Reduce log volume\" (a logging-verbosity change, ~3h26m before the report).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"id\":\"cfg-2801\",\"service\":\"auth-service\",\"key\":\"log.level\",\"old_value\":\"INFO\",\"new_value\":\"WARN\",\"changed_at\":\"2026-04-22T03:40:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T03:40:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service had NO deployments in the extended 2026-04-15→2026-04-22 window (count 0), so there is no auth-service release preceding this incident to match the reported 'after an auth-service release' claim.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "\"count\":0,\"deployments\":[],\"scope\":\"auth-service\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T08:59:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service dependency graph: auth-service → user-db (postgres, owner platform, not shared), auth-service → redis-cache (redis, SHARED=true), auth-service → kyc-provider (external, has_telemetry=false); api-gateway → auth-service (http caller).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"from\":\"auth-service\",\"to\":\"redis-cache\",\"kind\":\"cache\""
+        }
+      ],
+      "services": [
+        "auth-service",
+        "user-db",
+        "redis-cache",
+        "kyc-provider",
+        "api-gateway"
+      ],
+      "time": null,
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "redis-cache is shared by FOUR services — auth-service, portfolio-service, pricing-engine and market-data-service — making it a common-path component through which portfolio-service's new v4.4.0 deployment (dep-5803, 05:50Z) could affect auth-service. No redis-cache config changes were found in 2026-04-20→04-22.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"from\":\"portfolio-service\",\"to\":\"redis-cache\",\"kind\":\"cache\""
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "auth-service",
+        "portfolio-service",
+        "pricing-engine",
+        "market-data-service"
+      ],
+      "time": null,
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Historical incident HIST-101 (2025-08-14) 'Login latency after auth-service release' fingerprint: services [auth-service], symptoms [login p99 4s, 503 on login, high cpu], root cause 'bcrypt cost factor raised 10->14 in release v6.4.0', category bad_deployment, resolution 'Rolled back v6.4.0' (match_score 5). Related prior auth incidents: HIST-109 token-validation regression (401 invalid_token) and HIST-108 JWT key rotation (401 invalid_token).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"root_cause\":\"bcrypt cost factor raised 10->14 in release v6.4.0\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2025-08-14",
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A distinct historical precedent shows a shared/neighbour path to auth-like symptoms: HIST-107 (2025-12-09) 'Cold cache storm after redis failover' affecting redis-cache and market-data-service, root cause 'Redis primary failure promoted an empty replica', category infrastructure_failure.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"title\":\"Cold cache storm after redis failover\",\"services\":[\"redis-cache\",\"market-data-service\"]"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service"
+      ],
+      "time": null,
+      "id": "F7",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service p99 latency rose from a ~88-94ms baseline to degraded values starting in the 06:52:00Z bucket (avg 1925.68 / max 3849.2 ms); buckets from 06:56:00Z onward sit ~3700-3950ms (06:56 avg 3748.67 max 4012.81). The 240s bucket means true onset is in 06:48-06:52Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":1925.68,\"max\":3849.2}"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-04-22T06:48:00Z\",\"avg\":91.29,\"max\":94.6}"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"bucket_seconds\":240"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service CPU jumped at exactly the same 06:52:00Z bucket, from a 36-40% baseline to ~97% and pinned there (06:52 avg 96.76; 07:00 avg 97.49 max 98.35), staying ~96-98% through 08:59Z — sustained full saturation, not a spike.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":96.76,\"max\":96.96}"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-04-22T06:48:00Z\",\"avg\":36.75,\"max\":40.38}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The 503s are self-generated by auth-service, not downstream: the only error pattern is 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)' — 372 matches, first 2026-04-22T06:55:42Z, last 08:58:57Z — an accept-queue overflow at the app itself, consistent with a CPU-bound loop starving request acceptance.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "request rejected: accept queue full, returning 503 (POST /v1/auth/login)"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"first_match\":\"2026-04-22T06:55:42Z\""
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"count\":372"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:55:42Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service memory and restarts stayed healthy across onset, arguing against memory pressure or crash-looping: memory_pct flat ~51-52% before and after (06:48 avg 51.68/max 53.53; 07:52 avg 51.52) and restarts 0.0 in every 06:00-08:59Z bucket.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-04-22T07:52:00Z\",\"avg\":51.52,\"max\":54.79}"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "\"summary\":{\"min\":0.0,\"max\":0.0,\"mean\":0.0"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Request load and error rate rose at the same onset and stayed elevated: request_rate from ~394 req/s (06:40 avg 394.38) to 06:48 avg 669.05/max 1177.29, then ~1470-1540 req/s (06:56 avg 1519.55 max 1813.74); error_rate from ~0.2% to ~14% (06:48 avg 1.82 max 13.19; 06:56 avg 14.2).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-04-22T06:40:00Z\",\"avg\":394.38,\"max\":415.9}"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-04-22T06:56:00Z\",\"avg\":1519.55,\"max\":1813.74}"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-04-22T06:56:00Z\",\"avg\":14.2,\"max\":14.76}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Degradation is not evidently isolated to auth-service: api-gateway's cpu_pct (900s bucket) shows the same onset-region transition (06:30 avg 42.22, 06:45 avg 41.63, 07:00 avg 41.3) even though its CPU stays modest — but this is only a partial check; a full per-service latency/error sweep was not completed.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"bucket_seconds\":900"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-04-22T07:00:00Z\",\"avg\":41.3,\"max\":43.77}"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "api-gateway"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F13",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Across ALL services in the incident window (2026-04-22T00:00Z→08:59Z) there was exactly ONE deployment: dep-5803, portfolio-service v4.4.0, deployed 2026-04-22T05:50:00Z by ci-bot ('CSV export endpoint'), status live, rolled_back_at null — i.e. ~58 min before the first degraded bucket (06:52:00Z) and ~76 min before the 07:06Z report.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "dep-5803"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "2026-04-22T05:50:00Z"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Exactly ONE config change existed across all services in 2026-04-22T00:00Z→08:59Z: cfg-2801 on auth-service, log.level INFO→WARN at 2026-04-22T03:40:00Z by config-bot ('Reduce log volume') — a logging-verbosity change ~3h12m before onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "cfg-2801"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "log.level"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service had ZERO deployments in 2026-04-15→2026-04-22 (count 0), so there is no auth-service release preceding onset and no rollback of one to point to; the reporter's 'degradation after an auth-service release' framing is unsupported by release history.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service and portfolio-service share redis-cache (redis, shared=true), which is called by FOUR services (auth-service, portfolio-service, pricing-engine, market-data-service); no redis-cache config changes were found in 2026-04-20→04-22 (count 0), so the shared path exists but was not changed by config.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "shared"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "portfolio-service"
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "auth-service",
+        "portfolio-service"
+      ],
+      "time": null,
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "portfolio-service's dependency graph reaches redis-cache and the shared ledger-db (postgres, shared=true), and it also calls market-data-service (which itself uses redis-cache and exchange-gateway) — giving portfolio-service v4.4.0 multiple shared-component channels through which a neighbour could affect the four redis-cache consumers including auth-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "redis-cache"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "ledger-db"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "market-data-service"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The prior bcrypt incident HIST-101 fingerprint (2025-08-14) is login p99 4s + 503 on login + high cpu, root cause 'bcrypt cost factor raised 10->14 in release v6.4.0', resolved by rolling back v6.4.0 — matching current symptoms but requiring an auth-service release that does not exist in this window; a distinct precedent HIST-107 (shared-cache path) and HIST-113 (CPU saturation at volume) also exist as leads.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "bcrypt cost factor raised 10->14 in release v6.4.0"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "HIST-107"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F19",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Ranking the candidate change-to-symptom links by precedence and alignment with the 06:52Z onset: (1) dep-5803 portfolio-service v4.4.0 at 05:50Z — the only change anywhere that precedes onset and can reach auth-service via the shared redis-cache dependency chain (~62 min lead, plausible); (2) cfg-2801 auth-service log.level INFO→WARN at 03:40Z — precedes onset but is a logging-only change with no resource or dependency path to a CPU-bound failure (~3h12m lead, implausible); (3) no auth-service deployment exists (ruled out as a change candidate). Direct pre-onset causal evidence tying dep-5803 to auth-service was not retrievable within budget.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "dep-5803"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "cfg-2801"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "auth-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F20",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "portfolio-service dependency graph confirms it reaches the shared redis-cache and shared ledger-db (both SHARED=true), the two channels through which v4.4.0 could load common infrastructure; it also calls market-data-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-025",
+          "quote": "{\"from\":\"portfolio-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "{\"name\":\"ledger-db\",\"type\":\"postgres\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "{\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "redis-cache",
+        "ledger-db"
+      ],
+      "time": null,
+      "id": "F21",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "In the window 2026-04-22T05:00–08:59Z across ALL services there was exactly one deployment, dep-5803 portfolio-service v4.4.0 at 05:50:00Z ('CSV export endpoint', status live, rolled_back_at null) and zero config changes; no change touched redis-cache or ledger-db in that window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-039",
+          "quote": "\"id\":\"dep-5803\",\"service\":\"portfolio-service\",\"version\":\"v4.4.0\",\"deployed_at\":\"2026-04-22T05:50:00Z\""
+        },
+        {
+          "call_id": "tc-040",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "redis-cache",
+        "ledger-db"
+      ],
+      "time": "2026-04-22T05:50:00Z",
+      "id": "F22",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No portfolio-service config change existed 05:00–08:59Z (count 0) and no redis-cache config change in 2026-04-21→04-22 (count 0).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"portfolio-service\""
+        },
+        {
+          "call_id": "tc-028",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"redis-cache\""
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F23",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent HIST-102 (2025-09-02) 'Portfolio timeouts during ledger-db failover' shows portfolio-service itself is vulnerable to the shared ledger-db (504 at gateway), and HIST-111 (2025-05-22) shows a new report query on ledger-db caused full table scans / high db cpu — a same-shape risk for a new export/CSV endpoint.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-037",
+          "quote": "\"id\":\"HIST-102\",\"date\":\"2025-09-02\",\"title\":\"Portfolio timeouts during ledger-db failover\""
+        },
+        {
+          "call_id": "tc-037",
+          "quote": "\"New report query without index did sequential scans\""
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "ledger-db"
+      ],
+      "time": null,
+      "id": "F24",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent HIST-107 (2025-12-09) 'Cold cache storm after redis failover' affecting redis-cache and market-data-service (root cause 'Redis primary failure promoted an empty replica') is the shared-cache victim pattern that would look like H4; HIST-113 (2026-01-28) is the CPU-saturation-at-volume pattern behind H3. Neither establishes a mechanism for the current onset.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-037",
+          "quote": "\"Redis primary failure promoted an empty replica\""
+        },
+        {
+          "call_id": "tc-037",
+          "quote": "\"Record market-open volume exceeded provisioned capacity\""
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service",
+        "pricing-engine"
+      ],
+      "time": null,
+      "id": "F25",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache did NOT degrade at 06:48-06:52Z: its cpu_pct is flat ~21-23% across the whole 06:30-07:30Z window (06:48 avg 22.12/max 23.97; 06:51 avg 21.21/max 21.99; 06:54 avg 21.86), with summary min 20.59/max 25.59/mean 22.15 and missing_points 0 — no step at the auth-service onset. redis-cache exposes only [connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct]; latency_p99_ms and 'evictions' do not exist as metric names (not_found), so latency/eviction/failover/restart telemetry for the cache itself could not be read this round.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-029",
+          "quote": "\"ts\":\"2026-04-22T06:48:00Z\",\"avg\":22.12,\"max\":23.97"
+        },
+        {
+          "call_id": "tc-029",
+          "quote": "\"min\":20.59,\"max\":25.59,\"mean\":22.15"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "service 'redis-cache' has no metric 'latency_p99_ms'"
+        },
+        {
+          "call_id": "tc-031",
+          "quote": "service 'redis-cache' has no metric 'evictions'"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:48:00Z",
+      "id": "F26",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "auth-service request_rate was FLAT at ~375-405 req/s for the entire 03:00-06:45Z stretch (06:00 avg 392.47; 06:30 avg 395.86; 06:35 avg 405.51; 06:40 avg 394.49; 06:45 avg 390.98) and only lifts in the final bucket 06:50 avg 540.0/max 715.14 — i.e. the rise coincides with, not precedes, the ~06:48-06:52Z onset. There is NO genuine incoming surge before 06:48Z; the elevated 1470-1540 req/s seen after 06:56Z is consistent with retry amplification rather than an external traffic surge. NOTE: the query with start=00:00Z returned a first point of 03:00Z (summary first=364.51, total_points=233), so 00:00-03:00Z buckets were not returned and are unverified.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-032",
+          "quote": "\"ts\":\"2026-04-22T06:45:00Z\",\"avg\":390.98,\"max\":415.9"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "\"ts\":\"2026-04-22T06:50:00Z\",\"avg\":540.0,\"max\":715.14"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "\"first\":364.51,\"last\":715.14"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:50:00Z",
+      "id": "F27",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "api-gateway shows the SAME onset at 06:53Z, not only auth-service: latency_p99_ms jumps from 06:51 avg 205.84/max 207.66 to 06:53 avg 2118.07/max 4024.51, then pins 3766-4052 ms through 07:15Z; error_rate jumps from 06:53 avg 0.2% to 06:55 avg 9.27% and holds ~8.9-9.3%. This is expected for api-gateway since it calls auth-service (caller propagation), but it means the ~06:52 onset is not confined to auth-service in the HTTP tier.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-033",
+          "quote": "\"ts\":\"2026-04-22T06:53:00Z\",\"avg\":2118.07,\"max\":4024.51"
+        },
+        {
+          "call_id": "tc-034",
+          "quote": "\"ts\":\"2026-04-22T06:55:00Z\",\"avg\":9.27,\"max\":9.4"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-04-22T06:53:00Z",
+      "id": "F28",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "pricing-engine (a redis-cache consumer, but NOT a caller of auth-service) is completely UNAFFECTED across 06:45-07:15Z: latency_p99_ms stays 56-65 ms (06:51 avg 59.23; 06:53 avg 59.41; 06:59 max 65.16) and error_rate stays 0.12-0.32% throughout (06:53 avg 0.25; 07:15 avg 0.12). No 06:52Z step whatsoever — evidence against a shared redis-cache degradation propagating to all four consumers.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-035",
+          "quote": "\"ts\":\"2026-04-22T06:53:00Z\",\"avg\":59.41,\"max\":59.65"
+        },
+        {
+          "call_id": "tc-036",
+          "quote": "\"ts\":\"2026-04-22T06:53:00Z\",\"avg\":0.25,\"max\":0.29"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-04-22T06:53:00Z",
+      "id": "F29",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Discriminator results so far point AWAY from the shared-cache hypotheses H2/H4 and toward H3: (a) redis-cache itself has no CPU/resource anomaly at 06:48-06:52Z (flat 21-23%), (b) a co-equal redis-cache consumer, pricing-engine, shows no latency or error deviation at all across the onset window, whereas only auth-service and its caller api-gateway degrade, and (c) auth-service request_rate is flat until the onset bucket, so external surge-before-onset (genuine H3 driver) is also not evidenced — the post-onset rate rise is retry evidence. The onset therefore looks auth-service-local, not shared-path.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-029",
+          "quote": "\"mean\":22.15"
+        },
+        {
+          "call_id": "tc-035",
+          "quote": "\"mean\":59.78"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "\"ts\":\"2026-04-22T06:45:00Z\",\"avg\":390.98,\"max\":415.9"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "redis-cache",
+        "pricing-engine",
+        "api-gateway"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F30",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "redis-cache hit_ratio_pct is stable/flat across 2026-04-22T06:30-07:15Z at 60s buckets: 06:48=95.41, 06:49=95.42, 06:50=96.45, 06:51=97.15, 06:52=96.89, 06:53=95.40; summary min 94.44 / max 97.4 / mean 96.1, first 97.06, last 95.98, missing_points 0, total_points 46. There is NO hit-ratio collapse in the 06:48-06:52Z window (no value below 94.44 anywhere in the window; the window minimum 94.44 occurs at 06:56).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-041",
+          "quote": "{\"ts\":\"2026-04-22T06:50:00Z\",\"avg\":96.45"
+        },
+        {
+          "call_id": "tc-041",
+          "quote": "\"min\":94.44,\"max\":97.4,\"mean\":96.1"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F31",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache evictions_per_min shows NO spike at 06:48-06:52Z: values 06:48=3.78, 06:49=2.92, 06:50=2.21, 06:51=2.42, 06:52=4.25, 06:53=1.9/min — all within the window's normal oscillation; summary min 1.17 / max 4.42 / mean 2.97, missing_points 0. The window max 4.42 occurs at 06:54 (avg 4.42), i.e. after onset and not an out-of-family event (peers: 06:57 avg 4.06, 07:01 avg 4.32, 07:09 avg 4.3).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-042",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":4.25"
+        },
+        {
+          "call_id": "tc-042",
+          "quote": "\"min\":1.17,\"max\":4.42,\"mean\":2.97"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F32",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache connected_clients shows NO connection surge at 06:48-06:52Z: 06:48=310.01, 06:49=317.12, 06:50=310.79, 06:51=307.38, 06:52=319.30, 06:53=305.96 clients; summary min 283.34 / max 336.83 / mean 309.16, missing_points 0. Peers elsewhere in the same window reach the same ~336 max (06:46 avg 336.28, 07:07 avg 336.83), so the 06:52 value is ordinary jitter, not a step.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-043",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":319.3"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "\"min\":283.34,\"max\":336.83,\"mean\":309.16"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F33",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "re-confirmed redis-cache cpu_pct has no step at 06:48-06:52Z at TRUE 60s bucket resolution: 06:48=23.97, 06:49=20.69, 06:50=21.71, 06:51=21.05, 06:52=21.99, 06:53=20.59%; summary min 20.59 / max 25.59 / mean 22.15, missing_points 0. This reproduces F26's flat ~21-23% while the window max 25.59 is a single 06:33 bucket, not onset-related.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-045",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":21.99"
+        },
+        {
+          "call_id": "tc-045",
+          "quote": "\"min\":20.59,\"max\":25.59,\"mean\":22.15"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F34",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache memory_pct is flat with only ordinary jitter across 06:30-07:15Z: 06:48=70.37, 06:49=71.83, 06:50=68.33, 06:51=71.38, 06:52=72.0, 06:53=67.68%; summary min 64.49 / max 76.3 / mean 69.97, missing_points 0. No memory-pressure step at onset (the window max 76.3 is a lone 06:47 bucket, ~2.3h after the 05:50Z deployment but ~5 min before the 06:52Z onset and not sustained).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-044",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":72.0"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "\"min\":64.49,\"max\":76.3,\"mean\":69.97"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F35",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The stored-metric set for redis-cache is exactly five metrics — connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct — returned identically by all five query_metrics calls, and all five were retrievable with partial=false. latency_p99_ms is NOT stored for redis-cache (not in available_metrics), so redis-cache internal latency remains unreadable; every task-listed metric (hit_ratio_pct, evictions_per_min, connected_clients, memory_pct, cpu_pct) IS stored and was retrieved.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-041",
+          "quote": "\"available_metrics\":[\"connected_clients\",\"cpu_pct\",\"evictions_per_min\",\"hit_ratio_pct\",\"memory_pct\"]"
+        },
+        {
+          "call_id": "tc-042",
+          "quote": "\"partial\":false"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T06:30:00Z",
+      "id": "F36",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Across the entire 06:30-07:15Z window, no redis-cache metric shows a step change at 06:48-06:52Z, whereas auth-service p99/CPU stepped in exactly that bucket (F8/F9): redis-cache cpu_pct at 06:51 = 21.05 and 06:52 = 21.99 while auth-service CPU went to 96.76 at 06:52. This independently weakens H2/H4 (shared redis-cache as the propagating channel) from the cache-resource side.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-045",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":21.99"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F37",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The 00:00-03:00Z range for auth-service is genuinely NOT returned by this tool: both request_rate and rate_limited_per_min first points are 2026-04-22T03:00:00Z, and a narrowed 00:00-03:30Z query still returned only 31 points starting at 03:00:00Z (summary first=364.51, total_points=31). So the 375-405 req/s baseline CANNOT be verified for 00:00-03:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-046",
+          "quote": "\"ts\":\"2026-04-22T03:00:00Z\""
+        },
+        {
+          "call_id": "tc-047",
+          "quote": "\"first\":364.51"
+        },
+        {
+          "call_id": "tc-055",
+          "quote": "\"total_points\":31"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T03:00:00Z",
+      "id": "F38",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "From the first available point (03:00Z) through the last pre-onset bucket, auth-service request_rate holds a tight ~374-406 req/s baseline with no rise: 03:00 avg 379.4, 05:00 avg 382.06, 06:00 avg 391.86, 06:36 avg 403.48, 06:44 avg 406.5 (max 529.5). No bucket exceeds ~427 except the onset bucket, so there is NO pre-06:52Z incoming-traffic ramp within the measurable window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-22T06:44:00Z\",\"avg\":406.5,\"max\":529.5}"
+        },
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-22T06:36:00Z\",\"avg\":403.48,\"max\":427.65}"
+        },
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-22T03:00:00Z\",\"avg\":379.4,\"max\":399.9}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:44:00Z",
+      "id": "F39",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service request_rate steps up in the SAME 06:52Z bucket as the latency/CPU onset: 06:52 avg 1234.43/max 1813.74, then pinned ~1445-1526 req/s (07:00 avg 1488.7; 07:40 avg 1510.91; 08:52 avg 1515.78) — a ~3.6-3.8x jump over the ~400 baseline. The rise coincides with onset, does not precede it.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":1234.43,\"max\":1813.74}"
+        },
+        {
+          "call_id": "tc-047",
+          "quote": "{\"ts\":\"2026-04-22T07:40:00Z\",\"avg\":1510.91,\"max\":1606.53}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F40",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service rate_limited_per_min was flat and trivially small (~1.6-3.3 req/min) for every bucket 03:00-06:48Z (06:40 avg 2.21; 06:44 avg 1.63; 06:48 avg 1.94) then explodes at the 06:52Z bucket (06:52 avg 226.53/max 902.06; 06:56 avg 869.09) and pins ~880-930 req/min through 08:52Z — a >400x step, meaning auth-service itself began mass-rejecting/limiting its own requests at onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-048",
+          "quote": "{\"ts\":\"2026-04-22T06:48:00Z\",\"avg\":1.94,\"max\":2.22}"
+        },
+        {
+          "call_id": "tc-048",
+          "quote": "{\"ts\":\"2026-04-22T06:56:00Z\",\"avg\":869.09,\"max\":919.45}"
+        },
+        {
+          "call_id": "tc-046",
+          "quote": "{\"ts\":\"2026-04-22T06:44:00Z\",\"avg\":1.78,\"max\":2.22}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F41",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The post-onset load is NOT auth-login-specific: api-gateway's own request_rate shows the same amplified step at the same onset — from a flat ~1184-1267 req/s (03:00-06:30, e.g. 06:30 avg 1249.25) to 06:45 avg 2532.91/max 4859.74 and then pinned ~4858-4934 req/s (07:00 avg 4888.46; 08:45 avg 4920.9). The amplification appears at both the gateway and its downstream auth-service, i.e. mirrored across the HTTP tier, not confined to the login endpoint.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-056",
+          "quote": "{\"ts\":\"2026-04-22T06:30:00Z\",\"avg\":1249.25,\"max\":1324.64}"
+        },
+        {
+          "call_id": "tc-056",
+          "quote": "{\"ts\":\"2026-04-22T06:45:00Z\",\"avg\":2532.91,\"max\":4859.74}"
+        },
+        {
+          "call_id": "tc-056",
+          "quote": "{\"ts\":\"2026-04-22T07:00:00Z\",\"avg\":4888.46,\"max\":5197.35}"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F42",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Direction of causality: the metrics support a retry/feedback-loop reading over an external-surge reading. auth-service's own request_rate is flat until the 06:52Z onset (tc-047) while its rate_limited_per_min simultaneously saturates from ~2 to ~900 req/min (tc-048) and its downstream caller api-gateway amplifies to ~4.9k req/s at the same bucket (tc-056) — a self-amplifying pattern with no leading external ramp. This is an inference from the coincidence of unraised pre-onset rate with post-onset rejection/limiting at both tiers.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "\"avg\":406.5,\"max\":529.5"
+        },
+        {
+          "call_id": "tc-048",
+          "quote": "\"avg\":226.53,\"max\":902.06"
+        },
+        {
+          "call_id": "tc-056",
+          "quote": "\"avg\":4888.46,\"max\":5197.35"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "api-gateway"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F43",
+      "agent": "observability",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "portfolio-service (the dep-5803 v4.4.0 deploy target) shows NO step at ~06:52Z. Its latency_p99_ms (60s buckets) is flat across 06:45-07:15Z: 06:48 avg 164.72, 06:51 avg 183.05, 06:52 avg 183.83, 06:53 avg 175.4, 07:00 avg 187.98, summary min 164.72/max 190.67/mean 179.52, missing_points 0. error_rate is likewise flat 0.10-0.32% throughout (06:52 avg 0.22; 06:53 avg 0.3; 07:15 avg 0.18; summary min 0.1/max 0.32/mean 0.17). It behaves like pricing-engine (flat), NOT like auth-service/api-gateway (step up at ~06:52Z).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-049",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":183.83,\"max\":183.83}"
+        },
+        {
+          "call_id": "tc-050",
+          "quote": "\"summary\":{\"min\":0.1,\"max\":0.32,\"mean\":0.17"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F44",
+      "agent": "observability",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "market-data-service (a redis-cache consumer and a service portfolio-service calls) shows NO step at ~06:52Z. latency_p99_ms (60s buckets) stays 35.67-42.56 ms across 06:45-07:15Z (06:51 avg 41.5; 06:52 avg 37.83; 06:53 avg 41.44; summary mean 39.8, missing_points 0) and error_rate stays 0.10-0.31% (06:52 avg 0.21; 06:53 avg 0.13; summary min 0.1/max 0.31/mean 0.19). Flat, like pricing-engine — no propagation whatsoever.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-051",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":37.83,\"max\":37.83}"
+        },
+        {
+          "call_id": "tc-052",
+          "quote": "\"summary\":{\"min\":0.1,\"max\":0.31,\"mean\":0.19"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F45",
+      "agent": "observability",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache shows NO added load attributable to a pre-06:52Z portfolio-service deploy: connected_clients (180s buckets) is flat ~296-322 across 05:50-07:15Z (05:50 avg 311.79; 06:50 avg 312.49; 06:53 avg 307.71; 06:59 avg 295.32; summary min 273.86/max 337.64/mean 308.8, missing_points 0) — no ramp in the ~62 min between dep-5803 (05:50Z) and onset. hit_ratio_pct is similarly flat 94.0-98.08% (05:50 avg 96.34; 06:52-region 95.86-96.83; summary mean 96.0). redis-cache exposes only [connected_clients, cpu_pct, evictions_per_min, hit_ratio_pct, memory_pct] — there is NO per-service or command/request-load metric attributable to portfolio-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-053",
+          "quote": "\"summary\":{\"min\":273.86,\"max\":337.64,\"mean\":308.8,\"first\":323.37,\"last\":300.48,\"missing_points\":0,\"total_points\":86}"
+        },
+        {
+          "call_id": "tc-059",
+          "quote": "\"summary\":{\"min\":94.0,\"max\":98.08,\"mean\":96.0"
+        },
+        {
+          "call_id": "tc-058",
+          "quote": "\"available_metrics\":[\"connected_clients\",\"cpu_pct\",\"evictions_per_min\",\"hit_ratio_pct\",\"memory_pct\"]"
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-22T05:50:00Z",
+      "id": "F46",
+      "agent": "observability",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "ledger-db cpu_pct (the shared DB portfolio-service writes to) shows NO activity step around the 05:50Z dep-5803 deploy or the 06:52Z onset: flat ~27.7-33.79% across 05:50-07:15Z (05:50 avg 29.28; 06:11 avg 30.94; 06:50 avg 31.81/max 33.79; 06:53 avg 30.12; summary mean 30.2, missing_points 0). ledger-db exposes [connections_active, cpu_pct, disk_used_pct, replication_lag_ms, slow_queries_per_min] — but no per-service attribution to portfolio-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-054",
+          "quote": "{\"ts\":\"2026-04-22T06:50:00Z\",\"avg\":31.81,\"max\":33.79}"
+        },
+        {
+          "call_id": "tc-054",
+          "quote": "\"available_metrics\":[\"connections_active\",\"cpu_pct\",\"disk_used_pct\",\"replication_lag_ms\",\"slow_queries_per_min\"]"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F47",
+      "agent": "observability",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Blast-radius summary for 06:45-07:15Z: exactly TWO services step at ~06:52-06:53Z — auth-service (p99 88-94ms → ~3.8s, error ~0.2% → ~14%) and its HTTP caller api-gateway (p99 205.84 → 2118.07ms, error 0.2% → 9.27%). THREE services are flat through the same window — pricing-engine (p99 56-65ms, err 0.12-0.32%), portfolio-service (p99 164-191ms, err ≤0.32%) and market-data-service (p99 35.7-42.6ms, err ≤0.31%). The degradation does not follow the shared redis-cache fan-out (4 consumers) nor the portfolio-service→market-data-service chain; it follows the api-gateway→auth-service call chain only.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-049",
+          "quote": "\"summary\":{\"min\":164.72,\"max\":190.67,\"mean\":179.52"
+        },
+        {
+          "call_id": "tc-051",
+          "quote": "\"summary\":{\"min\":35.67,\"max\":42.56,\"mean\":39.8"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "api-gateway",
+        "pricing-engine",
+        "portfolio-service",
+        "market-data-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F48",
+      "agent": "observability",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_accepted",
+  "stats": {
+    "latency_s": 285.83,
+    "llm_calls": 35,
+    "prompt_tokens": 274772,
+    "completion_tokens": 52630,
+    "total_tokens": 327402,
+    "tool_calls": 59,
+    "tool_attempts": 59,
+    "tool_failures": 3,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 3,
+    "tasks": 8,
+    "tasks_failed": 0,
+    "findings": 48,
+    "findings_verified": 48,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 3,
+        "prompt_tokens": 7142,
+        "completion_tokens": 2418
+      },
+      "dependency": {
+        "calls": 11,
+        "prompt_tokens": 55977,
+        "completion_tokens": 8194
+      },
+      "observability": {
+        "calls": 14,
+        "prompt_tokens": 131792,
+        "completion_tokens": 19992
+      },
+      "reasoning": {
+        "calls": 3,
+        "prompt_tokens": 29099,
+        "completion_tokens": 9439
+      },
+      "critic": {
+        "calls": 3,
+        "prompt_tokens": 36706,
+        "completion_tokens": 5521
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 14056,
+        "completion_tokens": 7066
+      }
+    }
+  },
+  "warnings": [
+    "fact demoted to assumption: Blast radius for 06:45-07:15Z: exactly TWO services step at ~06:52-06:53Z — auth",
+    "fact demoted to assumption: Historical precedents HIST-107 (2025-12-09, 'Cold cache storm after redis failov",
+    "fact demoted to assumption: The measured metrics support a retry/feedback-loop reading over an external-surg"
+  ]
+}

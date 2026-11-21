@@ -1,0 +1,626 @@
+{
+  "incident_id": "INC-005",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Customer payment failures are real and are caused by an expired mTLS client certificate in payment-service. The client cert CN=payments-client.orangeinvest.internal reached notAfter=2026-04-02T12:15:00Z; from ~12:10Z onward every call to bank-partner-api fails with 'tls: expired certificate (alert 45)'. This drove bank_api_error_rate from 0.2% to 100% and payment_success_rate from ~99% to ~2.5%, while ~313 ERROR log lines and 140 PENDING_RETRY markings appear. The HTTP 5xx error_rate panel stayed green (~0.2%) because failed bank calls are recorded as PENDING_RETRY rather than 5xx, so the dashboard does not reflect the outage. All resource metrics (CPU, db pool, restarts), request rate, and other services (settlement, api-gateway) are normal, ruling out capacity/resource/deployment causes. Root-cause category: credential_expiry, originating in payment-service's own credential. Fix: renew/rotate the client cert and add expiry alerting.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "payment-service mTLS client certificate expired",
+      "statement": "The mTLS client certificate (CN=payments-client.orangeinvest.internal) used by payment-service to call bank-partner-api expired at 12:15:00Z. All outbound bank calls now fail TLS handshake (alert 45 certificate expired) and payments get marked PENDING_RETRY instead of completing, so real customers see failures while the HTTP 5xx error_rate panel stays green because the app returns a non-5xx outcome.",
+      "category": "credential_expiry",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": null,
+      "confidence": 0.9,
+      "pre_cap_confidence": 0.9,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Client cert notAfter=12:15:00Z reached, cert now invalid",
+          "finding_ids": [
+            "F4",
+            "F13"
+          ]
+        },
+        {
+          "claim": "TLS handshake with bank-partner-api rejected (alert 45)",
+          "finding_ids": [
+            "F4",
+            "F5"
+          ]
+        },
+        {
+          "claim": "bank_api_error_rate 0.2%->100% and payment_success_rate 99%->2.5%",
+          "finding_ids": [
+            "F2",
+            "F3"
+          ]
+        },
+        {
+          "claim": "Payments marked PENDING_RETRY instead of 5xx, so error_rate dashboard stays ~0.2%",
+          "finding_ids": [
+            "F1",
+            "F5"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "F13"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The expired cert is our own credential (payments-client.orangeinvest.internal) that we own and can rotate, not a vendor-managed cert",
+        "PENDING_RETRY payments do not eventually succeed automatically, matching customer complaints"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Bank partner API outage / dependency failure",
+      "statement": "bank-partner-api (external) is degrading or rejecting traffic, causing payment failures. This is what the report's 'bank side' guess suggests.",
+      "category": "dependency_failure",
+      "root_cause_service": "bank-partner-api",
+      "trigger_change_id": null,
+      "confidence": 0.08,
+      "pre_cap_confidence": 0.08,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F4",
+        "F5",
+        "F13",
+        "F1"
+      ],
+      "assumptions": [],
+      "rejection_reason": "The error is a TLS alert 45 specifically naming OUR client certificate's notAfter=2026-04-02T12:15:00Z expiry, not a partner-side 5xx/outage. Onset aligns exactly with the cert's expiry second, and the cert is our own CN, so the fault is our credential expiring rather than the partner degrading."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Config change (bank.api.timeout_ms 3000->5000)",
+      "statement": "Raising the bank API timeout to 5000ms caused bank call failures.",
+      "category": "config_change",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": null,
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F6"
+      ],
+      "contradicting_evidence": [
+        "F4",
+        "F2",
+        "F3"
+      ],
+      "assumptions": [],
+      "rejection_reason": "The change was at 11:20Z, ~55 minutes before onset (~12:10Z), and the error is a TLS expired-certificate alert, unrelated to timeout duration. Raising a timeout would slow failures, not cause 'tls: expired certificate'."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Bad deployment (settlement v1.9.0)",
+      "statement": "Deployment dep-5510 introduced the fault.",
+      "category": "bad_deployment",
+      "root_cause_service": "settlement-service",
+      "trigger_change_id": null,
+      "confidence": 0.01,
+      "pre_cap_confidence": 0.01,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F7"
+      ],
+      "contradicting_evidence": [
+        "F4",
+        "F11"
+      ],
+      "assumptions": [],
+      "rejection_reason": "The only deployment was to settlement-service at 10:30Z, not payment-service; settlement-service logged zero errors; the failure is a TLS credential expiry which a CSV exporter change could not produce."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "payment_success_rate fell from ~99% to ~2.5% beginning in the 12:10Z bucket and remained there.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "bank_api_error_rate rose from 0.2% to 50% at 12:10Z and reached 100% from 12:20Z onward.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "payment-service logs contain 171 'tls: expired certificate (alert 45)' entries naming CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z, plus 140 'mTLS handshake with bank-partner-api rejected' PENDING_RETRY entries.",
+      "finding_ids": [
+        "F4",
+        "F5"
+      ]
+    },
+    {
+      "statement": "The only config change in the window was payment-service bank.api.timeout_ms 3000->5000 at 11:20Z (before onset).",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "The only deployment was settlement-service v1.9.0 at 10:30Z, unrelated to payment-service.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "payment-service CPU (~30%), db_pool_in_use (~8), and restarts (0) were all normal throughout.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "request_rate was steady ~100 req/s, ruling out a traffic spike.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "settlement-service and api-gateway logged zero errors, isolating the failure to payment-service's bank call path.",
+      "finding_ids": [
+        "F11"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The client certificate CN=payments-client.orangeinvest.internal is owned/managed by our team (not the vendor), so it is the rotatable fault origin",
+    "PENDING_RETRY payments do not auto-complete, consistent with the ~40 customer tickets",
+    "No overlapping unrelated failure exists; payment-service/ledger-db/kafka metrics were checked only for the listed resource metrics",
+    "(demoted from facts: no verified observation backs it) payment-service HTTP 5xx error_rate stayed flat (~0.2%) across the incident window, so the dashboard was green while payments were failing.",
+    "(demoted from facts: no verified observation backs it) Historical incident HIST-106 was a settled prior case of an expired mTLS client certificate with no renewal automation."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-02T10:30:00Z",
+      "event": "settlement-service v1.9.0 deployed (unrelated, no errors observed)",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "time": "2026-04-02T11:20:00Z",
+      "event": "config change bank.api.timeout_ms 3000->5000 on payment-service",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:04:22Z",
+      "event": "first WARN 'retrying idempotent request after connection reset' in payment-service",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:10:00Z",
+      "event": "payment_success_rate starts collapsing; bank_api_error_rate jumps to 50%",
+      "finding_ids": [
+        "F2",
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:15:00Z",
+      "event": "client certificate CN=payments-client.orangeinvest.internal expires (notAfter)",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:15:27Z",
+      "event": "first 'mTLS handshake with bank-partner-api rejected' PENDING_RETRY error",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:16:44Z",
+      "event": "first 'tls: expired certificate (alert 45)' error logged",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:20:00Z",
+      "event": "bank_api_error_rate reaches 100%; payment_success_rate ~2.6%",
+      "finding_ids": [
+        "F3",
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:32:00Z",
+      "event": "support lead reports ~40 failed-transfer tickets (error dashboard still green)",
+      "finding_ids": [
+        "F1"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Rotate/renew the mTLS client certificate CN=payments-client.orangeinvest.internal and reload it into payment-service; verify bank-partner-api handshakes succeed.",
+      "priority": "immediate",
+      "rationale": "The cert's notAfter=2026-04-02T12:15:00Z has passed; all bank calls fail with alert 45 until a valid cert is presented.",
+      "finding_ids": [
+        "F4",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Reprocess the ~140+ payments marked PENDING_RETRY once the cert is valid so customers' transfers complete.",
+      "priority": "immediate",
+      "rationale": "Payments are stuck in PENDING_RETRY from the failed mTLS handshakes; customer impact persists until retried.",
+      "finding_ids": [
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add an alert on client-certificate expiry (e.g. warn 14-30 days out) and on bank_api_error_rate / payment_success_rate, which would have caught this despite the green 5xx panel.",
+      "priority": "short_term",
+      "rationale": "The error_rate dashboard missed the incident; HIST-106 was the same failure mode and its resolution included an expiry alert.",
+      "finding_ids": [
+        "F1",
+        "F2",
+        "F3",
+        "F12"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Automate certificate renewal/rotation to remove manual expiry risk.",
+      "priority": "long_term",
+      "rationale": "Repeat failure mode (HIST-106) attributed to 'no renewal automation'.",
+      "finding_ids": [
+        "F12"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Instrument bank-call outcomes as distinct signals (PENDING_RETRY, tls errors) so non-5xx failures surface on dashboards.",
+      "priority": "short_term",
+      "rationale": "Failed bank calls were recorded as PENDING_RETRY, not 5xx, hiding the outage from the error-rate panel.",
+      "finding_ids": [
+        "F1",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "No telemetry on bank-partner-api (external, has_telemetry=false), so its side is inferred only from our client's error messages",
+    "No certificate-store/deployment record showing when the cert was last rotated, so pre-expiry warning history is unknown",
+    "Exact count of affected customer payments/transactions beyond the 140 logged PENDING_RETRY markings is unquantified",
+    "logs are truncated (returned 40 of 313; 171 of the cert-error pattern shown) but the pattern and first/last timestamps are consistent across two queries"
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "payment-service HTTP 5xx error_rate stayed flat (~0.2%, max 0.32%) across 11:30-13:59Z, explaining why the error-rate dashboard looked green.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"metric\":\"error_rate\"... \"mean\":0.22"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:30:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": false,
+      "verification_note": "0/1 refs verified (tc-001: quote not found in tool output)"
+    },
+    {
+      "statement": "payment_success_rate collapsed from ~99% to ~2.5% starting in the 12:10Z bucket and stayed there.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":2.6"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"first\":98.72,\"last\":2.13"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:10:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "bank_api_error_rate jumped from 0.2% to 50% at 12:10Z then 100% from 12:20Z onward.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"ts\":\"2026-04-02T12:10:00Z\",\"avg\":50.1"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":100.0"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:10:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment-service logs show 311 ERROR entries 12:04-13:58Z with the dominant pattern being 'remote error: tls: expired certificate (alert 45); our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "tls: expired certificate (alert 45); our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"count\":171"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:16:44Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "140 ERROR log lines show payments marked PENDING_RETRY due to 'mTLS handshake with bank-partner-api rejected', first seen 12:15:27Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "payment <n> marked PENDING_RETRY: mTLS handshake with bank-partner-api rejected"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"first_seen\":\"2026-04-02T12:15:27Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:15:27Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only config change in the window was payment-service bank.api.timeout_ms raised 3000->5000 at 11:20Z, ~50 min before onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"key\":\"bank.api.timeout_ms\",\"old_value\":3000,\"new_value\":5000,\"changed_at\":\"2026-04-02T11:20:00Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:20:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only deployment in the window was settlement-service v1.9.0 (new CSV exporter) at 10:30Z, not payment-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"id\":\"dep-5510\",\"service\":\"settlement-service\",\"version\":\"v1.9.0\",\"deployed_at\":\"2026-04-02T10:30:00Z\""
+        }
+      ],
+      "services": [],
+      "time": "2026-04-02T10:30:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Resource metrics for payment-service stayed normal: cpu_pct ~30% flat, db_pool_in_use ~8 connections flat, restarts 0.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"mean\":30.12"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "\"mean\":7.99"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "\"max\":0.0"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:30:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "request_rate stayed steady ~100 req/s throughout, so traffic volume did not change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"mean\":100.4"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:30:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "payment-service depends on external bank-partner-api (no telemetry) via mTLS, plus ledger-db and kafka.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"bank-partner-api\",\"kind\":\"external\"}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T13:59:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service and api-gateway produced zero ERROR logs in 12:00-13:59Z, so the failure is isolated to payment-service's bank call path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "\"total_matched\":0"
+        }
+      ],
+      "services": [],
+      "time": "2026-04-02T12:00:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical incident HIST-106 is a prior 'Settlement mTLS certificate expired' with root cause 'Client certificate expired; no renewal automation' resolved by issuing a new cert and adding an expiry alert.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "Client certificate expired; no renewal automation"
+        }
+      ],
+      "services": [],
+      "time": "2025-06-30",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The failure is caused by OUR client certificate (CN=payments-client.orangeinvest.internal) expiring, not by the bank partner rejecting a valid cert or returning server-side errors; the bank is simply enforcing cert validity.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:15:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 60.93,
+    "llm_calls": 5,
+    "prompt_tokens": 47099,
+    "completion_tokens": 6479,
+    "total_tokens": 53578,
+    "tool_calls": 16,
+    "tool_attempts": 16,
+    "tool_failures": 0,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 13,
+    "findings_verified": 12,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 5,
+        "prompt_tokens": 47099,
+        "completion_tokens": 6479
+      }
+    }
+  },
+  "warnings": [
+    "fact demoted to assumption: payment-service HTTP 5xx error_rate stayed flat (~0.2%) across the incident wind",
+    "fact demoted to assumption: Historical incident HIST-106 was a settled prior case of an expired mTLS client "
+  ]
+}

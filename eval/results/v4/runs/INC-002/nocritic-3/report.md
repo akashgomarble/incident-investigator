@@ -1,0 +1,177 @@
+# Incident investigation report: INC-002
+*System: multi_agent | outcome: **root_cause_identified** | ended: critic_disabled*
+
+## Summary
+The portfolio page timeouts trace to a portfolio-service configuration change, not to the morning's gateway upgrade: cfg-2207 cut db.pool.max_size from 50 to 5 at 09:52Z, the pool pinned at exactly 5 connections in the same minute, and portfolio-service latency stepped from ~173ms to ~4.25s one bucket later, causing gateway 504s on /v1/portfolio/*. The HTTP/2 gateway upgrade at 08:00Z is contradicted as the origin because the gateway stayed healthy at ~200ms for ~1h52m after it and order-service, the other HTTP/2 target, never degraded. Confidence in the top hypothesis is medium (0.60), which is above the review threshold and clearly ahead of the rejected alternatives (0.08/0.05/0.03). Residual uncertainty is driven mostly by the absence of direct database/cache telemetry and by the fact that the 09:52 change-to-onset link rests on one-minute-granularity alignment plus corroborating precedent.
+
+## Probable root cause
+**portfolio-service JDBC pool ceiling cut (cfg-2207) exhausted the pool and backed up the portfolio path** -- config_change in `portfolio-service`, triggered by `cfg-2207` (confidence 0.60, medium)
+
+## Ranked hypotheses
+| # | Hypothesis | Category | Service | Trigger | Confidence | Status |
+|---|---|---|---|---|---|---|
+| 1 | H1: portfolio-service JDBC pool ceiling cut (cfg-2207) exhausted the pool and backed up the portfolio path | config_change | portfolio-service | cfg-2207 | 0.60 (medium) | active |
+| 2 | H3: ledger-db / shared datastore degradation stalled portfolio-service's JDBC pool | infrastructure_failure | ledger-db | null | 0.08 (low) | rejected |
+| 3 | H2: api-gateway HTTP/2-to-upstream envoy upgrade (dep-5220) broke connections to portfolio-service | bad_deployment | api-gateway | dep-5220 | 0.05 (low) | rejected |
+| 4 | H4: Traffic/load spike unrelated to any deploy saturated the portfolio path | capacity_saturation | portfolio-service | null | 0.03 (low) | rejected |
+
+### H1: portfolio-service JDBC pool ceiling cut (cfg-2207) exhausted the pool and backed up the portfolio path
+A cost-optimisation config change (cfg-2207) reduced portfolio-service db.pool.max_size from 50 to 5 at 09:52Z. The pool ceiling dropped to exactly 5 connections, requests that previously obtained a connection from a ~50-slot pool now queue ('could not acquire JDBC connection within 3000ms'), portfolio-service latency stepped from ~173ms to ~4.25s in the 09:53 bucket, and the gateway timed out on those upstream calls and returned 504s on /v1/portfolio/*. The gateway is the visible symptom; the origin is the config change on portfolio-service.
+
+**Causal chain**
+1. cfg-2207 applied at 09:52Z lowers portfolio-service db.pool.max_size 50 -> 5 [F8, F13]
+2. portfolio-service db_pool_in_use pins at exactly 5.0 (total=5, active=5, idle=0) from the 09:53 bucket onward, coinciding within one minute of the config change [F16, F6]
+3. At normal request concurrency, 5 connections are insufficient; callers wait on the pool and hit the 3000ms acquire timeout, with waiting threads up to 57 [F6]
+4. portfolio-service p99 steps from 172.69ms to 4250.91ms in the single 09:53 bucket [F5, F15]
+5. Upstream calls exceed the gateway timeout; gateway emits 'upstream timeout portfolio-service ... -> 504' and p99 steps ~200ms -> ~4.4s in the same minute [F3, F5, F14, F18]
+6. Users see the portfolio page spinning/504 [F2]
+
+**Supporting evidence**
+  - `F5` ✔ portfolio-service p99 was flat ~176-185ms until the 09:52 bucket, then jumped to avg 3744.86ms / max 4546.3ms and stayed ~4.1-4.2s; its first ERROR log is at 09:53:19Z.
+  - `F6` ✔ portfolio-service ERROR logs (503 of 505 matched entries) show database connection-pool exhaustion on the portfolio path: 'could not acquire JDBC connection within 3000ms' and HikariPool-1 with pool exhausted (total=5, active=5, idle=0, waiting up to 57).
+  - `F8` ✔ portfolio-service config change cfg-2207: key db.pool.max_size reduced 50 -> 5 at 2026-03-10T09:52:00Z by infra-automation, description "Apply cost-optimisation profile 'small' to service datasource". This is ~13 minutes before the 10:05Z incident report.
+  - `F13` ✔ Temporal ordering of the portfolio-path changes vs. onset: gateway HTTP/2 deploy 08:00Z, portfolio-service db.pool.max_size 50->5 at 09:52Z, incident reported 10:05Z. The config change is the closest-in-time change to the report (~13 min), the gateway deploy is ~2h05m before onset.
+  - `F14` ✔ Precise gateway onset: api-gateway p99 was ~200ms through the 09:52 bucket (200.33ms) then jumped to 4418.76ms in the 09:53 bucket — a clean one-bucket step, no ramp. The 09:52 bucket (09:52:00-09:53:00) was still normal.
+  - `F15` ✔ portfolio-service p99 shows the identical one-bucket step at the same instant: 172.69ms in the 09:52 bucket → 4250.91ms in the 09:53 bucket. Gateway and the downstream service degraded in the same minute, not sequentially.
+  - `F16` ✔ portfolio-service db_pool_in_use exactly tracks the cfg-2207 config change: it held ~11.3-12.7 connections through the 09:52 bucket (11.89), then was pinned at exactly 5.0 (max 5) from the 09:53 bucket onward — i.e. the pool ceiling dropped from ~50 to the configured max_size 5, coinciding within one minute with cfg-2207 at 09:52Z.
+  - `F18` ✔ The first gateway 504 log on the portfolio path is at 09:53:53Z ('upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504'), ~1m53s after the 09:52Z config change and ~1h54m after the 08:00Z gateway HTTP/2 deploy — consistent with errors beginning in the 09:53 bucket.
+  - `F19` ✔ Timing/blast-radius fit favours the pool config over the HTTP/2 deploy: the HTTP/2 upgrade was at 08:00Z but the gateway stayed healthy (~200ms p99) for ~1h52m after it, and both HTTP/2 targets did not degrade together (order-service flat). The 09:52Z db.pool.max_size 50->5 change is ~1-2 min before the single sharp onset, and the pool metric pins at exactly 5.0 in the same bucket. ledger-db itself shows no WARN/ERROR logs in 09:00-11:59Z, so the DB is not the failing component.
+**Contradicting evidence**
+  - (none)
+**Assumptions**
+  - The pool ceiling was the binding constraint: portfolio-service's steady-state concurrency genuinely needed >5 connections (pool_in_use had been ~11.9-12.7, so 5 would bind; F16 supports this).
+  - The 09:52Z config change was the cause of the bucket change rather than a coincidental co-occurrence with an unrelated 09:53 event; verified only by one-minute-granularity alignment of F16/F19.
+  - No other simultaneous change on ledger-db or market-data-service occurred (gap: config search may not be exhaustive).
+
+### H3: ledger-db / shared datastore degradation stalled portfolio-service's JDBC pool
+A shared component on the portfolio path (ledger-db, used also by order-service and payment-service, or redis-cache) became slow or saturated around 09:53Z, so portfolio-service connections were held by slow queries, filling the pool and producing acquire timeouts and 4s latency. If ledger-db were the origin, other consumers should also degrade.
+
+**Causal chain**
+1. A shared datastore (ledger-db) or cache on the portfolio path degrades around 09:53Z *(assumed)*
+2. Slow queries/reads hold portfolio-service JDBC connections, so the pool shows active=5, idle=0 [F6]
+3. Waiting callers exceed the 3000ms acquire timeout; portfolio latency steps to ~4.25s [F5, F6]
+4. Gateway times out upstream and returns 504 on /v1/portfolio/* [F3]
+
+**Supporting evidence**
+  - `F6` ✔ portfolio-service ERROR logs (503 of 505 matched entries) show database connection-pool exhaustion on the portfolio path: 'could not acquire JDBC connection within 3000ms' and HikariPool-1 with pool exhausted (total=5, active=5, idle=0, waiting up to 57).
+  - `F10` ✔ Dependency graph for /v1/portfolio/*: api-gateway -> portfolio-service (http); portfolio-service -> ledger-db (db), market-data-service (http), redis-cache (cache); market-data-service -> redis-cache (cache) and exchange-gateway (http). Shared components on this path: ledger-db (postgres, shared=true), redis-cache (redis, shared=true). ledger-db is a shared datastore also used by order-service and payment-service; redis-cache is shared by auth-service, market-data-service and portfolio-service.
+**Contradicting evidence**
+  - `F17` ✔ Blast radius is confined to the portfolio path despite HTTP/2 being enabled to BOTH portfolio-service and order-service: order-service p99 stayed flat at ~145-154ms across the entire 08:00-11:52Z window (e.g. 09:52 avg 150.3ms, 10:00 avg 151.02ms, last 11:52 avg 148.22ms), and api-gateway logged zero order-service/timeout WARN matching 'order'.
+  - `F19` ✔ Timing/blast-radius fit favours the pool config over the HTTP/2 deploy: the HTTP/2 upgrade was at 08:00Z but the gateway stayed healthy (~200ms p99) for ~1h52m after it, and both HTTP/2 targets did not degrade together (order-service flat). The 09:52Z db.pool.max_size 50->5 change is ~1-2 min before the single sharp onset, and the pool metric pins at exactly 5.0 in the same bucket. ledger-db itself shows no WARN/ERROR logs in 09:00-11:59Z, so the DB is not the failing component.
+**Assumptions**
+  - ledger-db or redis-cache actually slowed at onset; no DB/cache latency metric was retrieved (explicit gap).
+  - portfolio-service would hold, rather than promptly acquire, connections if the DB were merely slow.
+**Rejected because:** No positive evidence of a shared-component fault exists: ledger-db emits no WARN/ERROR in 09:00-11:59Z (F19) and no DB/cache metrics were queried (stated gap), so this rests on absence of logs. More decisively, a shared ledger-db fault would hit order-service too (order-service is a listed consumer, F10), but order-service p99 stayed flat across the whole window (F17). The pool signature (active=5, idle=0, total=5) is a hard ceiling of exactly the configured max_size, which points at the ceiling rather than at slow queries, and the ceiling change is independently timestamped at 09:52Z (F8, F16).
+
+### H2: api-gateway HTTP/2-to-upstream envoy upgrade (dep-5220) broke connections to portfolio-service
+The api-gateway v9.3.0 upgrade at 08:00Z enabled HTTP/2 to upstreams (envoy 1.29->1.30). A latent incompatibility (e.g. HTTP/2 max concurrent streams / connection churn against portfolio-service) caused upstream requests to be reset or time out, producing 504s on /v1/portfolio/* and the ~4.4s gateway p99. This is the reporter's hypothesis and matches precedent HIST-116.
+
+**Causal chain**
+1. dep-5220 deployed at 08:00Z enabling h2 to portfolio-service and order-service [F7]
+2. An envoy h2 misconfiguration causes upstream stream resets/timeouts to portfolio-service *(assumed)*
+3. Gateway p99 steps to ~4.4s and 5xx to ~7% at 09:53 [F1, F2, F14]
+4. Gateway logs 'upstream timeout portfolio-service ... 504'; users see portfolio page timeouts [F3]
+
+**Supporting evidence**
+  - `F3` ✔ api-gateway WARN logs are dominated by upstream timeouts to portfolio-service on the portfolio path: 252/254 matches are 'upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504', first seen 09:53:53Z.
+  - `F7` ✔ Only one deployment across all services in the 2026-03-09..2026-03-10T11:59Z window: api-gateway v9.3.0 (dep-5220) at 2026-03-10T08:00:00Z, 'Upgrade envoy filter chain; enable HTTP/2 to upstreams' (envoy 1.29->1.30, upstream protocol h2 for portfolio-service and order-service); status 'live', rolled_back_at null.
+  - `F11` ✔ Precedent HIST-116 (2025-12-18): "HTTP/2 resets after gateway envoy upgrade", services api-gateway, symptoms "504 at gateway","upstream resets","timeouts", root cause "Envoy upgrade changed HTTP/2 max concurrent streams default", category bad_deployment, resolution "Rolled back gateway". Lead only, not evidence about this incident.
+**Contradicting evidence**
+  - `F1` ✔ api-gateway p99 latency was flat ~200-230ms from 08:00 through 09:45, then jumped abruptly at the 09:50 bucket (avg 1849.99ms, max 4418.76ms) and stayed ~4.2-4.4s thereafter (last 4352.83).
+  - `F4` ✔ api-gateway is not resource-saturated: cpu_pct stayed ~40-46% throughout (09:00 42.29% ... 11:54 40.86%) and request_rate stayed flat ~1098-1395 req/s (09:45 1246.98 -> 09:50 1255.49), so the gateway's own load/resource did not spike at onset.
+  - `F17` ✔ Blast radius is confined to the portfolio path despite HTTP/2 being enabled to BOTH portfolio-service and order-service: order-service p99 stayed flat at ~145-154ms across the entire 08:00-11:52Z window (e.g. 09:52 avg 150.3ms, 10:00 avg 151.02ms, last 11:52 avg 148.22ms), and api-gateway logged zero order-service/timeout WARN matching 'order'.
+  - `F19` ✔ Timing/blast-radius fit favours the pool config over the HTTP/2 deploy: the HTTP/2 upgrade was at 08:00Z but the gateway stayed healthy (~200ms p99) for ~1h52m after it, and both HTTP/2 targets did not degrade together (order-service flat). The 09:52Z db.pool.max_size 50->5 change is ~1-2 min before the single sharp onset, and the pool metric pins at exactly 5.0 in the same bucket. ledger-db itself shows no WARN/ERROR logs in 09:00-11:59Z, so the DB is not the failing component.
+  - `F14` ✔ Precise gateway onset: api-gateway p99 was ~200ms through the 09:52 bucket (200.33ms) then jumped to 4418.76ms in the 09:53 bucket — a clean one-bucket step, no ramp. The 09:52 bucket (09:52:00-09:53:00) was still normal.
+**Assumptions**
+  - An envoy h2 defect or stream-limit default exists that only manifests after ~1h52m of healthy traffic and only for portfolio-service.
+  - The 09:53 step is attributable to the 08:00 deploy with a ~2h delayed onset, which no finding demonstrates.
+**Rejected because:** Timing and scope contradict it. The gateway was healthy at ~200ms p99 for ~1h52m after the 08:00Z deploy (F1, F14, F19); a code/config defect normally manifests at deploy or first path exercise, not after a quiet 2-hour gap. Blast radius is also wrong: HTTP/2 was enabled to BOTH portfolio-service and order-service, yet order-service p99 stayed flat ~145-154ms and the gateway logged zero order-path timeouts (F17). The gateway itself shows no resource or request-rate change (F4), and its degradation is simultaneous with portfolio-service (F15), not upstream of it. The only corroboration is a legacy precedent (HIST-116, F11), which is a lead, not evidence.
+
+### H4: Traffic/load spike unrelated to any deploy saturated the portfolio path
+A sudden increase in request volume against /v1/portfolio/* (or downstream) saturated the portfolio path's fixed resources and produced timeouts, independent of the gateway deploy and the pool config.
+
+**Causal chain**
+1. Inbound request rate to the portfolio path rises sharply near 09:53Z *(assumed)*
+2. The path's pool/latency capacity is exceeded, causing queueing *(assumed)*
+3. portfolio-service and gateway latency step to ~4.2-4.4s; gateway returns 504s [F5, F14]
+
+**Supporting evidence**
+  - `F5` ✔ portfolio-service p99 was flat ~176-185ms until the 09:52 bucket, then jumped to avg 3744.86ms / max 4546.3ms and stayed ~4.1-4.2s; its first ERROR log is at 09:53:19Z.
+**Contradicting evidence**
+  - `F4` ✔ api-gateway is not resource-saturated: cpu_pct stayed ~40-46% throughout (09:00 42.29% ... 11:54 40.86%) and request_rate stayed flat ~1098-1395 req/s (09:45 1246.98 -> 09:50 1255.49), so the gateway's own load/resource did not spike at onset.
+  - `F16` ✔ portfolio-service db_pool_in_use exactly tracks the cfg-2207 config change: it held ~11.3-12.7 connections through the 09:52 bucket (11.89), then was pinned at exactly 5.0 (max 5) from the 09:53 bucket onward — i.e. the pool ceiling dropped from ~50 to the configured max_size 5, coinciding within one minute with cfg-2207 at 09:52Z.
+  - `F19` ✔ Timing/blast-radius fit favours the pool config over the HTTP/2 deploy: the HTTP/2 upgrade was at 08:00Z but the gateway stayed healthy (~200ms p99) for ~1h52m after it, and both HTTP/2 targets did not degrade together (order-service flat). The 09:52Z db.pool.max_size 50->5 change is ~1-2 min before the single sharp onset, and the pool metric pins at exactly 5.0 in the same bucket. ledger-db itself shows no WARN/ERROR logs in 09:00-11:59Z, so the DB is not the failing component.
+**Assumptions**
+  - A traffic spike occurred; no request-rate or RPS metric for portfolio-service was retrieved, and the one available rate metric (gateway, F4) shows no spike.
+**Rejected because:** The only request-rate evidence available shows the gateway flat at ~1098-1395 req/s with no step at onset (F4), and the gateway CPU also stayed flat ~40-46% (F4). The pool metric pins at exactly the configured max_size 5 (F16) rather than at a value reflecting unexpectedly high concurrency, and no load metric shows any discontinuity. The sharpest discontinuity in the data is a configuration value, not a demand value (F16, F19).
+
+## Facts (verified observations)
+- portfolio-service config change cfg-2207 reduced db.pool.max_size from 50 to 5 at 2026-03-10T09:52:00Z by infra-automation, described as applying cost-optimisation profile 'small' to the service datasource; it is the only change on the portfolio path near onset (~13 min before the 10:05Z report). [F8]
+- portfolio-service db_pool_in_use held ~11.3-12.7 connections through the 09:52 bucket (11.89) then was pinned at exactly 5.0 (max 5) from the 09:53 bucket onward, coinciding within one minute with cfg-2207. [F16]
+- portfolio-service p99 was flat ~176-185ms until the 09:52 bucket, then stepped cleanly to 4250.91ms in the 09:53 bucket and stayed ~4.1-4.2s; its first ERROR log is at 09:53:19Z. [F5, F15]
+- portfolio-service ERROR logs (503 of 505 matched entries) show JDBC connection-pool exhaustion on the portfolio path: 'could not acquire JDBC connection within 3000ms' and HikariPool-1 exhausted (total=5, active=5, idle=0, waiting up to 57). [F6]
+- api-gateway p99 was flat ~200-230ms from 08:00 through the 09:52 bucket (200.33ms), then jumped to 4418.76ms in the 09:53 bucket — a clean one-bucket step with no ramp — and stayed ~4.2-4.4s. [F1, F14]
+- Gateway HTTP 5xx rate rose from ~0.2% to ~7.1-7.5% in the same 09:50-09:53 window, and gateway WARN logs are dominated (252/254) by 'upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504', first seen 09:53:53Z. [F2, F3, F18]
+- Gateway and portfolio-service degraded in the same minute (identical one-bucket step at 09:53), rather than the gateway degrading upstream of the service. [F15, F14]
+- The gateway was not resource-saturated: cpu_pct stayed ~40-46% and request_rate stayed flat ~1098-1395 req/s with no step at onset. [F4]
+- Only one deployment occurred across all services in the 2026-03-09..2026-03-10T11:59Z window: api-gateway v9.3.0 (dep-5220) at 08:00Z enabling HTTP/2 to upstreams for both portfolio-service and order-service; it was not rolled back. [F7]
+- Blast radius is confined to the portfolio path: order-service p99 stayed flat ~145-154ms across the entire 08:00-11:52Z window and the gateway logged zero order-path timeout WARNs. [F17]
+- The dependency graph for /v1/portfolio/* is api-gateway -> portfolio-service -> ledger-db / market-data-service / redis-cache; ledger-db is a shared datastore also used by order-service and payment-service. [F10]
+- Precedents exist for both mechanisms: HIST-116 (HTTP/2 resets after a gateway envoy upgrade, resolved by rollback) and HIST-115 (connection pool exhausted due to a wrong environment profile); these are leads only, not evidence about this incident. [F11, F12]
+
+## Assumptions (not verified)
+- The pool ceiling was the binding constraint: portfolio-service's steady-state concurrency genuinely needed more than 5 connections (pool_in_use had been ~11.9-12.7), so a ceiling of 5 would bind.
+- The 09:52Z config change caused the bucket change rather than coincidentally co-occurring with an unrelated 09:53 event; this is supported only by one-minute-granularity alignment of the config timestamp and the pool/latency buckets.
+- No other simultaneous change on ledger-db, redis-cache or market-data-service occurred; the config-change search may not be exhaustive.
+- The ledger-db health statement rests on the absence of WARN+ logs, not on positive DB/cache latency metrics.
+- Gateway and service timestamps are comparable enough that the 'same-minute' step is real and not an artifact of differing metric collection alignment.
+- (demoted from facts: no verified observation backs it) ledger-db emits no WARN/ERROR logs in 09:00-11:59Z.
+
+## Timeline
+- `2026-03-10T07:00:00Z` Unrelated change: order-service log.sampling_rate 0.1 -> 0.2 by config-bot (order path, not portfolio path). [F9]
+- `2026-03-10T08:00:00Z` api-gateway v9.3.0 (dep-5220) deployed: envoy 1.29->1.30, HTTP/2 enabled to upstreams for portfolio-service and order-service. This is the reporter's suspected cause. [F7]
+- `2026-03-10T08:00:00Z` Gateway healthy at ~200-230ms p99 from deploy through 09:52 (~1h52m of normal operation); order-service also stays flat ~145-154ms. [F1, F14, F17]
+- `2026-03-10T09:52:00Z` portfolio-service config change cfg-2207: db.pool.max_size reduced 50 -> 5 by infra-automation (cost-optimisation profile 'small'). [F8]
+- `2026-03-10T09:52:00Z` Last normal bucket: portfolio-service p99 172.69ms / gateway p99 200.33ms; portfolio-service db_pool_in_use 11.89. [F14, F15, F16]
+- `2026-03-10T09:53:00Z` Sharp single-bucket onset: portfolio-service p99 4250.91ms and gateway p99 4418.76ms in the same minute; portfolio-service db_pool_in_use pinned at exactly 5.0. [F15, F14, F16]
+- `2026-03-10T09:53:19Z` portfolio-service first ERROR: 'could not acquire JDBC connection within 3000ms'; HikariPool-1 exhausted (total=5, active=5, idle=0, waiting up to 57). [F6, F5]
+- `2026-03-10T09:53:53Z` First gateway 504 log: 'upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504'. [F3, F18]
+- `2026-03-10T10:05:00Z` Incident INC-002 reported by on-call SRE; symptoms: gateway p99 > 4s, 504s on /v1/portfolio/*. []
+- `2026-03-10T11:59:00Z` Sustained degradation: gateway p99 ~4.35s, 5xx ~7.25%, portfolio-service p99 ~4.1-4.2s; order-service still flat ~148ms. [F1, F2, F5, F17]
+
+## Recommended actions
+- **[immediate]** Revert cfg-2207 on portfolio-service: restore db.pool.max_size from 5 to 50 (or the pre-change cost-profile value) and restart/refresh the datasource pool on portfolio-service. -- The pool is pinned at exactly the configured max_size 5 with active=5, idle=0 and acquire timeouts, so lifting the ceiling removes the binding constraint; this is the single change closest in time to onset. [F8, F16, F6]
+- **[immediate]** Verify recovery on portfolio-service (db_pool_in_use back above ~11, p99 back to ~173ms, zero 'could not acquire JDBC connection' errors) and on api-gateway (p99 back to ~200ms, 504 rate on /v1/portfolio/* back to ~0). -- Confirms the pool ceiling was the binding constraint and that the gateway symptoms were downstream of it; if recovery does not follow, the H1 attribution must be revisited. [F16, F5, F1, F2]
+- **[immediate]** Do NOT roll back the api-gateway v9.3.0 / dep-5220 HTTP/2 upgrade as the first action; if a rollback is considered, treat it as a controlled experiment ordered after the cfg-2207 revert, and only if symptoms persist. -- The gateway was healthy for ~1h52m post-deploy and order-service (the other HTTP/2 target) never degraded, so the upgrade is not the evidenced cause; an unnecessary rollback would add a second variable mid-incident. [F1, F14, F17, F13]
+- **[short_term]** Add a guardrail so cost-optimisation datasource profiles cannot set db.pool.max_size below a validated minimum, and require a canary/gradual rollout with automatic rollback for pool-size changes on portfolio-service. -- The change was applied by infra-automation with a human-out-of-loop cost profile and drove the incident within roughly one minute; HIST-115 shows the same failure class from a wrong environment profile. [F8, F12]
+- **[short_term]** Add alerting on connection-pool saturation (e.g. Hikari waiting-thread count > 0 or pool_in_use at max_size for > 1 min) on portfolio-service and other services with JDBC pools, so pool exhaustion is paged before the gateway starts returning 504s. -- Detection currently depends on gateway 504s and upstream-timeout WARNs, which lagged the true cause by roughly the pool-fill time; the pool metric was the earliest clean signal. [F6, F3, F16]
+- **[short_term]** Re-validate the still-live gateway HTTP/2 configuration (dep-5220) against portfolio-service under sustained load, including stream limits, to close out the reporter's hypothesis with positive evidence rather than absence of symptoms. -- H2 is rejected on timing and blast radius, not on a direct test; the upgrade is still live and HIST-116 is a real precedent for a delayed-manifestation class of issue, so a targeted check is cheap insurance. [F7, F11, F17]
+- **[long_term]** Inventory and audit other cost-optimisation/capacity profiles applied in the same automation run or campaign, and re-check any service whose pool ceiling dropped near its steady-state concurrency. -- cfg-2207 was applied by infra-automation as a profile; the same campaign may have set ceilings close to or below other services' real concurrency, creating latent repeats of this incident. [F8]
+- **[long_term]** Improve portfolio-path observability: ingest DB- and cache-level latency/saturation metrics for ledger-db and redis-cache, and ensure the JDBC pool exposes waiting-thread and acquire-timeout metrics, so future incidents can positively confirm or exclude shared-component faults. -- During this incident the database health assessment rested on absence of logs, which is not credible evidence; the shared components on the path had no telemetry retrieved at all. [F10, F19]
+
+## Data gaps
+- No per-service metrics/logs for the other portfolio-path services or for the shared database behind portfolio-service's JDBC pool; cannot positively confirm the DB/cache were healthy, only that ledger-db emitted no WARN+ logs. Limits H3 exclusion to absence-of-logs evidence.
+- No DB-level latency, connection or cache metrics were retrieved for ledger-db or redis-cache, so a slow-query holding connections cannot be positively excluded.
+- The gateway upgrade timestamp was taken from the deployment record rather than independent telemetry/change-log verification; the report's original 'earlier today' framing was not cross-checked.
+- Config-change search may not be exhaustive (pagination / scope unknown) and did not cover ledger-db or redis-cache DB-level changes; a simultaneous change on a shared component could have been missed.
+- Deployment search covered only 2026-03-09..2026-03-10; an older still-live deployment outside that window would not appear in the timeline.
+- api-gateway ERROR logs returned 0 matches (errors only at WARN), so there is no gateway-side ERROR signature beyond upstream-timeout lines.
+- No request-rate metric exists for portfolio-service itself; the no-traffic-spike conclusion relies on the gateway's flat request rate.
+- Historical incident matches are keyword-scored leads only; no precedent reproduces this exact combination of an HTTP/2 upgrade plus a portfolio-path pool reduction.
+
+## What would change this conclusion
+- Lifting the cfg-2207 pool ceiling does not restore portfolio-service latency and gateway 504s — that would falsify the top hypothesis and shift weight to a shared-component (ledger-db/redis-cache) or HTTP/2 cause.
+- Direct DB/cache telemetry showing ledger-db query latency or connection saturation spiking at or before 09:52Z, coincident with the pool filling, would move H3 back into contention as the origin.
+- Order-service or payment-service (other ledger-db consumers) degrading on the same minute as portfolio-service would indicate a shared-datastore fault rather than a portfolio-only pool ceiling.
+- Gateway errors appearing for order-service as well as portfolio-service, or order-path latency stepping at 09:53, would restore the blast radius expected of the HTTP/2 upgrade and revive H2.
+- Evidence that the pool change was applied well before 09:52Z or was already at 5 in earlier buckets (so that the 09:53 step is unrelated to it) would break the central timing link for H1.
+- A portfolio-service request-rate spike in the 09:53 bucket would support H4/capacity saturation over a configuration ceiling.
+- Discovery of an additional change on the portfolio path (e.g. a ledger-db connection limit or an unrelated deploy) at 09:52-09:53Z would require re-attributing the onset.
+
+## Integrity warnings (set by code)
+- critic disabled (ablation); analysis unreviewed, confidence capped at 0.6
+- fact demoted to assumption: ledger-db emits no WARN/ERROR logs in 09:00-11:59Z.
+
+## Investigation stats
+- latency 131.1s, LLM calls 13, tokens 97624 (in 81101 / out 16523)
+- tool calls 23 (0 failed, 0 partial, 0 recovered by retry), findings 19/19 verified

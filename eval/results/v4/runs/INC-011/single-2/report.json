@@ -1,0 +1,598 @@
+{
+  "incident_id": "INC-011",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order quote timeouts (onset 12:06:10Z) are caused by pricing-engine, not market-data-service. Config change cfg-3120 ramped feature flag flags.pricing.greeks_v2.rollout_pct from 5 to 100 at 12:04:00Z (applied 12:04:16Z). Within ~1 minute pricing-engine began running the CPU-heavy GreeksV2 Monte-Carlo path (20000 paths, 3-9s per call); CPU jumped from ~40% to ~99%, quote p99 rose from ~60ms to ~2600ms, exceeding the 2000ms internal quote budget and the 2500ms order-service timeout, yielding 12%+ 5xx and order-service quote timeouts. Request rate was flat (no load surge), market-data-service latency/errors were flat (ruling out the protobuf deploy dep-6111), and there were no restarts or memory pressure. The flag was never rolled back and the incident was still fully active at 13:59Z. Root cause category: config_change, origin in pricing-engine's Greeks v2 code path.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "Feature-flag ramp of Greeks v2 (config_change) saturated pricing-engine CPU, causing quote deadline misses and order timeouts",
+      "statement": "Config change cfg-3120 (flags.pricing.greeks_v2.rollout_pct 5->100) at 12:04:00Z enabled the CPU-heavy GreeksV2 Monte-Carlo path (20000 paths, 3-9s each) for all traffic. Pricing-engine CPU jumped from ~40% to ~99%, quote p99 went from ~60ms to ~2600ms, exceeding the 2000ms internal budget and the 2500ms order-service timeout, producing quote timeouts and elevated 5xx. The fault originates in pricing-engine (the newly-fully-enabled Greeks v2 code path) but is triggered by the flag rollout.",
+      "category": "config_change",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": "cfg-3120",
+      "confidence": 0.86,
+      "pre_cap_confidence": 0.86,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-3120 ramps greeks_v2 rollout 5->100 at 12:04:00Z",
+          "finding_ids": [
+            "F2",
+            "F3"
+          ]
+        },
+        {
+          "claim": "GreeksV2Calculator Monte-Carlo path (20000 paths) becomes active at full traffic and takes 3-9s per call",
+          "finding_ids": [
+            "F4"
+          ]
+        },
+        {
+          "claim": "pricing-engine CPU saturates ~40%->~99%",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "quote p99 rises 60ms->2600ms, exceeding 2000ms internal budget",
+          "finding_ids": [
+            "F6",
+            "F5"
+          ]
+        },
+        {
+          "claim": "order-service 2500ms pricing-engine quote calls time out",
+          "finding_ids": [
+            "F1",
+            "F15"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F15"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The greeks_v2 flag gates the GreeksV2Calculator path (strongly implied by identical naming and timing, not directly stated in a single log line)",
+        "No other change between 11:56 and 12:05 affected pricing-engine"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "market-data-service protobuf serialization deploy (dep-6111) broke pricing-engine quote parsing",
+      "statement": "Deploy dep-6111 switched market-data-service quote serialization to protobuf at 11:56:00Z, allegedly causing pricing-engine quote timeouts.",
+      "category": "bad_deployment",
+      "root_cause_service": "market-data-service",
+      "trigger_change_id": "dep-6111",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F10",
+        "F11",
+        "F12",
+        "F4",
+        "F5",
+        "F2"
+      ],
+      "assumptions": [],
+      "rejection_reason": "market-data-service latency and error_rate stayed flat/normal throughout; the onset (~12:05) follows the pricing-engine flag change (12:04), not the 11:56 deploy; the failing code path is a local GreeksV2 CPU computation, not serialization; and the timing gap (9 min) doesn't match. This is the report's human guess, unsupported by telemetry."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Capacity saturation due to increased request load",
+      "statement": "Traffic growth pushed pricing-engine past provisioned capacity, causing CPU saturation and timeouts.",
+      "category": "capacity_saturation",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": null,
+      "confidence": 0.04,
+      "pre_cap_confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F9",
+        "F2",
+        "F3",
+        "F4"
+      ],
+      "assumptions": [],
+      "rejection_reason": "request_rate was flat (~630-660 req/s) across the onset; no load surge. CPU rose because a far heavier computation (GreeksV2) was enabled by the flag, not because of more traffic."
+    }
+  ],
+  "facts": [],
+  "assumptions": [
+    "The greeks_v2 rollout flag gates the GreeksV2Calculator execution path (inferred from identical naming and 1-minute onset alignment; no single log line states this explicitly)",
+    "No pricing-engine deployment or other config change occurred between 11:56 and 12:05 that could independently raise CPU (deployments list shows none)",
+    "Downstream effects (order timeouts) are caused by pricing-engine latency, consistent with the dependency graph order-service->pricing-engine->market-data-service"
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-20T11:56:00Z",
+      "event": "market-data-service deploy dep-6111 (protobuf quote serialization) goes live",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:04:00Z",
+      "event": "Config change cfg-3120: flags.pricing.greeks_v2.rollout_pct 5->100",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:04:16Z",
+      "event": "pricing-engine logs cfg-3120 applied (rollout_pct=100)",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:05:00Z",
+      "event": "pricing-engine CPU jumps ~40%->~99%, latency_p99 ~60ms->~2609ms",
+      "finding_ids": [
+        "F6",
+        "F7"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:05:21Z",
+      "event": "Slow GreeksV2Calculator Monte-Carlo warnings begin (3-9s per call)",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:06:10Z",
+      "event": "order-service begins logging pricing-engine quote call timeouts (2500ms)",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:06:41Z",
+      "event": "pricing-engine logs request deadline exceeded (2000ms budget) calculator=GreeksV2",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-05-20T12:12:00Z",
+      "event": "pricing-engine error_rate elevated to ~12.5%",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-05-20T13:59:00Z",
+      "event": "Incident still active; cfg-3120 never rolled back",
+      "finding_ids": [
+        "F16"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Immediately roll back cfg-3120 (set flags.pricing.greeks_v2.rollout_pct back to 5 or 0) and confirm pricing-engine CPU and quote p99 recover",
+      "priority": "immediate",
+      "rationale": "This is the direct trigger; reverting the flag should immediately stop the CPU-heavy GreeksV2 path and restore latency. Flag was never rolled back and incident is ongoing.",
+      "finding_ids": [
+        "F2",
+        "F3",
+        "F6",
+        "F7",
+        "F16"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a target of reducing GreeksV2 Monte-Carlo path count / optimizing the calculator before re-enabling at scale",
+      "priority": "short_term",
+      "rationale": "20000-path Monte-Carlo runs taking 3-9s and pinning CPU at 99% is not viable at full traffic; needs optimization or a sampled/async design.",
+      "finding_ids": [
+        "F4",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Require load/capacity validation and staged ramp with automated rollback for feature-flag ramps on latency-critical services",
+      "priority": "short_term",
+      "rationale": "A 5->100 jump in one step bypassed gradual exposure; canarying would have caught the CPU blowup before full ramp.",
+      "finding_ids": [
+        "F2",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add alerting on pricing-engine CPU saturation and GreeksV2 calculator duration budget breaches",
+      "priority": "long_term",
+      "rationale": "CPU pinned at 99% and 3-9s calculator runs were only visible as slow logs; proactive alerting would shorten detection.",
+      "finding_ids": [
+        "F4",
+        "F6",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "The initial all-services config-change query (tc-004) was partial (config-audit shard 2/3 did not respond); however the retried full query (tc-019) returned the complete set of 2 changes, so config completeness is confirmed.",
+    "No log/metric directly proves the greeks_v2 flag is the on/off switch for the GreeksV2Calculator code path; this linkage is inferred from naming and timing.",
+    "Root cause of why GreeksV2 is CPU-heavy (code regression vs. inherently expensive algorithm) cannot be determined from telemetry alone; no pricing-engine deployment in window means the code predates the window."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service began logging 'pricing-engine quote call timed out after 2500ms' at 12:06:10Z, continuing to the end of data (225 ERROR entries).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "pricing-engine quote call timed out after 2500ms orderId=4bd44879"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-20T12:06:10Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A pricing-engine config change cfg-3120 ramped feature flag flags.pricing.greeks_v2.rollout_pct from 5 to 100 at 12:04:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "flags.pricing.greeks_v2.rollout_pct"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:04:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine logged the config change as applied at 12:04:16Z: 'config change cfg-3120 applied: flags.pricing.greeks_v2.rollout_pct=100'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "config change cfg-3120 applied: flags.pricing.greeks_v2.rollout_pct=100"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:04:16Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine began logging slow GreeksV2Calculator Monte-Carlo runs (paths=20000) taking 2964-8942ms at 12:05:21Z (342 such WARN entries).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "GreeksV2Calculator: Monte-Carlo paths=20000 took 6465ms for symbol opt-41547"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:21Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine logged 'request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2' from 12:06:41Z (276 ERROR entries).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "request deadline exceeded computing quote (2000ms budget) calculator=GreeksV2"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:06:41Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine latency_p99_ms jumped from ~60ms (bucket 11:58) to ~2609ms avg (bucket 12:05) and stayed ~2600ms through 13:57.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":2609.71,\"max\":2849.25}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine cpu_pct jumped from ~40% (bucket 11:58, avg 39.89) to ~99% (bucket 12:05, avg 99.11, max 100.0) and stayed pinned near 99-100%.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":99.11,\"max\":100.0}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine error_rate rose from ~0.19% (bucket 11:58) to ~12.5% (bucket 12:12 onward, avg 12.34) and stayed elevated.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-05-20T12:12:00Z\",\"avg\":12.34,\"max\":13.09}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:12:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine request_rate was flat/normal throughout (~629-662 req/s, no surge) across the incident.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":640.29,\"max\":687.48}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service latency_p99_ms stayed flat at ~39-42ms across the whole window (no degradation), and its error_rate stayed ~0.2%.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":39.29,\"max\":41.12}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service error_rate remained ~0.17-0.28% throughout the incident window with no spike.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":0.19,\"max\":0.26}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only deployment in the window is dep-6111 on market-data-service (protobuf quote serialization) at 11:56:00Z, still 'live' with no rollback; no pricing-engine deployments occurred.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "dep-6111"
+        }
+      ],
+      "services": [
+        "market-data-service",
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T11:56:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine restarts metric stayed 0 throughout the window (no crashes/restarts).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "\"restarts\""
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine memory_pct stayed steady in the ~47-54% range across the incident (no memory exhaustion).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":49.06,\"max\":52.1}"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F14",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service latency_p99_ms jumped from ~150ms (bucket 11:58) to ~2433ms (bucket 12:05), consistent with waiting on pricing-engine quotes.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "{\"ts\":\"2026-05-20T12:05:00Z\",\"avg\":2433.45,\"max\":3011.61}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F15",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No rollback of cfg-3120 occurred through the end of available data (13:59Z); the flag remained at 100%.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T13:59:00Z",
+      "id": "F16",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No redis-related warnings or errors appear in pricing-engine logs during the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-025",
+          "quote": "\"total_matched\":0"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-05-20T12:05:00Z",
+      "id": "F17",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 63.59,
+    "llm_calls": 6,
+    "prompt_tokens": 79859,
+    "completion_tokens": 7919,
+    "total_tokens": 87778,
+    "tool_calls": 25,
+    "tool_attempts": 25,
+    "tool_failures": 0,
+    "tool_partial": 1,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 17,
+    "findings_verified": 17,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 6,
+        "prompt_tokens": 79859,
+        "completion_tokens": 7919
+      }
+    }
+  },
+  "warnings": []
+}

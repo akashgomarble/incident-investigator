@@ -1,0 +1,580 @@
+{
+  "incident_id": "INC-003",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order submit failures (~31% error rate, 504 Gateway Timeout) originate from the external exchange partner, not from order-service v2.15.2. Fault onset is 11:01-11:02Z, coinciding with exchange-gateway logging connect timeouts to api.exchange-partner.example and 503 Service Unavailable responses from exchange-api. exchange-gateway's upstream latency rose from ~120ms to ~9300ms and upstream error rate from ~0.3% to ~45%, while exchange-gateway itself and order-service show no local resource anomaly (CPU/memory/pool/request-rate flat, no restarts). The reported order-service deploy at 10:48 was rolled back at 11:16 but the error rate never recovered (~31% through 12:45), ruling it out as the cause. Root cause: external exchange-api dependency failure.\", \"facts\": [{\"statement\": \"order-service v2.15.2 deployed 10:48Z, rolled back 11:16Z with no recovery of the ~31% error rate.\", \"finding_ids\": [\"F1\", \"F3\"]}, {\"statement\": \"order-service error rate jumped from ~0.2% to ~31% at the 11:00Z bucket and stayed there through 12:45Z.\", \"finding_ids\": [\"F2\"]}, {\"statement\": \"All order-service errors are 'exchange-gateway call failed: 504 Gateway Timeout (placeOrder)' beginning 11:02:45Z.\", \"finding_ids\": [\"F4\"]}, {\"statement\": \"exchange-gateway began logging upstream connect timeouts to api.exchange-partner.example at 11:01:25Z and partner 503 responses at 11:02:20Z.\", \"finding_ids\": [\"F5\", \"F6\"]}, {\"statement\": \"exchange-gateway upstream latency rose ~120ms -> ~9300ms and upstream error rate ~0.3% -> ~45%.\", \"finding_ids\": [\"F7\"]}, {\"statement\": \"exchange-gateway local health unchanged: CPU ~30%, 0 restarts, request_rate ~270 r/s.\", \"finding_ids\": [\"F8\"]}, {\"statement\": \"order-service local metrics unchanged: CPU ~40%, db_pool ~14, request_rate ~230 r/s.\", \"finding_ids\": [\"F9\"]}, {\"statement\": \"pricing-engine error rate flat ~0.2%; its 09:20 cache TTL config change had no effect.\", \"finding_ids\": [\"F11\"]}, {\"statement\": \"exchange-gateway had no deployments in the incident window; order-service depends on exchange-gateway which depends on the external exchange-api.\", \"finding_ids\": [\"F13\", \"F12\"]}]",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "External exchange partner (exchange-api) outage causes exchange-gateway timeouts and order submit failures",
+      "statement": "The external provider api.exchange-partner.example began failing/timing out at ~11:01Z (connect timeouts after 5000ms and 503 Service Unavailable responses). exchange-gateway, which has no local resource issue, surfaces 504s to order-service, whose placeOrder path fails ~30%. The order-service release is coincidental and its rollback had no effect because the fault is external.",
+      "category": "dependency_failure",
+      "root_cause_service": "exchange-api (external partner)",
+      "trigger_change_id": null,
+      "confidence": 0.82,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "External exchange-api degrades: connect timeouts + 503s",
+          "finding_ids": [
+            "F5",
+            "F6"
+          ]
+        },
+        {
+          "claim": "exchange-gateway upstream latency 120ms->9300ms and upstream_error_rate 0.3%->45%",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "order-service placeOrder to exchange-gateway returns 504 Gateway Timeout",
+          "finding_ids": [
+            "F4"
+          ]
+        },
+        {
+          "claim": "order-service error rate ~31%, latency p99 ->5s",
+          "finding_ids": [
+            "F2",
+            "F10"
+          ]
+        },
+        {
+          "claim": "Rollback of order-service v2.15.2 did not restore service, confirming the fault is not in order-service",
+          "finding_ids": [
+            "F3",
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F4",
+        "F3",
+        "F9",
+        "F13"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "exchange-api has no telemetry in our stack, so its outage is inferred from exchange-gateway's upstream metrics and partner error bodies",
+        "the 503s with x-partner-request-id genuinely originate at the partner rather than a shared network egress layer"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "order-service v2.15.2 release introduced the failures",
+      "statement": "The idempotency-key/retry-safe submit change in v2.15.2 caused order submit failures and the rollback should have recovered the service.",
+      "category": "bad_deployment",
+      "root_cause_service": "order-service",
+      "trigger_change_id": "dep-5333",
+      "confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F1"
+      ],
+      "contradicting_evidence": [
+        "F3",
+        "F4",
+        "F5",
+        "F9"
+      ],
+      "assumptions": [],
+      "rejection_reason": "Rollback at 11:16 did not recover (error rate stayed ~31% through 12:45: F3); error onset at 11:02 postdates the 10:48 deploy by ~14 min and coincides with partner-side failures starting 11:01 (F5); all errors are exchange-gateway 504s, not order-service internal errors (F4); order-service CPU/pool/request-rate are normal (F9)."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "exchange-gateway local resource exhaustion or process failure",
+      "statement": "exchange-gateway ran out of CPU/memory or crashed, causing timeouts to order-service.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "exchange-gateway",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F8",
+        "F7"
+      ],
+      "assumptions": [],
+      "rejection_reason": "exchange-gateway CPU ~30%, memory ~44%, 0 restarts, request_rate flat ~270 r/s (F8); the only degradation is on its upstream to the external provider (F7)."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "pricing-engine cache TTL config change degraded order flow",
+      "statement": "The cache.ttl_seconds 5->4 change at 09:20 caused downstream failures.",
+      "category": "config_change",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": "cfg-2290",
+      "confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F11",
+        "F4"
+      ],
+      "assumptions": [],
+      "rejection_reason": "pricing-engine error rate stayed flat ~0.2% (F11), change occurred 100+ min before onset, and no order-service error references pricing-engine (F4)."
+    }
+  ],
+  "facts": [],
+  "assumptions": [
+    "exchange-api external provider has no telemetry in our stack; its fault is inferred from exchange-gateway upstream metrics and partner error payloads",
+    "the observed 503/x-partner-request-id responses genuinely originate at the partner and not at a shared egress/network layer",
+    "metric buckets are 900s aligned, so 1-2 min onset precision is limited"
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-17T09:20:00Z",
+      "event": "pricing-engine config change cfg-2290 (cache.ttl_seconds 5->4)",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-03-17T10:48:00Z",
+      "event": "order-service v2.15.2 deployed (idempotency keys)",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-03-17T11:01:25Z",
+      "event": "exchange-gateway first upstream connect timeout to api.exchange-partner.example",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-03-17T11:02:20Z",
+      "event": "exchange-api returns 503 Service Unavailable with x-partner-request-id",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-03-17T11:02:45Z",
+      "event": "order-service first 504 Gateway Timeout on placeOrder",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-03-17T11:03:26Z",
+      "event": "exchange-gateway circuit breaker OPEN for exchange-api (failure ratio 0.47)",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-03-17T11:16:00Z",
+      "event": "order-service v2.15.2 rolled back - error rate does not recover",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-03-17T12:58:54Z",
+      "event": "Last exchange-gateway 504 error logged on order-service",
+      "finding_ids": [
+        "F4"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Stop treating this as order-service and engage the exchange partner / check partner status page; open a vendor incident for exchange-api.",
+      "priority": "immediate",
+      "rationale": "Partner returns 503 with x-partner-request-id and connect timeouts; fault is external.",
+      "finding_ids": [
+        "F5",
+        "F6"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Fail over to a secondary exchange route or degrade gracefully (queue retries) instead of returning 504 on order submit.",
+      "priority": "immediate",
+      "rationale": "No secondary route exists in the dependency graph; HIST-103 resolution used exactly this.",
+      "finding_ids": [
+        "F12"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Verify post-rollback state and confirm keeping v2.15.2 is safe; the rollback was based on a false correlation.",
+      "priority": "short_term",
+      "rationale": "Rollback produced no recovery; re-deploying or re-investigating costs availability.",
+      "finding_ids": [
+        "F3",
+        "F1"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Add telemetry/health checks for the external exchange-api and alert on exchange-gateway upstream_error_rate.",
+      "priority": "short_term",
+      "rationale": "exchange-api has_telemetry=false and the upstream degradation was only visible via exchange-gateway.",
+      "finding_ids": [
+        "F12",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Tune exchange-gateway circuit breaker/timeouts so order-service fails fast rather than piling up 5s waits.",
+      "priority": "long_term",
+      "rationale": "Client p99 rose to ~5s while 5000ms connect timeouts were hit repeatedly.",
+      "finding_ids": [
+        "F10",
+        "F5"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "No direct telemetry from exchange-api (external, has_telemetry=false), so the partner-side root condition cannot be confirmed from our data - only inferred from exchange-gateway's upstream metrics and error bodies.",
+    "No packet-level/DNS/TLS egress data to fully rule out a shared network path fault between exchange-gateway and the partner; the single WARN 'deprecated TLS cipher offered by client' at 10:04:50Z is unexplained and not obviously causal.",
+    "order-service logs are truncated (349 matches, 40 returned); only the dominant 504 pattern was seen, so rarer error variants cannot be excluded."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service deployed v2.15.2 at 2026-03-17T10:48:00Z (change 'Add idempotency keys to order submit'); it was rolled back at 11:16:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "v2.15.2"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "rolled_back_at"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T10:48:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service error rate was ~0.2% from 07:00 through the 10:45 bucket, then jumped to avg 26.73% at the 11:00 bucket and stayed ~31% (last 30.39%) through 12:45.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":26.73,\"max\":33.2}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"ts\":\"2026-03-17T12:45:00Z\",\"avg\":30.99,\"max\":32.94}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service error rate did NOT recover after the 11:16 rollback: it remains ~31% in every bucket from 11:15 through 12:45.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"ts\":\"2026-03-17T11:30:00Z\",\"avg\":30.97,\"max\":33.32}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"last\":30.39"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T11:30:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "All 349 order-service ERROR entries share a single pattern: 'exchange-gateway call failed: <n> Gateway Timeout (placeOrder)', first seen 11:02:45Z, still occurring at 12:58:54Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "exchange-gateway call failed: <n> Gateway Timeout (placeOrder)"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "2026-03-17T12:58:54Z"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T11:02:45Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway upstream connect timeouts and 503s begin at 11:01:25Z (upstream connect timeout host=api.exchange-partner.example op=placeOrder), about 13 minutes after the order-service deploy and about 2 minutes before order-service's first 504.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "upstream connect timeout after 5000ms host=api.exchange-partner.example op=placeOrder"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"ts\":\"2026-03-17T11:01:25Z\""
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T11:01:25Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway logs show the external partner returning 503 Service Unavailable with x-partner-request-id values (161 occurrences) plus 163 placeOrder + 146 quoteSnapshot connect timeouts.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "exchange-api returned <n> Service Unavailable (x-partner-request-id=<n>)"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "exchange-api returned 503 Service Unavailable (x-partner-request-id=46ed2490)"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T11:02:20Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway's upstream to the partner degraded sharply: upstream_latency_ms went from ~120ms to ~8550ms at the 11:00 bucket, and upstream_error_rate from ~0.3% to ~42%, both sustained through 12:45.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":8550.82,\"max\":9644.67}"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":42.39,\"max\":48.59}"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway itself shows no local resource problem: CPU stayed ~30%, memory ~44%, restarts 0, and request_rate flat ~270 r/s across the whole window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":29.83,\"max\":32.52}"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "\"mean\":0.0"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":274.62,\"max\":295.65}"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "order-service local metrics are unchanged across the incident: CPU ~40%, db_pool_in_use ~14 connections, request_rate ~230 r/s.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":40.08,\"max\":42.36}"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":13.98,\"max\":14.64}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service p99 latency jumped from ~150ms to ~4650-5300ms at the 11:00 bucket, consistent with waiting on the exchange-gateway timeout.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":4648.8,\"max\":5665.0}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine error rate stayed flat at ~0.2% throughout, and it has no shared dependency with order-service other than being a sibling; the only config change (pricing-engine cache.ttl_seconds 5->4 at 09:20) produced no measurable effect.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "{\"ts\":\"2026-03-17T11:00:00Z\",\"avg\":0.21,\"max\":0.3}"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "cache.ttl_seconds"
+        }
+      ],
+      "services": [
+        "pricing-engine"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service has one dependency to exchange-gateway (http) and exchange-gateway calls exchange-api (external, has_telemetry=false); no alternate/secondary exchange route is present in the graph.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "{\"from\":\"order-service\",\"to\":\"exchange-gateway\",\"kind\":\"http\"}"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "{\"name\":\"exchange-api\",\"type\":\"external\"}"
+        }
+      ],
+      "services": [
+        "order-service",
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T11:00:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "exchange-gateway had no code deployments in the 06:00-12:59 window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "exchange-gateway"
+      ],
+      "time": "2026-03-17T12:59:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 48.53,
+    "llm_calls": 6,
+    "prompt_tokens": 85769,
+    "completion_tokens": 8189,
+    "total_tokens": 93958,
+    "tool_calls": 24,
+    "tool_attempts": 24,
+    "tool_failures": 0,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 13,
+    "findings_verified": 13,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 6,
+        "prompt_tokens": 85769,
+        "completion_tokens": 8189
+      }
+    }
+  },
+  "warnings": []
+}

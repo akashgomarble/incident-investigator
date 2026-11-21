@@ -1,0 +1,183 @@
+# Incident investigation report: INC-008
+*System: multi_agent | outcome: **inconclusive** | ended: critic_disabled*
+
+## Summary
+auth-service is genuinely self-saturated: CPU pinned at ~97%, worker pool saturating (active=64/64, queue=94198), accept queue full with 372x 503s on /v1/auth/login, and the autoscaler unable to help because desired replicas 14 exceeds maxReplicas 8 (F1-F6). The leading explanation — capacity saturation, i.e. login load outgrew provisioned auth-service capacity — is plausible but only low-confidence (0.45, below threshold), because the key discriminating metric, auth-service request_rate, was never retrieved, so we cannot yet show that incoming load actually rose before the sharp 06:52→06:54Z onset (F1). The reporter's bcrypt hypothesis is effectively ruled out: exactly one deployment landed across all services in the window and it was portfolio-service v4.4.0 at 05:50Z, with no auth-service release to carry a cost-factor change (F7, F13, F17). The secondary hypothesis (shared redis-cache perturbed by the portfolio-service release, ~62 min before onset) remains unproven and untested because no redis-cache or cross-service metrics were collected. Net: mitigation can start now, but the root cause is not adequately established.
+
+## Probable root cause
+**Inconclusive** -- the evidence does not single out one cause. See ranked hypotheses and data gaps.
+
+## Ranked hypotheses
+| # | Hypothesis | Category | Service | Trigger | Confidence | Status |
+|---|---|---|---|---|---|---|
+| 1 | H1: Capacity saturation: login volume outgrew provisioned auth-service capacity (autoscaler capped at 8 replicas) | capacity_saturation | auth-service | null | 0.45 (low) | active |
+| 2 | H2: Shared-dependency perturbation: portfolio-service v4.4.0 (05:50Z) disturbed shared redis-cache, which auth-service depends on | dependency_failure | portfolio-service (new release) / redis-cache (shared) | portfolio-service v4.4.0 @ 2026-04-22T05:50:00Z | 0.22 (low) | active |
+| 3 | H3: bcrypt cost/hashing regression from an auth-service release (reporter's hypothesis) | bad_deployment | auth-service (code) | null | 0.08 (low) | rejected |
+| 4 | H4: auth-service log.level config change (03:40Z) as origin of degradation | config_change | auth-service (config) | auth-service log.level INFO->WARN @ 2026-04-22T03:40:00Z | 0.05 (low) | rejected |
+
+### H1: Capacity saturation: login volume outgrew provisioned auth-service capacity (autoscaler capped at 8 replicas)
+auth-service request handling saturated its own worker pool and CPU because incoming login load exceeded provisioned capacity, and the autoscaler was capped at maxReplicas 8 so it could not add replicas. The result is CPU pinned at ~97%, active=64/64 workers, deep accept queue, and 503s on /v1/auth/login. No code or config change is required to explain it — the load/capacity relationship broke.
+
+**Causal chain**
+1. Login request volume exceeds provisioned auth-service capacity (8 replicas worth of worker pool). *(assumed)*
+2. Worker pool saturates: active=64/64 with enormous queue (94198), CPU climbs to ~97%. [F2, F3]
+3. Autoscaler cannot add capacity: desired 14 replicas > maxReplicas 8. [F5]
+4. Accept queue fills, requests rejected with 503 on POST /v1/auth/login; p99 climbs to ~3.8s and error rate to ~14%. [F1, F3, F6]
+
+**Supporting evidence**
+  - `F1` ✔ auth-service p99 latency onset is sharp between 06:52Z and 06:54Z: the 2-min buckets show avg 91.5ms at 06:52:00Z then 3759.86ms at 06:54:00Z, staying ~3.5-3.9s thereafter to 08:50Z.
+  - `F2` ✔ auth-service cpu_pct jumped from a steady ~38% baseline to 84.31% avg (max 97.33%) in the 06:50Z bucket and stayed ~97% through 08:50Z.
+  - `F3` ✔ The dominant error signature is self-saturation of auth-service request handling, not upstream/connection failure: 372x ERROR 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)' starting 06:55:42Z, and 249x WARN 'worker pool saturated (active=64/64, queue=...)' starting 06:54:53Z with enormous queues (e.g. queue=94198).
+  - `F5` ✔ auth-service autoscaler could not relieve load: repeated WARN 'autoscaler: desired replicas 14 exceeds maxReplicas 8; cannot scale further' (34 occurrences, first_seen 06:57:15Z), so horizontal scaling is capped at 8 replicas.
+  - `F6` ✔ auth-service error_rate rose in the same 06:50Z bucket from a ~0.2% baseline to 7.11% avg (max 14.76%), then holding ~14% through 08:50Z — temporally consistent with the latency and CPU onset.
+  - `F18` ✔ Alternative historical leads for CPU saturation without a code change: HIST-113 (2026-01-28) 'pricing-engine CPU saturation at market open', symptoms 'quote timeouts','cpu 99%', root cause 'Record market-open volume exceeded provisioned capacity', category capacity_saturation, resolution 'Raised replica count'. This shows the same CPU-saturation symptom class observed in auth-service can arise from load/capacity rather than a deployment, consistent with T1's finding that the auth autoscaler was capped ('desired replicas 14 exceeds maxReplicas 8').
+**Contradicting evidence**
+  - (none)
+**Assumptions**
+  - Request rate actually rose before 06:52Z (request_rate was never retrieved for auth-service; this is the key missing metric).
+  - The sharpness of the 06:52→06:54 onset could be a load spike crossing a capacity threshold, not a step change.
+
+### H2: Shared-dependency perturbation: portfolio-service v4.4.0 (05:50Z) disturbed shared redis-cache, which auth-service depends on
+portfolio-service v4.4.0 deployed at 05:50Z is the only change that touches a component shared with auth-service (redis-cache). The new release perturbed the shared cache (e.g. key churn/eviction or a hot-key pattern), which propagated to auth-service and drove its per-request work up until its worker pool saturated and it self-throttled with 503s.
+
+**Causal chain**
+1. portfolio-service v4.4.0 lands at 05:50Z ('Holdings export'), the only deployment in the window. [F7, F13]
+2. redis-cache is the single shared component touched by both auth-service and portfolio-service. [F10, F15]
+3. The new release degrades redis-cache behavior (eviction/latency/hot keys), slowing auth-service per-request work. *(assumed)*
+4. auth-service worker pool saturates and CPU pins, producing 3.8s p99 and 503s on /v1/auth/login. [F1, F2, F3]
+
+**Supporting evidence**
+  - `F7` ✔ Across ALL services, exactly one deployment landed in 2026-04-18 through 2026-04-22T08:59Z: portfolio-service v4.4.0 at 2026-04-22T05:50:00Z ('Holdings export', status live, not rolled back). No auth-service deployment appears in this window, so the auth-service symptoms at ~07:06Z were not preceded by an auth-service release.
+  - `F13` ✔ Independently re-querying deployments for ALL services over 2026-04-21T00:00Z→2026-04-22T08:59Z returns exactly one: portfolio-service v4.4.0 at 2026-04-22T05:50:00Z ('Holdings export', status live, rolled_back_at null). No auth-service deployment exists, so nothing of auth-service's own changed before the 06:52-06:54Z onset.
+  - `F15` ✔ redis-cache is the single shared component touched by both auth-service and portfolio-service: the redis-cache dependency graph shows edges 'from:auth-service to:redis-cache kind:cache' and 'from:portfolio-service to:redis-cache kind:cache' with redis-cache marked shared=true. This makes the 05:50Z portfolio-service release the only change that could plausibly perturb auth-service through a shared datastore.
+**Contradicting evidence**
+  - `F16` ✔ Temporal gap assessment: portfolio-service v4.4.0 landed 2026-04-22T05:50:00Z, ~62-64 minutes before the first auth-service symptom (WARN worker pool saturated at 06:54:53Z per T1). It is the closest change to onset, but not tight; the auth-service config change is ~3.2h before, and no change falls inside the 06:52-06:54Z onset window.
+  - `F4` ✔ No evidence of connection-pool / dependency exhaustion in auth-service: connection-pool logs remained 'healthy' up to 06:36:19Z, the last such line before onset, and the pre-onset logs contain no ERROR entries (only 19 INFO, 5 WARN, 2 ERROR in the 05:00-06:56 window; the 2 ERRORs are the 06:55 503s).
+  - `F3` ✔ The dominant error signature is self-saturation of auth-service request handling, not upstream/connection failure: 372x ERROR 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)' starting 06:55:42Z, and 249x WARN 'worker pool saturated (active=64/64, queue=...)' starting 06:54:53Z with enormous queues (e.g. queue=94198).
+**Assumptions**
+  - redis-cache was actually degraded by the portfolio-service release (no cache metrics were retrieved).
+  - The degradation mechanism is CPU-bound rather than I/O-waiting: auth-service shows ~97% CPU with no connection-pool or dependency-timeout errors.
+
+### H3: bcrypt cost/hashing regression from an auth-service release (reporter's hypothesis)
+A recent auth-service release reintroduced the bcrypt cost-factor regression (HIST-101), making /v1/auth/login CPU-bound, driving CPU to ~97%, saturating workers, and producing ~4s p99 and 503s.
+
+**Causal chain**
+1. An auth-service release raising bcrypt cost factor lands shortly before onset. *(assumed)*
+2. CPU-bound hashing per login drives auth-service CPU to ~97%. [F2]
+3. Worker pool saturates; accept queue fills; 503s and 3.8s p99 on /v1/auth/login. [F1, F3, F6]
+
+**Supporting evidence**
+  - `F2` ✔ auth-service cpu_pct jumped from a steady ~38% baseline to 84.31% avg (max 97.33%) in the 06:50Z bucket and stayed ~97% through 08:50Z.
+  - `F1` ✔ auth-service p99 latency onset is sharp between 06:52Z and 06:54Z: the 2-min buckets show avg 91.5ms at 06:52:00Z then 3759.86ms at 06:54:00Z, staying ~3.5-3.9s thereafter to 08:50Z.
+  - `F3` ✔ The dominant error signature is self-saturation of auth-service request handling, not upstream/connection failure: 372x ERROR 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)' starting 06:55:42Z, and 249x WARN 'worker pool saturated (active=64/64, queue=...)' starting 06:54:53Z with enormous queues (e.g. queue=94198).
+  - `F12` ✔ Historical precedent HIST-101 (2025-08-14) matches the reported signature closely: 'Login latency after auth-service release', symptoms 'login p99 4s','503 on login','high cpu', root cause 'bcrypt cost factor raised 10->14 in release v6.4.0', category bad_deployment, resolution 'Rolled back v6.4.0' (match_score 5). This is the prior bcrypt regression the reporter referenced. Other auth-related precedents are HIST-109 (JWT clock-skew lib upgrade), HIST-108 (JWT key rotation config change) and HIST-107 (cold cache storm after redis failover). Past incidents are leads, not evidence about the current incident.
+**Contradicting evidence**
+  - `F7` ✔ Across ALL services, exactly one deployment landed in 2026-04-18 through 2026-04-22T08:59Z: portfolio-service v4.4.0 at 2026-04-22T05:50:00Z ('Holdings export', status live, not rolled back). No auth-service deployment appears in this window, so the auth-service symptoms at ~07:06Z were not preceded by an auth-service release.
+  - `F13` ✔ Independently re-querying deployments for ALL services over 2026-04-21T00:00Z→2026-04-22T08:59Z returns exactly one: portfolio-service v4.4.0 at 2026-04-22T05:50:00Z ('Holdings export', status live, rolled_back_at null). No auth-service deployment exists, so nothing of auth-service's own changed before the 06:52-06:54Z onset.
+  - `F17` ✔ The bcrypt precedent the reporter invoked (HIST-101, 2025-08-14) was resolved by 'Rolled back v6.4.0' and its root cause is explicitly 'bcrypt cost factor raised 10->14 in release v6.4.0' — i.e. it was caused by a specific auth-service release. In the current window there is no auth-service release to roll back, so the precedent's causal mechanism (a code change raising bcrypt cost) has no matching trigger. Signature similarity alone does not establish the same cause.
+**Assumptions**
+  - An auth-service deployment existed but was missed by the deployment queries.
+**Rejected because:** F7 and F13 (independently re-verified) show exactly ONE deployment across all services in the window — portfolio-service v4.4.0 — with no auth-service release. F17 confirms the HIST-101 precedent's mechanism requires a specific auth-service release that does not exist here. Signature similarity alone is not a trigger.
+
+### H4: auth-service log.level config change (03:40Z) as origin of degradation
+The auth-service log.level INFO->WARN config change at 03:40Z altered runtime behavior or logging paths in a way that degraded /v1/auth/login handling, causing CPU saturation and 503s.
+
+**Causal chain**
+1. config-bot applies log.level INFO->WARN at 03:40Z. [F9, F14]
+2. Verbosity change somehow shifts work onto the login hot path. *(assumed)*
+3. auth-service CPU pins, workers saturate, 503s on login. [F2, F3]
+
+**Supporting evidence**
+  - `F9` ✔ Across ALL services, exactly one config change landed in 2026-04-18 through 2026-04-22T08:59Z: auth-service log.level INFO->WARN at 2026-04-22T03:40:00Z by config-bot ('Reduce log volume'). No other service configuration was changed in the window; note this lowers log verbosity ~3.4h before the reported symptoms, which also reduces log evidence available for diagnosis.
+  - `F14` ✔ Independently re-querying config/flag changes for ALL services over 2026-04-21T00:00Z→2026-04-22T08:59Z returns exactly one: auth-service log.level INFO→WARN at 2026-04-22T03:40:00Z ('Reduce log volume'). This is ~3.2h before onset and changes only logging verbosity, not CPU-bound login code.
+**Contradicting evidence**
+  - `F14` ✔ Independently re-querying config/flag changes for ALL services over 2026-04-21T00:00Z→2026-04-22T08:59Z returns exactly one: auth-service log.level INFO→WARN at 2026-04-22T03:40:00Z ('Reduce log volume'). This is ~3.2h before onset and changes only logging verbosity, not CPU-bound login code.
+  - `F16` ✔ Temporal gap assessment: portfolio-service v4.4.0 landed 2026-04-22T05:50:00Z, ~62-64 minutes before the first auth-service symptom (WARN worker pool saturated at 06:54:53Z per T1). It is the closest change to onset, but not tight; the auth-service config change is ~3.2h before, and no change falls inside the 06:52-06:54Z onset window.
+**Assumptions**
+  - A logging-verbosity flag could plausibly alter CPU-bound login hashing cost.
+**Rejected because:** F14/F16: the change is ~3.2h before onset and changes only logging verbosity; a 3.2h quiet gap plus no mechanism by which lower verbosity raises CPU makes this implausible. It may, however, have reduced diagnostic logs.
+
+## Facts (verified observations)
+- auth-service p99 latency onset is sharp between 06:52Z and 06:54Z: avg 91.5ms at 06:52:00Z, then 3759.86ms at 06:54:00Z, holding ~3.5-3.9s through 08:50Z. [F1]
+- auth-service cpu_pct jumped from a steady ~38% baseline to 84.31% avg (max 97.33%) in the 06:50Z bucket and stayed ~97% through 08:50Z. [F2]
+- The dominant error signature is self-saturation of auth-service request handling: 372x ERROR 'request rejected: accept queue full, returning 503' from 06:55:42Z on POST /v1/auth/login, and 249x WARN 'worker pool saturated (active=64/64, queue=...)' from 06:54:53Z with queues as large as 94198. [F3]
+- auth-service error_rate rose in the same 06:50Z bucket from ~0.2% baseline to 7.11% avg (max 14.76%), holding ~14% through 08:50Z. [F6]
+- The auth-service autoscaler could not relieve load: 34x WARN 'desired replicas 14 exceeds maxReplicas 8; cannot scale further' (first_seen 06:57:15Z), so horizontal scaling was capped at 8 replicas. [F5]
+- No evidence of connection-pool or dependency exhaustion in auth-service: connection-pool logs stayed 'healthy' up to 06:36:19Z (last such line before onset) and pre-onset logs contain no ERROR entries. [F4]
+- Exactly one deployment landed across ALL services between 2026-04-18 and 2026-04-22T08:59Z: portfolio-service v4.4.0 at 05:50:00Z ('Holdings export', live, not rolled back); this was confirmed by an independent re-query over 2026-04-21T00:00Z-2026-04-22T08:59Z. [F7, F13]
+- No auth-service deployment exists in the window, so the auth-service symptoms were not preceded by an auth-service release of its own. [F7, F13]
+- Exactly one config change landed across ALL services in the window: auth-service log.level INFO->WARN at 03:40:00Z by config-bot ('Reduce log volume'), ~3.2h before onset, changing only logging verbosity (independently re-verified). [F9, F14]
+- auth-service depends on user-db (postgres), redis-cache (kind=cache, shared=true, used by several services) and kyc-provider (external, has_telemetry=false); api-gateway calls auth-service over http, and no other service calls auth-service in the returned graph. [F10, F11]
+- redis-cache is the single shared component touched by both auth-service and portfolio-service (edges from:auth-service and from:portfolio-service to redis-cache, shared=true), making the 05:50Z portfolio-service release the only change able to perturb auth-service through a shared datastore. [F15]
+
+## Assumptions (not verified)
+- Assumption: login request rate actually rose before ~06:50-06:52Z. auth-service request_rate was never retrieved; this is the key unverified premise of the capacity-saturation hypothesis (H1).
+- Assumption: the sharp 06:52->06:54Z onset reflects a load spike crossing a capacity threshold rather than a step change in per-request work (which would point to a code/config trigger).
+- Assumption: redis-cache was in fact degraded or perturbed by the portfolio-service v4.4.0 release. No cache CPU, memory, hit-rate, eviction or latency metrics were retrieved, so the shared-dependency path (H2) is a mechanism sketch, not an observed fact.
+- Assumption: the degradation is CPU-bound rather than I/O-waiting, consistent with ~97% CPU and the absence of connection-pool or dependency-timeout errors (F2, F4).
+- Assumption: no relevant change or infra event is missing from the tracked change record; only deployments and config changes between 2026-04-18 and 2026-04-22T08:59Z were enumerated.
+- Assumption: the auth-service log.level INFO->WARN change at 03:40Z did not itself alter runtime behavior beyond reducing diagnostic log volume; a 3.2h quiet gap and no plausible CPU mechanism argue against it as origin.
+- Assumption: the fact that the pre-onset log window (05:00-06:56Z) contains only 19 INFO / 5 WARN / 2 ERROR lines reflects both reduced verbosity (F9) and the absence of errors, not an unobserved failure mode.
+- (demoted from facts: no verified observation backs it) Temporal fit is loose: portfolio-service v4.4.0 landed ~62-64 minutes before the first auth-service symptom (06:54:53Z), and no deployment or config change falls inside the 06:52-06:54Z onset window.
+- (demoted from facts: no verified observation backs it) The HIST-101 bcrypt precedent was resolved by rolling back a specific auth-service release (v6.4.0, bcrypt cost 10->14); with no auth-service release in this window, that causal mechanism has no matching trigger here.
+- (demoted from facts: no verified observation backs it) HIST-113 (2026-01-28, pricing-engine CPU saturation at market open) shows the same CPU-saturation symptom class can arise from load exceeding provisioned capacity and was resolved by raising replica count, consistent with the auth-service autoscaler cap.
+- (demoted from facts: no verified observation backs it) The deployment quote field in F7 required correction: the verbatim evidence for the single-deployment claim is the count/deployment fragments in the referenced dependency queries.
+
+## Timeline
+- `2026-04-22T03:40:00Z` Only config change in the window: auth-service log.level INFO->WARN by config-bot ('Reduce log volume'); lowers log verbosity ~3.4h before symptoms. [F9, F14]
+- `2026-04-22T05:50:00Z` Only deployment in the window: portfolio-service v4.4.0 ('Holdings export') goes live; redis-cache is the single shared component it and auth-service both depend on. ~62-64 min before the first auth-service symptom. [F7, F13, F15, F16]
+- `2026-04-22T06:36:19Z` Last pre-onset auth-service connection-pool log line, still 'healthy'; no ERROR entries in the 05:00-06:56Z pre-onset log window. [F4]
+- `2026-04-22T06:50:00Z` auth-service cpu_pct jumps from ~38% baseline to 84.31% avg (max 97.33%) in this bucket; error_rate rises from ~0.2% to 7.11% avg (max 14.76%). [F2, F6]
+- `2026-04-22T06:52:00Z` auth-service p99 latency still low: avg 91.5ms in the 2-min bucket. [F1]
+- `2026-04-22T06:54:00Z` p99 latency jumps to 3759.86ms and holds ~3.5-3.9s through 08:50Z; CPU stays ~97% through 08:50Z and error_rate holds ~14%. [F1, F2, F6]
+- `2026-04-22T06:54:53Z` First WARN 'worker pool saturated (active=64/64, queue=...)' with queues as large as 94198. [F3]
+- `2026-04-22T06:55:42Z` First ERROR 'request rejected: accept queue full, returning 503' on POST /v1/auth/login; ultimately 372 occurrences. [F3]
+- `2026-04-22T06:57:15Z` First of 34x WARN 'autoscaler: desired replicas 14 exceeds maxReplicas 8; cannot scale further' — no relief via horizontal scaling. [F5]
+- `2026-04-22T07:06:00Z` Incident INC-008 reported by on-call SRE: login latency ~4s and 503s; reporter suspects the prior bcrypt regression. [F12]
+- `2026-04-22T08:50:00Z` Last data point in the window: latency, CPU (~97%) and error_rate (~14%) remain at degraded levels; no recovery observed. [F1, F2, F6]
+
+## Recommended actions
+- **[immediate]** Raise or remove the auth-service autoscaler cap (currently maxReplicas=8) so the deployment can reach the desired replica count of ~14, then watch whether latency/error_rate recover. -- The autoscaler explicitly wanted 14 replicas but was blocked at maxReplicas 8 (F5). This is the single safe, reversible lever that directly addresses the observed saturation, and its outcome is itself diagnostic: recovery under added capacity confirms a capacity-bound incident, while no improvement points to a per-request cost change or dependency slowdown. [F3, F5, F18]
+- **[immediate]** Pull auth-service request_rate and memory_pct for 05:00-09:00Z (the missing metrics) and compare them against the 06:52->06:54Z onset. -- The capacity-saturation hypothesis (H1) rests entirely on the unverified premise that inbound login load rose. A rising request_rate before 06:50Z corroborates H1; an unchanged or falling rate while CPU and per-request work rise points away from pure capacity and toward a code/dependency trigger. [F1, F2, F6]
+- **[immediate]** Pull redis-cache metrics (CPU, memory, hit-rate, evictions, latency) alongside metrics for other redis-cache consumers (pricing-engine, market-data-service, order-service) for 05:30-09:00Z. -- The only change touching a component shared with auth-service is portfolio-service v4.4.0 at 05:50Z, and redis-cache is the sole shared component (F15); H2 cannot be confirmed or refuted without cache metrics. If other consumers are simultaneously degraded, H2 strengthens; if only auth-service is affected, it weakens. [F15, F16, F10]
+- **[immediate]** Retrieve api-gateway metrics (cpu_pct, error_rate, latency_p99_ms, memory_pct, request_rate, restarts) and per-route request counts for /v1/auth/login for the same window. -- api-gateway is the only caller of auth-service (F11) and is where a login-load spike would originate; its request_rate and error_rate distinguish 'real load increase' from 'auth-service got slower per request', which is the crux between H1 and a hidden per-request regression. [F11, F1]
+- **[short_term]** Add an alert on auth-service autoscaler 'desired > maxReplicas' and on worker-pool saturation / accept-queue-full, and review the maxReplicas setting against peak login volume quarterly. -- The autoscaler cap warning fired 34 times (F5) yet the incident was reported by a human; an explicit alert on cap-hits and accept-queue-full would cut detection time. The HIST-113 precedent (capacity saturation resolved by raising replicas) shows this is a recurring failure mode. [F5, F18]
+- **[short_term]** Establish a headroom/load-shedding policy for auth-service: load shedding with a clear 429/503 contract and pre-agreed replica ceiling for login storms. -- auth-service rejected requests with 503 only after the accept queue filled (F3); a deliberate load-shedding contract with correct status codes and retry hints would reduce client-visible failures during future capacity crossings. [F3, F5]
+- **[short_term]** Re-examine whether any change or infra event is missing from the tracked change record around 06:19-06:54Z, including the unexplained 06:19:11Z 'slow request 3759ms on /internal/metrics' warning. -- No deployment or config change falls inside the 06:52-06:54Z onset window (F16), and the 06:19Z warning shares the exact 3759ms value seen post-onset, so either the true start is earlier or a change is untracked. Resolving this is required before declaring a root cause. [F16, F7, F13]
+- **[short_term]** Once a root cause is fixed, restore auth-service log verbosity (log.level WARN->INFO at least around login paths) and set a permanent floor for error/503 logging, since the 03:40Z verbosity reduction cost diagnostic evidence. -- The only config change in the window lowered auth-service log verbosity ~3.4h before onset (F9, F14), which reduced the log detail available for diagnosis; a verbosity floor preserves signal without restoring full noise. [F9, F14]
+- **[long_term]** Add autoscaling-capacity review and per-service load forecasting to the change/tuning process, with headroom targets validated against observed peak login rates before any release. -- H1 and the HIST-113 precedent both describe capacity being outgrown without any code change (F18); a forecasting and headroom review prevents recurrence of the capped-autoscaler pattern. [F5, F18]
+- **[long_term]** Make shared components (redis-cache) first-class with ownership and change-impact review: any release touching a shared cache requires a cache-metrics canary and a consumer-impact check. -- H2's unresolved question is whether a portfolio-service release perturbed the shared redis-cache that auth-service depends on (F15); a shared-component change process would prevent and quickly detect cross-service blast radius. [F15, F10]
+- **[long_term]** Instrument per-request cost (e.g. password-hash CPU time) in auth-service so a future bcrypt-style regression is distinguishable from capacity saturation within minutes. -- This incident was initially mistaken for the HIST-101 bcrypt regression (F12, F17); the two causes produce near-identical latency/CPU/503 signatures, so per-request cost instrumentation is the definitive discriminator. [F12, F17]
+
+## Data gaps
+- auth-service request_rate and memory_pct were never retrieved — the key metric for confirming H1 (load outgrew capacity) is missing.
+- No metrics of any kind were pulled for api-gateway or any other caller/dependency (task tool-call budget exhausted after tc-016); true blast radius beyond auth-service is unconfirmed, and the service list does not include a session-service.
+- No DB/cache/queue component metrics were retrieved (user-db, redis-cache, kafka), so a shared-dependency contribution cannot be ruled out; redis-cache is confirmed to exist, be shared, and have telemetry, but no metric values were obtained.
+- redis-cache's full dependency graph and the broader incident search for similar signatures returned budget_exhausted, so the transmission path from portfolio-service v4.4.0 to auth-service remains untested.
+- Deployments and config changes were only queried for 2026-04-18 to 2026-04-22T08:59Z; whether user-db, kyc-provider or another shared dependency had a change or failover near onset was not checked.
+- No logs or metrics were retrieved for auth-service or its dependencies directly in this investigation, so the exact onset time and whether CPU or a downstream dependency degraded first are not established from our queries.
+- The owner/meaning of the 06:19:11Z 'slow request 3759ms on /internal/metrics' warning is unclear; it precedes the 06:54Z onset by 35 min and shares the exact post-onset p99 value, so a true earlier start cannot be excluded.
+- The auth-service log.level INFO->WARN change reduces log verbosity before the incident, so diagnostic log detail around 07:06Z may be missing.
+- The 03:40Z config change, the 05:50Z deployment, the 06:52-06:54Z onset, and the 07:06Z report all fall outside tool queries performed for the OBSERVABILITY SECOND WAVE; the 06:54:53Z saturation onset quoted in the ranking is derived from the same finding set (F3).
+- Tool reliability: query_metrics(metric=available_metrics, service=api-gateway) and query_metrics(metric=available_metrics, service=session-service) both FAILED not_found, so those lookups could not be completed.
+- The top hypothesis confidence is 0.45, below the 0.50 sufficiency threshold; the ranking explicitly relies on an unretrieved metric as its key missing input.
+
+## What would change this conclusion
+- Retrieving auth-service request_rate and finding it flat or declining across 06:52-06:54Z would contradict pure capacity saturation (H1) and point to a per-request cost regression or a dependency slowdown.
+- Finding simultaneous CPU/latency/error degradation in other redis-cache consumers (pricing-engine, market-data-service, order-service) around 06:50Z would elevate H2 (shared-dependency perturbation) above H1.
+- redis-cache metrics showing eviction churn, hit-rate collapse or latency spikes beginning shortly after 05:50Z would confirm the portfolio-service v4.4.0 -> redis-cache -> auth-service path.
+- Any auth-service deployment or code/config change to the bcrypt/login path inside the 06:19-06:54Z window (beyond the 03:40Z log.level change) would revive the per-request work hypothesis and the reporter's HIST-101 comparison.
+- Evidence that the degradation began at ~06:19Z (the 3759ms /internal/metrics warning) rather than 06:54Z would shift the onset ~35 min earlier and change which changes are temporally relevant.
+- Autoscaler cap relief resulting in prompt recovery would confirm H1 and make the capacity explanation adequate; no recovery despite added replicas would refute it.
+- Discovery of a tracked change or infra event in the 06:52-06:54Z window (or evidence that the change record is incomplete) would invalidate the 'no trigger in window' basis used to reject the code-change hypotheses.
+
+## Integrity warnings (set by code)
+- critic disabled (ablation); analysis unreviewed, confidence capped at 0.6
+- fact demoted to assumption: Temporal fit is loose: portfolio-service v4.4.0 landed ~62-64 minutes before the
+- fact demoted to assumption: The HIST-101 bcrypt precedent was resolved by rolling back a specific auth-servi
+- fact demoted to assumption: HIST-113 (2026-01-28, pricing-engine CPU saturation at market open) shows the sa
+- fact demoted to assumption: The deployment quote field in F7 required correction: the verbatim evidence for 
+
+## Investigation stats
+- latency 98.01s, LLM calls 13, tokens 81938 (in 65001 / out 16937)
+- tool calls 22 (2 failed, 0 partial, 0 recovered by retry), findings 18/18 verified

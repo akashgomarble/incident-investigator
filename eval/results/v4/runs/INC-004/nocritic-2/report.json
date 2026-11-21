@@ -1,0 +1,1074 @@
+{
+  "incident_id": "INC-004",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The evidence points to an unbounded in-memory template cache introduced by notification-service v3.8.0 (dep-5402, 2026-03-21) as the root cause of the recurring OOMKilled restarts, at medium confidence (0.60, top hypothesis H1 and clearly ahead of the alternatives at ≤0.10). Memory_pct climbs monotonically in a ~24h sawtooth from ~48% to ~95-98% and resets at each of the three daily OOMs, with a classic old-gen GC-pressure log signature leading each kill; lag spikes coincide with (and recover right after) each restart rather than preceding it, and there is no throughput or lag response at the Kafka retention change. The reporter's replay theory is unsupported: lowering log.retention.ms truncates segments rather than forcing a replay, no offset reset or topic/partition change is recorded, and the ramp and restarts began ~2 days before the maintenance. Remaining uncertainty comes from the absence of byte-level heap attribution, service-scoped config history, and node/sizing change visibility.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "Unbounded in-memory template cache in notification-service v3.8.0 (memory leak)",
+      "statement": "notification-service v3.8.0 (dep-5402, 2026-03-21) added a ConcurrentHashMap template cache keyed by template+locale+userSegment with no eviction/bound. The cache grows as new key combinations are rendered, so old-gen heap climbs monotonically after each restart until it saturates and the container is OOMKilled (exit 137). Each cycle takes ~24h; restarts are the sawtooth resets. Kafka lag spikes are a downstream consequence of the restart, not the cause.",
+      "category": "bad_deployment",
+      "root_cause_service": "notification-service",
+      "trigger_change_id": "dep-5402",
+      "confidence": 0.6,
+      "pre_cap_confidence": 0.68,
+      "confidence_label": "medium",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5402 (v3.8.0) adds an unbounded ConcurrentHashMap template cache in notification-service, the only recent deploy touching the service",
+          "finding_ids": [
+            "F2",
+            "F6"
+          ]
+        },
+        {
+          "claim": "Cache grows with each distinct template+locale+userSegment rendering, so old-gen heap rises monotonically instead of steady-state",
+          "finding_ids": []
+        },
+        {
+          "claim": "memory_pct shows a monotonic sawtooth: ~48% after reset climbing ~5%/2h to 95-98% before the next drop — the leak signature",
+          "finding_ids": [
+            "F7",
+            "F14"
+          ]
+        },
+        {
+          "claim": "Old-gen saturates and full-GC pauses escalate (4152→6488ms) until the container is OOMKilled (exit 137)",
+          "finding_ids": [
+            "F15",
+            "F8"
+          ]
+        },
+        {
+          "claim": "Restart counter steps exactly once per ~24h cycle (Mar 21 22:00, Mar 22 22:00, Mar 23 20:00), consistent with a fixed-size leak, not an external trigger",
+          "finding_ids": [
+            "F9"
+          ]
+        },
+        {
+          "claim": "Consumer lag is flat all day and spikes only in the OOM bucket, then returns to baseline in the same bucket — downstream of the restart",
+          "finding_ids": [
+            "F10",
+            "F12",
+            "F13"
+          ]
+        },
+        {
+          "claim": "Delayed trade-confirmation emails follow from the consumer being frozen/down during the OOM-restart window",
+          "finding_ids": [
+            "F12"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F12",
+        "F13",
+        "F14",
+        "F15",
+        "F17",
+        "F18"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F5"
+      ],
+      "assumptions": [
+        "The template cache actually accumulates entries at a rate matching a ~24h hour-to-OOM cycle; no byte-level heap attribution exists (only memory_pct %).",
+        "There is no eviction/weak-reference bound in the cache implementation — supported by the change being 'Add in-memory template cache' with no noted bound, but unverified.",
+        "No earlier notification-service deploy or the pre-existing code could equally explain the ramp; deployment history for the service is not retrievable (budget_exhausted gap)."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H4",
+      "title": "Shared-component resource contention reduced memory available to notification-service",
+      "statement": "A change to node sizing, Kafka broker container limits, or JVM limits in the same maintenance window reduced the memory ceiling available to notification-service (or raised its concurrency), so a constant working set now hits the limit. Would affect co-tenant consumers too.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "shared infrastructure / node",
+      "trigger_change_id": "null",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Node/container/JVM memory limit or sizing was reduced for notification-service's pod or its node",
+          "finding_ids": []
+        },
+        {
+          "claim": "The effective memory ceiling drops, so a previously-tolerable working set exceeds the limit",
+          "finding_ids": []
+        },
+        {
+          "claim": "Container is OOMKilled (exit 137) once the ramp touches the new lower ceiling",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F4",
+        "F8"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F11",
+        "F16",
+        "F7",
+        "F14",
+        "F9"
+      ],
+      "assumptions": [
+        "A sizing/limit change occurred — the gaps state node instance-type and broker-count changes may be invisible in the deploy feed, so this cannot be fully excluded.",
+        "The effect would be notification-specific despite shared Kafka, since order-service is flat."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H5",
+      "title": "Email-provider / downstream slowdown caused unbounded in-memory queueing of unsent notifications",
+      "statement": "The external email-provider degraded, so rendered-but-unsent notifications accumulated in an in-memory queue inside notification-service, driving heap to exhaustion independent of Kafka volume. Emails were delayed because the provider is slow, and the OOM followed from the internal queue.",
+      "category": "dependency_failure",
+      "root_cause_service": "email-provider",
+      "trigger_change_id": "null",
+      "confidence": 0.08,
+      "pre_cap_confidence": 0.08,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "email-provider (external, no telemetry) slowed or errored",
+          "finding_ids": []
+        },
+        {
+          "claim": "notification-service queues unsent messages in memory without backpressure",
+          "finding_ids": []
+        },
+        {
+          "claim": "Heap saturates → OOMKilled (exit 137) and emails delayed ~25 min",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F4"
+      ],
+      "contradicting_evidence": [
+        "F10",
+        "F17",
+        "F12",
+        "F13",
+        "F9"
+      ],
+      "assumptions": [
+        "A provider slowdown of sufficient duration and magnitude to fill heap over a ~24h cycle — unsupported; no telemetry exists for email-provider.",
+        "Consumer lag would stay flat while an internal send queue fills — not directly checked but consistent with F17's flat request_rate."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H3",
+      "title": "Consumer-group rebalance / partition reassignment storm after broker maintenance concentrated load per instance",
+      "statement": "Per historical precedent HIST-104/HIST-112, broker maintenance induces a consumer-group rebalancing storm or partition reassignment that concentrates partitions on fewer instances, spiking per-instance memory and starving notification-service of its assignment until it is OOMKilled. The Kafka maintenance (tc-004) is the origin even though it only changed retention.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "kafka",
+      "trigger_change_id": "tc-004",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Kafka maintenance triggers a broker-side rebalance/partition reassignment (as in HIST-104)",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "Partitions concentrate on fewer notification-service instances, raising per-instance memory and consumer lag",
+          "finding_ids": []
+        },
+        {
+          "claim": "Per-instance heap saturates → OOMKilled at 19:59:21Z and prior daily restarts",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F5",
+        "F1"
+      ],
+      "contradicting_evidence": [
+        "F16",
+        "F13",
+        "F14",
+        "F9",
+        "F10",
+        "F17",
+        "F18",
+        "F7",
+        "F11"
+      ],
+      "assumptions": [
+        "That log verbosity simply did not emit rebalance events (the gap explicitly flags absence of rebalance logs as weak evidence) — this is the only way H3 survives F16.",
+        "That a broker maintenance limited to a retention key can induce reassignment with no topic/partition setting change (F1 says none were altered)."
+      ],
+      "rejection_reason": "HIST-104/HIST-112 are historical leads, not current-incident evidence, and are weak by policy. F16: zero rebalance/partition-assignment log lines for notification-service AND co-sharer settlement-service in the incident window. F1: the maintenance change altered only log.retention.ms — no topic/partition/consumer-group/rebalance setting. F13/F14/F17: no lag or throughput response at 18:00Z and the memory ramp predates the change. F9/F8: restarts began 2 days before the maintenance, so this trigger cannot cover the full symptom set."
+    },
+    {
+      "rank": 5,
+      "hypothesis_id": "H2",
+      "title": "Kafka retention change (7d→3d) triggered a replay/backlog that the consumer buffered in memory",
+      "statement": "The Kafka maintenance config change (log.retention.ms 604800000→259200000, tc-004) at 2026-03-23T18:00Z caused notification-service to choke on a replay/backlog that it buffered unboundedly in memory, causing the 19:59:21Z OOM. This is the reporter's theory.",
+      "category": "config_change",
+      "root_cause_service": "kafka",
+      "trigger_change_id": "tc-004",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "tc-004 reduces Kafka log.retention.ms from 7d to 3d on shared infra at 18:00Z",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "The retention change somehow forces a consumer-group replay of already-retained messages",
+          "finding_ids": []
+        },
+        {
+          "claim": "notification-service buffers the replay backlog in memory",
+          "finding_ids": []
+        },
+        {
+          "claim": "Heap saturates and the container is OOMKilled at 19:59:21Z",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F5"
+      ],
+      "contradicting_evidence": [
+        "F6",
+        "F13",
+        "F14",
+        "F16",
+        "F17",
+        "F18",
+        "F7",
+        "F9"
+      ],
+      "assumptions": [
+        "Lowering log.retention.ms deletes old segments; re-reading them requires an offset reset that no change records — this is the weakest link.",
+        "The replay would have to start within the 18:00–19:59Z window and produce lag/throughput responses that are in fact absent."
+      ],
+      "rejection_reason": "F6 (inference): lowering retention truncates old segments, it does not force a replay; no offset reset or consumer-group change recorded. F13: the 18:00Z bucket shows avg lag 64.6/max 75.74 — no lag response at the change time; lag rises only in the bucket containing the OOM. F17: request_rate is flat ~130-142 req/s with no replay surge. F14: the memory ramp was already continuous from 14:00Z (83.82%) with no inflection at 18:00Z, i.e. the ramp predates the change by hours. F9/F7/F8 show restarts began Mar 21 22:59Z, ~2 days before the maintenance, so the change cannot explain the earlier restarts at all."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "notification-service v3.8.0 was deployed on 2026-03-21T00:00:00Z (dep-5402, author s.menon) with change 'Add in-memory template cache for email rendering' — a ConcurrentHashMap keyed by template+locale+userSegment — and it is still live, not rolled back; it is the only recent deploy touching notification-service.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "The only config change on shared infrastructure in the 48h window (2026-03-21→23) is the Kafka maintenance change reducing log.retention.ms from 604800000 to 259200000 (7d→3d) at 2026-03-23T18:00:00Z; no topic/partition/consumer-group/rebalance setting was altered.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "notification-service memory_pct rises gradually and monotonically within each ~24h cycle and then resets — a sawtooth, starting ~48% after each reset and climbing in ~5%/2h steps to ~95-98% before the next drop.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "Three OOMKilled restarts of the same container notification-service-7d9f (exit code 137) occurred at 2026-03-21T22:59:50Z, 2026-03-22T21:59:47Z and 2026-03-23T19:59:21Z — one per day, each ~1h earlier than the previous; the cumulative restart counter steps 0→1→2→3 at the corresponding 2h buckets and was flat 0 for all of Mar 20 and most of Mar 21.",
+      "finding_ids": [
+        "F8",
+        "F9"
+      ]
+    },
+    {
+      "statement": "Consumer lag is flat/low (~56-65 msgs) throughout each day and spikes only in the same 2h bucket as each OOM (max 17161.92 at 2026-03-21T22:00Z, 17611.66 at 2026-03-22T20:00Z, 18137.93 at 2026-03-23T18:00Z), and returns to baseline in the very next bucket after the restart (e.g. avg 1542.68 at 20:00Z falls back to 57.89 by 22:00Z).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "In the post-maintenance window, notification-service consumer_lag stays flat at ~52-67 msgs and spikes only at the OOM (19:30Z avg 3069.83/max 18137.93; 20:00Z avg 6004.47/max 14213.61; back to avg 57.18 at 20:30Z); the 18:00Z bucket at the retention change shows avg 64.6/max 75.74 — no lag response to the maintenance itself.",
+      "finding_ids": [
+        "F13"
+      ]
+    },
+    {
+      "statement": "notification-service memory_pct was already in a monotonic ramp well before the 18:00Z maintenance (14:00Z avg 83.82, 16:30Z 89.12, 17:45Z 93.37, 19:00Z 96.17, max 98.44 at 19:25Z) with no inflection at 18:00Z; it only dropped at the 19:50Z bucket (avg 66.53) into 20:15Z (avg 47.2), the restart reset.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "statement": "notification-service logs in the 18:00-21:00Z window show a GC/heap-pressure signature leading the OOM, not rebalance or partition-assignment activity: 10 WARN 'heap usage N% over 90 (old gen), full GC took Nms' lines from 18:34:46Z (4152ms) escalating to 19:49:28Z (6488ms), then one ERROR 'container notification-service-7d9f OOMKilled (exit code 137), restarting' at 19:59:21Z.",
+      "finding_ids": [
+        "F15"
+      ]
+    },
+    {
+      "statement": "No rebalance or partition-assignment events exist in notification-service logs for the whole 2026-03-23T14:00-23:59Z window (searches for 'rebalance' and 'partition' both returned total_matched 0), and the same 'rebalance' search on the co-sharer settlement-service also returned 0 matches.",
+      "finding_ids": [
+        "F16"
+      ]
+    },
+    {
+      "statement": "notification-service request_rate (consumer throughput proxy) is flat with no replay surge: ~130-142 req/s across 14:00-23:59Z, dipping slightly to avg 128.67 at 21:20Z post-restart, never exceeding max 152.2.",
+      "finding_ids": [
+        "F17"
+      ]
+    },
+    {
+      "statement": "order-service memory_pct is flat and stable across the whole window (avg ~59.5-60.5, max ~66), showing no concurrent memory growth like notification-service's ramp.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "Kafka is a shared component used by order-service and payment-service (queue-produce) and settlement-service and notification-service (queue-consume); notification-service also depends on email-provider (external, no telemetry).",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "Historical leads HIST-104 (2025-11-05, notification-service lag after Kafka broker rebalance) and HIST-112 (2026-02-03, settlement-service lost partition assignment during broker maintenance) describe rebalance-related causes, but are historical leads only, not current-incident evidence.",
+      "finding_ids": [
+        "F5"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The template cache actually accumulates entries at a rate matching a ~24h hour-to-OOM cycle; no byte-level heap attribution exists (only memory_pct %).",
+    "There is no eviction/weak-reference bound in the cache implementation — supported by the change being 'Add in-memory template cache' with no noted bound, but unverified.",
+    "No earlier notification-service deploy or pre-existing code could equally explain the ramp; deployment history for the service is not retrievable (budget_exhausted gap).",
+    "The absence of rebalance log lines is meaningful evidence rather than a log-verbosity artifact; the gap explicitly flags that the log stream may simply not emit rebalance events.",
+    "(demoted from facts: no verified observation backs it) Lowering Kafka retention truncates old segments rather than re-reading them; no consumer-group offset reset or topic/partition change was found that would force a replay, and the only change that adds unbounded in-memory growth is the notification-service v3.8.0 template cache deployed 2 days before onset.",
+    "(demoted from facts: no verified observation backs it) The Kafka maintenance change and the OOM correlate with near-full heap (already ~84% by 14:00Z rising to ~98% by 19:25Z) rather than with replay volume or a traffic/rebalance shift; lag spikes at 19:30-20:00Z are temporally downstream of near-full heap, and throughput is flat."
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-21T00:00:00Z",
+      "event": "notification-service v3.8.0 deployed (dep-5402, author s.menon) with 'Add in-memory template cache for email rendering' — ConcurrentHashMap keyed by template+locale+userSegment; no rollback recorded.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-03-21T22:59:50Z",
+      "event": "First OOMKilled restart of notification-service-7d9f (exit 137); restart counter steps 0→1 in the 22:00 bucket; lag spikes to max 17161.92 in the same 2h bucket.",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-03-22T21:59:47Z",
+      "event": "Second OOMKilled restart (exit 137), ~1h earlier than the previous; restart counter steps 1→2 in the 22:00 bucket; lag max 17611.66.",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-03-23T14:00:00Z",
+      "event": "Memory ramp already underway: memory_pct avg 83.82 with continuous climb (16:30Z 89.12, 17:45Z 93.37) — hours before the Kafka maintenance.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-03-23T18:00:00Z",
+      "event": "Kafka maintenance change applied: log.retention.ms 604800000→259200000 (7d→3d) by platform-team; no lag response in this bucket (avg 64.6/max 75.74) and no throughput surge (request_rate flat ~130-142 req/s).",
+      "finding_ids": [
+        "F1",
+        "F13",
+        "F17"
+      ]
+    },
+    {
+      "time": "2026-03-23T18:34:46Z",
+      "event": "First full-GC WARN under heap pressure (4152ms) appears in notification-service logs; old-gen heap usage over 90%.",
+      "finding_ids": [
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-03-23T19:25:00Z",
+      "event": "memory_pct reaches max 98.44.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-03-23T19:49:28Z",
+      "event": "Full-GC pause escalates to 6488ms; GC pause duration grew monotonically toward the kill.",
+      "finding_ids": [
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-03-23T19:59:21Z",
+      "event": "Third OOMKilled restart (exit 137) of notification-service-7d9f logged as ERROR; restart counter steps 2→3; lag spikes (19:30Z avg 3069.83/max 18137.93; 20:00Z avg 6004.47/max 14213.61).",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F13",
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-03-23T20:15:00Z",
+      "event": "Memory reset to avg 47.2 after the restart (sawtooth reset); lag returns to baseline (avg 57.18 by 20:30Z), confirming lag as a downstream consequence.",
+      "finding_ids": [
+        "F14",
+        "F13",
+        "F12"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Mitigate the immediate recurrence risk by rolling back notification-service from v3.8.0 (dep-5402) to the prior build, or by disabling the in-memory template cache (feature flag / config) if a rollback is not feasible — this is the operative change id dep-5402.",
+      "priority": "immediate",
+      "rationale": "The only change touching notification-service in the window and the only change adding unbounded in-memory growth is dep-5402; the memory ramp, GC-pressure logs and daily ~24h OOM cycle all begin after it, and it was never rolled back.",
+      "finding_ids": [
+        "F2",
+        "F6",
+        "F7",
+        "F8",
+        "F15"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "If rollback must be staged, set an interim container memory limit increase / raise the JVM max heap on notification-service as a stopgap, and enable alerting on memory_pct > 85% and on full-GC pause > 3s to catch the next ramp before the ~24h OOM.",
+      "priority": "immediate",
+      "rationale": "Memory climbs in a predictable sawtooth from ~48% to ~95-98% over roughly 24h with escalating full-GC pauses, so a higher ceiling and earlier alerting buys time while the fix is prepared; this is mitigation, not a root-cause fix.",
+      "finding_ids": [
+        "F7",
+        "F14",
+        "F15"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Do NOT act on the Kafka retention change (tc-004) or pursue a replay mitigation: revert nothing in Kafka for this incident, and correct the incident narrative that the maintenance/replay caused the OOM.",
+      "priority": "immediate",
+      "rationale": "The retention change only truncated segments (no forced replay, no offset reset), produced no lag or throughput response at 18:00Z, and both the memory ramp and the first two restarts predate it by ~2 days.",
+      "finding_ids": [
+        "F1",
+        "F6",
+        "F13",
+        "F14",
+        "F17"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Fix the cache properly in a new notification-service release: bound the template cache with a size limit plus eviction (e.g. Caffeine with maximumSize/expireAfterAccess or weak keys), and add a per-process heap/old-gen metric so cache growth is attributable.",
+      "priority": "short_term",
+      "rationale": "The root-cause mechanism is a ConcurrentHashMap keyed by template+locale+userSegment with no eviction or bound, and no byte-level heap attribution exists today (only memory_pct %), so the fix and its verification both require a bounded cache and better instrumentation.",
+      "finding_ids": [
+        "F2",
+        "F7",
+        "F15"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Verify the fix by watching notification-service for at least 48-72h after deploy: confirm memory_pct no longer shows the monotonic ~24h sawtooth, restart count stays flat at its current value, full-GC WARN lines stop recurring, and consumer lag no longer spikes in the OOM bucket.",
+      "priority": "short_term",
+      "rationale": "The signature to disprove is the daily sawtooth to ~95-98% with an OOM in the same 2h bucket; a full 72h observation covers more than the three ~24h cycles observed so far.",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F15"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a memory-growth/leak gate to CI for notification-service (heap-ramp soak test or cache-size bound check) and require bounded-collection review for caches added to long-lived services.",
+      "priority": "long_term",
+      "rationale": "A single PR ('Add in-memory template cache', dep-5402) introduced an unbounded collection that took ~2 days to manifest as three SEV-3 restarts; a soak/bound check would catch this class of regression pre-merge.",
+      "finding_ids": [
+        "F2",
+        "F6",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Close out the alternatives: check node/instance sizing and Kafka broker container limits for the 2026-03-21→23 window (not visible in the deploy feed), and spot-check other co-tenant consumers (settlement-, payment-) for a similar memory ramp to exclude a shared-component ceiling change.",
+      "priority": "short_term",
+      "rationale": "H4 (shared-component contention, 0.10) cannot be fully excluded because node instance-type and broker-count changes may be invisible in the deploy feed, and only order-service was checked (flat at ~59.5-60.5%).",
+      "finding_ids": [
+        "F4",
+        "F11"
+      ],
+      "hypothesis_id": "H4"
+    }
+  ],
+  "data_gaps": [
+    "No JVM heap/RSS byte-level gauges exist for notification-service — only a memory_pct percentage — so the ramp cannot be attributed to the template cache specifically, only that old-gen pressure grows toward the kill (GC WARN lines).",
+    "Config-change history for notification-service itself was not retrievable (budget_exhausted), so notification-specific JVM heap / container memory limits or Kafka consumer-group/offset settings cannot be confirmed unchanged.",
+    "Node/instance sizing and Kafka broker-count changes may be invisible in the deploy feed (get_deployments returned only 2 deploys across all services for the 7-day window), limiting the 'what changed' answer to deploys plus config keys.",
+    "Kafka metrics (cpu_pct/messages_in_per_s/under_replicated_partitions) and kafka memory were not queried (and kafka exposes no memory_pct), so broker-side maintenance activity cannot be correlated with the start of the ramp.",
+    "No broker-side/consumer-group telemetry exists (no per-consumer fetch, partition-assignment, or rebalance metrics), so a broker-side rebalance at 18:00Z cannot be confirmed or excluded — only that no such event is logged service-side, and the log stream may simply not emit rebalance events.",
+    "No telemetry for the external email-provider, so the reported ~25 min email delay could not be measured directly — it is observed only via notification-service lag and restarts.",
+    "Only order-service was checked for co-tenant memory behavior; settlement-service and payment-service memory was not compared, so the scope of any shared-component effect remains unverified.",
+    "Historical incident search for shared-node memory pressure / Kafka broker container limits returned budget_exhausted, so no prior pattern could be checked."
+  ],
+  "what_would_change_the_conclusion": [
+    "A service-scoped config or deployment history showing notification-service JVM heap or container memory limit was reduced (or its consumer concurrency raised) in the window would shift weight toward H4/shared-component contention.",
+    "Evidence of a concurrent memory ramp in sibling consumers (settlement-service, payment-service) or a node instance-type/broker-count change in the window would indicate a shared-component cause rather than an application-level cache leak.",
+    "Log evidence or broker-side telemetry showing a consumer-group rebalance or partition reassignment storm at or near 18:00Z — or a demonstration that the log stream suppresses rebalance events — would revive H3.",
+    "A recorded consumer-group offset reset or forced re-read of retained segments at 18:00Z would support the reporter's replay theory (H2).",
+    "Inspection of the v3.8.0 source showing the template cache is already bounded/evicting, or heap-profiler data attributing the old-gen growth to something other than the cache, would overturn H1.",
+    "An email-provider degradation of sufficient duration and magnitude, with a flat consumer lag but a growing internal send queue, would support H5."
+  ],
+  "findings": [
+    {
+      "statement": "The only config change on shared infrastructure in the 48h window (2026-03-21→23) is a Kafka maintenance change: kafka key log.retention.ms reduced from 604800000 to 259200000 (7 days → 3 days), changed at 2026-03-23T18:00:00Z by platform-team, described as 'Kafka maintenance: reduce retention to 3 days'. No topic/partition/consumer-group/rebalance setting was altered in this change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"key\":\"log.retention.ms\",\"old_value\":604800000,\"new_value\":259200000,\"changed_at\":\"2026-03-23T18:00:00Z\",\"author\":\"platform-team\",\"description\":\"Kafka maintenance: reduce retention to 3 days\""
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"id\":\"cfg-2410\",\"service\":\"kafka\",\"key\":\"log.retention.ms\""
+        }
+      ],
+      "services": [
+        "kafka"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "notification-service itself was deployed on 2026-03-21T00:00:00Z (dep-5402, v3.8.0, author s.menon) with change 'Add in-memory template cache for email rendering' — a ConcurrentHashMap keyed by template+locale+userSegment — and it is still live, not rolled back. This is the only recent deploy touching notification-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "\"id\":\"dep-5402\",\"service\":\"notification-service\",\"version\":\"v3.8.0\",\"deployed_at\":\"2026-03-21T00:00:00Z\",\"author\":\"s.menon\",\"summary\":\"Add in-memory template cache for email rendering\""
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"TemplateCache (ConcurrentHashMap) keyed by template+locale+userSegment\""
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-21T00:00:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only other deployment in the window is unrelated to Kafka/notification: auth-service v7.1.4 on 2026-03-22T13:00:00Z (ci-bot, 'bump jackson'). No rolling back is recorded on any deploy (all rolled_back_at: null).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"id\":\"dep-5415\",\"service\":\"auth-service\",\"version\":\"v7.1.4\",\"deployed_at\":\"2026-03-22T13:00:00Z\",\"author\":\"ci-bot\",\"summary\":\"Patch release\",\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-03-22T13:00:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": false,
+      "verification_note": "0/1 refs verified (tc-003: quote not found in tool output)"
+    },
+    {
+      "statement": "Kafka is a SHARED component used by several services: order-service (queue-produce), payment-service (queue-produce), settlement-service (queue-consume) and notification-service (queue-consume). notification-service also depends on email-provider (external, no telemetry). So notification-service competes for the shared Kafka cluster with order-, payment- and settlement-services.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"order-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"},{\"from\":\"payment-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"},{\"from\":\"settlement-service\",\"to\":\"kafka\",\"kind\":\"queue-consume\"},{\"from\":\"notification-service\",\"to\":\"kafka\",\"kind\":\"queue-consume\"}"
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "{\"name\":\"kafka\",\"type\":\"kafka\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true}"
+        }
+      ],
+      "services": [
+        "kafka",
+        "notification-service",
+        "order-service",
+        "payment-service",
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent (lead only): HIST-104 (2025-11-05) 'notification-service lag after Kafka broker rebalance' had identical symptoms (consumer lag spike, delayed emails) but root cause 'Partition reassignment caused consumer group rebalancing storm' — an infrastructure/rebalance cause, not a retention change; resolution was 'Throttled reassignment'. A second lead HIST-112 (2026-02-03, settlement-service) is 'Consumer lost partition assignment during broker maintenance'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "\"id\":\"HIST-104\",\"date\":\"2025-11-05\",\"title\":\"notification-service lag after Kafka broker rebalance\""
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"id\":\"HIST-112\",\"date\":\"2026-02-03\",\"title\":\"Settlement consumer stalled after partition reassignment\""
+        }
+      ],
+      "services": [
+        "notification-service",
+        "kafka"
+      ],
+      "time": null,
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The Kafka maintenance change (retention 7d→3d) does not by itself force a data replay — lowering retention truncates old segments rather than re-reading them; the reported 'consumer choking on a replay' is not supported by any change I found (no consumer-group offset reset, no topic/partition change recorded). The only change that adds unbounded in-memory growth is the notification-service v3.8.0 template cache deployed 2 days before onset.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "reduce retention to 3 days"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "Add in-memory template cache for email rendering"
+        }
+      ],
+      "services": [
+        "kafka",
+        "notification-service"
+      ],
+      "time": null,
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "notification-service memory_pct rises gradually and monotonically within each ~24h cycle, then resets — a sawtooth, not an abrupt jump. 7-day series starts ~48% after each reset and climbs in ~5%/2h steps to ~95-98% before the next drop.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-21T02:00:00Z\",\"avg\":52.71,\"max\":55.43}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-21T20:00:00Z\",\"avg\":92.91,\"max\":95.09}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-22T00:00:00Z\",\"avg\":50.33,\"max\":52.22}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "\"min\":42.73,\"max\":98.44"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-21T00:00:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "Three OOMKilled restarts of the same container notification-service-7d9f (exit code 137) occurred, timed at 2026-03-21T22:59:50Z, 2026-03-22T21:59:47Z and 2026-03-23T19:59:21Z — one per day, each ~1h earlier than the previous.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "container notification-service-7d9f OOMKilled (exit code 137), restarting"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"first_match\":\"2026-03-21T22:59:50Z\",\"last_match\":\"2026-03-23T19:59:21Z\""
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-03-22T21:59:47Z\",\"level\":\"ERROR\",\"message\":\"container notification-service-7d9f OOMKilled (exit code 137), restarting\"}"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T19:59:21Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Cumulative restart counter confirms exactly 3 restarts, stepping 0→1 at the 22:00 bucket of Mar 21, 1→2 at 22:00 of Mar 22, and 2→3 at 20:00 of Mar 23; it was a flat 0 for all of Mar 20 and most of Mar 21.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "{\"ts\":\"2026-03-21T22:00:00Z\",\"avg\":0.5,\"max\":1}"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "{\"ts\":\"2026-03-23T20:00:00Z\",\"avg\":3.0,\"max\":3}"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "\"first\":0.0,\"last\":3"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T20:00:00Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Consumer lag is flat/low (~56-65 msgs) throughout each day and spikes only in the same 2h bucket as each OOM: max 17161.92 at 2026-03-21T22:00Z, max 17611.66 at 2026-03-22T20:00Z, max 18137.93 at 2026-03-23T18:00Z — i.e. lag spikes coincide with the memory-exhaustion/OOM window, not before the ~24h ramp.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-20T20:00:00Z\",\"avg\":57.61,\"max\":92.63}"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-21T22:00:00Z\",\"avg\":2273.11,\"max\":17161.92}"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-23T18:00:00Z\",\"avg\":810.33,\"max\":18137.93}"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-23T22:00:00Z\",\"avg\":57.89,\"max\":79.06}"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "order-service memory_pct is flat and stable across the whole window (avg ~59.5-60.5, max ~66), showing no concurrent memory growth like notification-service's ramp.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-20T00:00:00Z\",\"avg\":60.14,\"max\":66.7}"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-23T18:00:00Z\",\"avg\":60.39,\"max\":64.65}"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "\"min\":51.57,\"max\":66.74"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The lag spike is short-lived relative to the memory ramp: after each OOM the lag returns to baseline in the same 2h bucket that the restart froze (e.g. 2026-03-23T20:00Z avg 1542.68 falls back to 57.89 by 2026-03-23T22:00Z). This is consistent with lag being a consequence of the restart, not a leading trigger.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-23T20:00:00Z\",\"avg\":1542.68,\"max\":14213.61}"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-23T22:00:00Z\",\"avg\":57.89,\"max\":79.06}"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T22:00:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "In the post-maintenance window (2026-03-23T16:00–23:59Z), notification-service consumer_lag stays flat at ~52–67 msgs throughout the flat period and spikes ONLY at the OOM: 2026-03-23T19:30Z avg 3069.83/max 18137.93, 20:00Z avg 6004.47/max 14213.61, then back to avg 57.18 at 20:30Z. Importantly the 18:00Z bucket (right at the Kafka retention change, 18:00:00Z) shows avg 64.6/max 75.74 — no lag response to the maintenance itself. Lag rises only in the ~30 min bucket containing the 19:59:21Z OOM, i.e. after/with the memory exhaustion, not at the change time.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"ts\":\"2026-03-23T19:30:00Z\",\"avg\":3069.83,\"max\":18137.93"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"ts\":\"2026-03-23T18:00:00Z\",\"avg\":64.6,\"max\":75.74"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"ts\":\"2026-03-23T20:30:00Z\",\"avg\":57.18,\"max\":71.58"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T19:30:00Z",
+      "id": "F13",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "notification-service memory_pct was already in a monotonic ramp well BEFORE the 18:00Z maintenance: 2026-03-23T14:00Z avg 83.82, climbing continuously (16:30Z 89.12, 17:45Z 93.37, 19:00Z 96.17, max 98.44 at 19:25Z) and only dropping at the 19:50Z bucket (avg 66.53) into 20:15Z (avg 47.2) — the restart reset. So the last ~4h pre-OOM is a steady climb with no inflection at 18:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"ts\":\"2026-03-23T14:00:00Z\",\"avg\":83.82"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"ts\":\"2026-03-23T19:25:00Z\",\"avg\":95.99,\"max\":98.44"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"ts\":\"2026-03-23T20:15:00Z\",\"avg\":47.2,\"max\":47.77"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F14",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "notification-service logs in the maintenance window (18:00–21:00Z) show a GC/heap-pressure signature leading the OOM, NOT rebalance or partition-assignment activity: 10 WARN 'heap usage N% over 90 (old gen), full GC took Nms' lines from 18:34:46Z (4152ms) escalating to 19:49:28Z (6488ms), then one ERROR 'container notification-service-7d9f OOMKilled (exit code 137), restarting' at 19:59:21Z. Full-GC pause duration grows monotonically (4152→6488ms) toward the kill.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "heap usage 1% over 90 (old gen), full GC took 6388ms"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "container notification-service-7d9f OOMKilled (exit code 137), restarting"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T19:59:21Z",
+      "id": "F15",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No rebalance or partition-assignment events exist in notification-service logs for the whole 2026-03-23T14:00–23:59Z window: searches for 'rebalance' and 'partition' both returned total_matched 0 (returned 0, truncated false). The same 'rebalance' search on the co-sharer settlement-service also returned 0 matches. There is no log evidence of a rebalance storm or partition reassignment around the maintenance/OOM.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "\"total_matched\":0,\"returned\":0,\"truncated\":false"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "\"total_matched\":0,\"returned\":0,\"truncated\":false"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "\"total_matched\":0,\"returned\":0"
+        }
+      ],
+      "services": [
+        "notification-service",
+        "settlement-service"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F16",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "notification-service request_rate (consumer throughput proxy) is flat with no replay surge: ~130–142 req/s across 14:00–23:59Z, dipping slightly to avg 128.67 at 21:20Z (post-restart) and never exceeding max 152.2. There is no throughput spike that would indicate an unusually large replay volume crossing the maintenance or the OOM.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "\"ts\":\"2026-03-23T18:00:00Z\",\"avg\":131.35,\"max\":135.69"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "\"max\":152.2"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T18:00:00Z",
+      "id": "F17",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Interpretation: the OOM correlates with heap/old-gen saturation (an internal memory ramp, already at ~84% by 14:00Z and rising to ~98% by 19:25Z) reaching a limit, not with replay volume or a traffic/rebalance shift. Lag spikes at 19:30–20:00Z are temporally downstream of near-full heap rather than at the 18:00Z retention change, and throughput is flat — consistent with the 'choking on a replay' theory being unsupported in this window.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"ts\":\"2026-03-23T19:25:00Z\",\"avg\":95.99,\"max\":98.44"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"ts\":\"2026-03-23T19:30:00Z\",\"avg\":3069.83,\"max\":18137.93"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "\"ts\":\"2026-03-23T22:00:00Z\",\"avg\":137.69,\"max\":147.89"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-23T19:59:21Z",
+      "id": "F18",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    }
+  ],
+  "termination_reason": "critic_disabled",
+  "stats": {
+    "latency_s": 144.43,
+    "llm_calls": 14,
+    "prompt_tokens": 69500,
+    "completion_tokens": 18264,
+    "total_tokens": 87764,
+    "tool_calls": 23,
+    "tool_attempts": 23,
+    "tool_failures": 3,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 3,
+    "tasks_failed": 0,
+    "findings": 18,
+    "findings_verified": 17,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 1,
+        "prompt_tokens": 823,
+        "completion_tokens": 691
+      },
+      "observability": {
+        "calls": 8,
+        "prompt_tokens": 47727,
+        "completion_tokens": 7014
+      },
+      "dependency": {
+        "calls": 3,
+        "prompt_tokens": 9801,
+        "completion_tokens": 2913
+      },
+      "reasoning": {
+        "calls": 1,
+        "prompt_tokens": 5161,
+        "completion_tokens": 3208
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 5988,
+        "completion_tokens": 4438
+      }
+    }
+  },
+  "warnings": [
+    "critic disabled (ablation); analysis unreviewed, confidence capped at 0.6",
+    "fact demoted to assumption: Lowering Kafka retention truncates old segments rather than re-reading them; no ",
+    "fact demoted to assumption: The Kafka maintenance change and the OOM correlate with near-full heap (already "
+  ]
+}

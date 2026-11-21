@@ -1,0 +1,955 @@
+{
+  "incident_id": "INC-008",
+  "system": "multi_agent",
+  "outcome": "inconclusive",
+  "summary": "Login latency (p99 ~3.8s sustained) and 503s on POST /v1/auth/login began at ~06:54Z and are an overload/queueing signature, not a bad-deployment signature: the auth-service worker pool was pinned at 64/64 with queues up to ~98,763, every 503 is an \"accept queue full\" rejection, and CPU hit 96-99% with flat memory. The top hypothesis is H3 (genuine login-traffic surge, credential stuffing / retry storm overrunning auth-service capacity with the autoscaler capped at maxReplicas 8) at only 0.45 confidence, driven by the >3x request-rate rise coincident with CPU saturation and the autoscaler's \"desired replicas 14 exceeds maxReplicas 8\" message. The reporter's bcrypt-regression hypothesis (H1) is rejected: no auth-service deployment exists in the window and the only auth-service config change is a log.level INFO->WARN edit, while no login-path dependency shows degradation. Because the top hypothesis remains below the confidence threshold and the blast-radius/shared-infrastructure cross-checks were never run, the outcome is recorded as inconclusive with the surge-capacity cause as the leading (unconfirmed) explanation.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H3",
+      "title": "Genuine login-traffic surge (credential stuffing / retry storm) overruns auth-service capacity, autoscaler capped",
+      "statement": "Login request rate more than tripled, driven by external retry/bot/credential-stuffing traffic (possibly amplified by client retries of the already-slow endpoint). auth-service's provisioned capacity/maxReplicas were insufficient, the autoscaler hit maxReplicas=8-14, workers pinned at 96-99% CPU, the worker queue grew to ~98k, and the accept queue began rejecting with 503s. No faulty code or config change is involved.",
+      "category": "capacity_saturation",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "null",
+      "confidence": 0.45,
+      "pre_cap_confidence": 0.45,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "External login traffic surge begins ~06:50Z (request_rate 391-411 -> 680 -> ~1450-1520 req/s)",
+          "finding_ids": [
+            "F11"
+          ]
+        },
+        {
+          "claim": "auth-service worker pool saturates (active=64/64, queue depths 3787-98763) and CPU pegs at 96-99%",
+          "finding_ids": [
+            "F9",
+            "F10",
+            "F15"
+          ]
+        },
+        {
+          "claim": "Timing is consistent with work arriving (queues) — comes as a single step, no dependency slowdown to blame",
+          "finding_ids": [
+            "F16",
+            "F17",
+            "F13",
+            "F14"
+          ]
+        },
+        {
+          "claim": "Autoscaler cannot add capacity (desired 14 > maxReplicas 8)",
+          "finding_ids": [
+            "F11"
+          ]
+        },
+        {
+          "claim": "User-visible symptom: sustained ~3.5-4.0s p99 and 503 accept-queue rejections on /v1/auth/login",
+          "finding_ids": [
+            "F7",
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F11",
+        "F9",
+        "F10",
+        "F15",
+        "F16",
+        "F12",
+        "F8"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "That the traffic surge is externally generated (the evidence does not distinguish real third-party load from client retry amplification; both are capacity_saturation and would call for the same fix — raise maxReplicas/capacity and/or shed or rate-limit the load).",
+        "That request_rate is measured on auth-service itself, not only on the gateway."
+      ],
+      "rejection_reason": ""
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H4",
+      "title": "Shared-infrastructure/co-tenant contention (node/sidecar/shared cache) degraded auth-service indirectly",
+      "statement": "Something else co-located or shared with auth-service (a node-level stressor, a co-tenant service, a shared proxy/DNS, or the shared redis-cache as a shared resource) degraded at the same time, and auth-service's symptoms are collateral damage rather than an auth-service-local fault. This predicts the same onset pattern in at least one other credential/identity service, and predicts auth-service CPU saturation without a matching auth-service traffic surge (a wildcard not seen): the observed simultaneous 3.5-4x request-rate rise and CPU rise (F10, F11) is more consistent with H3.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "unknown",
+      "trigger_change_id": "null",
+      "confidence": 0.2,
+      "pre_cap_confidence": 0.2,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "A shared node/co-tenant resource degrades (no finding directly shows this)",
+          "finding_ids": []
+        },
+        {
+          "claim": "auth-service CPU/latency rises at the same time",
+          "finding_ids": [
+            "F10",
+            "F7"
+          ]
+        },
+        {
+          "claim": "auth-service overflows to 503s",
+          "finding_ids": [
+            "F8",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F5",
+        "F6"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "That no other service was checked for a matching onset — the blast-radius cross-check was never run, so a shared-infrastructure cause cannot be fully excluded."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H2",
+      "title": "Login-path dependency (redis-cache / user-db / kyc-provider) degraded, auth-service is a victim",
+      "statement": "A shared downstream dependency on the login path (shared redis-cache, user-db, or the external kyc-provider) became slow, so auth-service login requests queue up and the service saturates while waiting — the 503s/latency are propagated, not locally generated.",
+      "category": "dependency_failure",
+      "root_cause_service": "redis-cache",
+      "trigger_change_id": "null",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "dependency slows or fails",
+          "finding_ids": []
+        },
+        {
+          "claim": "auth-service login handlers block on the dependency",
+          "finding_ids": []
+        },
+        {
+          "claim": "request accumulation -> worker pool/accept queue overflow -> 503",
+          "finding_ids": [
+            "F9",
+            "F8"
+          ]
+        },
+        {
+          "claim": "p99 jumps to ~3.8s",
+          "finding_ids": [
+            "F7"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F5",
+        "F6"
+      ],
+      "contradicting_evidence": [
+        "F13",
+        "F14",
+        "F16",
+        "F17"
+      ],
+      "assumptions": [
+        "That a brief saturation of redis-cache or user-db could be missed by the 5-minute/120s bucket averages (partially countered by F13's flat per-minute series).",
+        "That kyc-provider degradation could be invisible because it has no telemetry (still open)."
+      ],
+      "rejection_reason": "F13/F17: redis-cache CPU stayed flat 20.6-24% and hit_ratio ~96% through the whole onset; user-db slow_queries_per_min stayed flat at 0.18-0.51 the entire time (F14). Neither dependency shows latency, error or saturation. F16/F15/F10: auth-service latency and CPU jump as a single local step at its own CPU saturation, not a gradual ramp that would follow a downstream slowdown. The only rising upstream-facing metric (user-db connections_active, F14) rises simultaneously with auth CPU, consistent with auth-service driving the extra load itself. F17 states this inference."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H1",
+      "title": "auth-service release reintroduced bcrypt cost regression (reporter's hypothesis)",
+      "statement": "An auth-service code release raised the bcrypt cost factor (or otherwise made password verification CPU-bound), so login verification burns CPU, saturates the worker pool / accept queue, and produces 3.8s p99 plus 503s — the same mechanism as HIST-101 in 2025-08.",
+      "category": "bad_deployment",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "null",
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "auth-service deploy raises bcrypt cost factor",
+          "finding_ids": []
+        },
+        {
+          "claim": "verifyPassword becomes CPU-bound, auth-service CPU pegged",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "worker pool/accept queue overflows -> 503 on /v1/auth/login",
+          "finding_ids": [
+            "F9",
+            "F8"
+          ]
+        },
+        {
+          "claim": "p99 jumps to ~3.8s",
+          "finding_ids": [
+            "F7"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F3",
+        "F10",
+        "F9"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F2",
+        "F4"
+      ],
+      "assumptions": [
+        "That the bcrypt cost is a deploy-time constant and cannot change without a release (true for HIST-101's mechanism)."
+      ],
+      "rejection_reason": "F1: the deployment inventory shows NO auth-service deployment anywhere in 2026-04-16 -> 2026-04-22 (count 0), and the only deployment fleet-wide is portfolio-service. F2: the only auth-service config change is a log.level INFO->WARN verbosity change, not a crypto/bcrypt parameter. F4 states this explicitly. The bcrypt mechanism requires a release to raise the cost factor; no such release exists in the window, so the reporter's mechanism cannot be the origin."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "auth-service p99 latency was flat ~85-95ms until 06:53Z, then jumped at 06:54Z to 3849.2ms and stayed ~3.5-4.0s through 08:59Z (the 4s bucket value at 06:52 is a bucket artifact).",
+      "finding_ids": [
+        "F7",
+        "F16"
+      ]
+    },
+    {
+      "statement": "Every 503 on POST /v1/auth/login is logged as an overload rejection: top error pattern 'request rejected: accept queue full, returning 503', count=372, first_seen 06:55:42Z, last 08:58:57Z; error_rate rose from ~0.2% at 06:48 to ~14% sustained.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "At onset the auth-service worker pool was fully saturated with a large waiting backlog: 32 WARN 'worker pool saturated (active=64/64, queue=...)' entries from 06:54:53Z with queue depths 3787-98763; the first 503 at 06:55:42Z is the accept-queue-full rejection that follows.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "auth-service CPU saturates simultaneously with the latency jump (cpu_pct ~37-40% through 06:45, then avg 71.88/max 96.96 at 06:50 and 96-98% onward, max 99.54) while memory_pct stays flat ~51-53% — a CPU-bound signature with no memory growth.",
+      "finding_ids": [
+        "F10",
+        "F15"
+      ]
+    },
+    {
+      "statement": "auth-service request_rate more than tripled at onset (~391-411 req/s baseline to avg 680.57/max 1012.36 at 06:50 and ~1450-1520 req/s sustained), and the autoscaler could not absorb it: 'desired replicas 14 exceeds maxReplicas 8; cannot scale further' (first 06:57:15Z, count=4).",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "Login-path dependencies show no degradation at onset: redis-cache cpu_pct flat 20.59-23.97% and hit_ratio ~94.4-97.3% across 06:40-07:20; user-db slow_queries_per_min flat at 0.18-0.51 throughout.",
+      "finding_ids": [
+        "F13",
+        "F14"
+      ]
+    },
+    {
+      "statement": "user-db connections_active rose from ~25 (06:40-06:50) to avg 73.31 at 06:52 and ~79 sustained — simultaneous with auth-service CPU, consistent with auth-service driving the extra connections rather than a downstream slowdown.",
+      "finding_ids": [
+        "F14"
+      ]
+    },
+    {
+      "statement": "No auth-service deployment exists anywhere in the 2026-04-16T00:00Z -> 2026-04-22T08:59Z window (count 0); the only deployment fleet-wide is portfolio-service.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "The only config change touching auth-service in the window is cfg-2801: log.level INFO->WARN at 2026-04-22T03:40:00Z — a logging verbosity change, not an auth/bcrypt/crypto parameter.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "The historical bcrypt precedent HIST-101 matches the current symptom signature but required a release (v6.4.0) to raise the bcrypt cost factor; no such release exists in this window, so the deployment-driven mechanism cannot be the origin of this incident.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "auth-service's login path depends on user-db, redis-cache (marked shared, used by several services), the external kyc-provider (has_telemetry=false), and is called by api-gateway; redis-cache's shared nature is a candidate vector for externally originating damage.",
+      "finding_ids": [
+        "F5"
+      ]
+    }
+  ],
+  "assumptions": [
+    "That the observed request-rate surge is externally generated traffic; the evidence does not distinguish genuine third-party load from client retry amplification of the already-slow endpoint (both are capacity_saturation and call for the same fix).",
+    "That request_rate is measured on auth-service itself and not only at the gateway (the metric was read from auth-service telemetry).",
+    "That auth-service capacity in this incident is governed by maxReplicas=8 as reported by the autoscaler, and that replicas could not be increased beyond it in the observed window.",
+    "That no relevant change occurred on a login-path dependency that the fleet-wide deployment/config query failed to surface for a specific dependency, and that kyc-provider (no telemetry) did not degrade.",
+    "That the 5-minute/120s metric buckets would have surfaced a dependency-side saturation if one existed, i.e. that redis-cache/user-db flatness is not masking a short saturation.",
+    "That the traffic surge and CPU saturation are causally related (surge drives CPU), rather than an unrelated CPU burner coinciding with a traffic rise.",
+    "(demoted from facts: no verified observation backs it) The bcrypt-regression signature is not distinguishable from observed data: CPU is pegged at 96-99% with flat memory (consistent with CPU-bound work in general) but no metric separates verifyPassword CPU from other CPU, and the visible evidence is an overload/queueing signature rather than a per-hash CPU-time signature."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-22T03:40:00Z",
+      "event": "cfg-2801: auth-service log.level changed INFO->WARN by config-bot ('Reduce log volume') — the only auth-service config change in the window, and a non-crypto parameter.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:00:00Z",
+      "event": "Baseline: auth-service request_rate ~391-411 req/s, CPU ~37-40%, p99 latency ~85-95ms.",
+      "finding_ids": [
+        "F7",
+        "F10",
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:50:00Z",
+      "event": "CPU begins to rise (120s bucket avg 71.88, max 96.96) as request_rate climbs (avg 680.57, max 1012.36) — onset of the traffic surge and CPU saturation.",
+      "finding_ids": [
+        "F10",
+        "F11",
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:52:00Z",
+      "event": "auth-service CPU saturates in the 120s bucket (avg 96.89, max 96.96); user-db connections_active jumps ~25 -> avg 73.31 — one bucket before the measured latency jump.",
+      "finding_ids": [
+        "F14",
+        "F15",
+        "F17"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:54:00Z",
+      "event": "p99 latency jumps in a single step to 3849.2ms and stays ~3.5-4.0s; worker pool saturates (active=64/64) with queue depths 3787-98763 (first WARN 06:54:53Z).",
+      "finding_ids": [
+        "F7",
+        "F9",
+        "F16"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:55:42Z",
+      "event": "First 503 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)'; error_rate rises from ~0.2% to ~14% sustained.",
+      "finding_ids": [
+        "F8",
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:57:15Z",
+      "event": "Autoscaler logs 'desired replicas 14 exceeds maxReplicas 8; cannot scale further' (count=4) — capacity ceiling prevents absorption of the surge.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-04-22T06:40:00Z-07:20:00Z",
+      "event": "Throughout the incident window, redis-cache CPU stays ~22% with ~96% hit ratio and user-db slow_queries_per_min stays ~0.2-0.5 — no dependency-side saturation or latency signature.",
+      "finding_ids": [
+        "F13",
+        "F14",
+        "F17"
+      ]
+    },
+    {
+      "time": "2026-04-22T08:58:57Z",
+      "event": "Last of 372 accept-queue-full 503 rejections logged on POST /v1/auth/login; latency/errors still elevated at latest data (08:59Z).",
+      "finding_ids": [
+        "F8"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Raise auth-service capacity / the autoscaler ceiling: increase the maxReplicas setting above 8 (autoscaler was requesting 14) for the auth-service deployment and verify HPA/target metrics so replicas can actually be added; confirm the cap change takes effect during the ongoing elevated request_rate.",
+      "priority": "immediate",
+      "rationale": "The autoscaler explicitly could not scale (desired 14 > maxReplicas 8) while request_rate was ~1450-1520 req/s and workers were pinned at 96-99% CPU with queue depths up to 98763 — the direct capacity bottleneck.",
+      "finding_ids": [
+        "F9",
+        "F10",
+        "F11"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Apply rate limiting / load shedding at api-gateway or the auth-service front door for POST /v1/auth/login (and enable/verify the auth-service rate_limited_per_min control), prioritizing real user logins and dropping bot/retry traffic, to relieve accept-queue pressure.",
+      "priority": "immediate",
+      "rationale": "All 372 503s are accept-queue-full overload rejections on the login endpoint; shedding excess load is a safe mitigation that does not depend on knowing whether the surge is external or retry-amplified.",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F12"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Run the blast-radius cross-check: compare request_rate/CPU/latency onset in the 06:45-07:00Z window for api-gateway and for other services co-located with or sharing redis-cache (call get_service_dependencies on redis-cache, direction=upstream) to determine whether the onset is auth-service-local or shared-infrastructure-driven.",
+      "priority": "immediate",
+      "rationale": "H3 (0.45) and H4 (0.20) are not yet discriminated: H4 predicts a matching onset in at least one other credential/identity or co-tenant service, and this cross-check was never run.",
+      "finding_ids": [
+        "F5",
+        "F6",
+        "F11"
+      ],
+      "hypothesis_id": "H4"
+    },
+    {
+      "action": "Determine whether the request-rate surge is external (bot/credential-stuffing) or client retry amplification of the slow endpoint — inspect caller/IP/source distribution, user-agent patterns, and login-failure vs login-success ratios in the auth-service and api-gateway access data for 06:50-08:59Z.",
+      "priority": "short_term",
+      "rationale": "The evidence does not distinguish third-party load from client retry amplification; the distinction is needed to choose between bot mitigation and client-side backoff changes, and to confirm H3's causal story.",
+      "finding_ids": [
+        "F8",
+        "F11"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "After capacity mitigation, verify recovery: confirm p99 latency returns to baseline (~85-95ms), error_rate returns to ~0.2%, accept-queue-full 503 count stops incrementing, and worker queue depths return to normal; keep the maxReplicas/capacity change in place and tune autoscaling thresholds from the observed surge profile.",
+      "priority": "short_term",
+      "rationale": "Validates that capacity, not a code/config defect, was the binding constraint and closes the loop on the observed queueing and CPU saturation.",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F9",
+        "F10"
+      ],
+      "hypothesis_id": "H3"
+    },
+    {
+      "action": "Establish guardrails to prevent recurrence: load-test auth-service to the new capacity envelope, set alerting on worker-pool queue depth / accept-queue rejections and on autoscaler maxReplicas saturation, add login-endpoint rate limiting and bot/credential-stuffing protection, and add a CPU-time-by-code-path metric to separate verifyPassword cost from other handler work.",
+      "priority": "long_term",
+      "rationale": "The incident showed no early-warning alert before queue depths reached tens of thousands, autoscaling silently capped, and no metric can separate bcrypt/verify-password CPU from other CPU — a gap that made the reporter's bcrypt hypothesis (H1) unfalsifiable from the available data.",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F11",
+        "F18"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Additionally instrument and collect telemetry (or a substitute health signal) for kyc-provider (external, has_telemetry=false) and per-endpoint/health-check latency for auth-service, and backfill the missing deployment/config history before 2026-04-16T00:00Z for user-db and redis-cache.",
+      "priority": "long_term",
+      "rationale": "These were explicit gaps: no telemetry for kyc-provider, no per-endpoint latency metrics, and no change history older than ~3.5 days — each leaves a login-path cause channel unchecked.",
+      "finding_ids": [
+        "F5",
+        "F12"
+      ],
+      "hypothesis_id": null
+    }
+  ],
+  "data_gaps": [
+    "Could not run the upstream dependency query for redis-cache (get_service_dependencies, direction=upstream) — rejected with budget_exhausted — so the caller list for the shared redis-cache and whether other callers changed is unknown; the shared-infrastructure hypothesis H4 remains unverified.",
+    "Deployment/config history for user-db, redis-cache, api-gateway and kyc-provider was not enumerated as separate per-service queries; only fleet-wide scope queries ran (returning just portfolio-service deployment and cfg-2801). A dependency-specific change could be missed.",
+    "No deployment/config history exists for the 24-72h before 2026-04-16T00:00Z, so a slower-burning change older than ~3.5 days (e.g. user-db schema/index migration, redis caching-layer config) affecting login is unchecked.",
+    "kyc-provider is external with has_telemetry=false, so no deployment, config or metric data can confirm whether it changed or degraded.",
+    "Per-endpoint and health-check latency metrics were not available; only overall latency_p99_ms and error_rate exist, so the 'login-only vs all-endpoints' and 'health checks unaffected' conclusions rest on log evidence alone.",
+    "No cross-service comparison was run for other services in the 06:45-07:00Z window, so whether any other service shows a matching onset (blast radius) is unanswered.",
+    "auth-service logs (06:45-07:10Z: 84 matched/40 shown) and the ERROR query (372 matched/30 shown) were truncated, so a rarer error signature or a deploy/restart marker could be missed.",
+    "No CPU-time-by-code-path metric exists for auth-service (verifyPassword vs other handlers), so the bcrypt/verify-password CPU contribution cannot be positively confirmed or ruled out.",
+    "redis-cache connected_clients/evictions_per_min and user-db cpu_pct/replication_lag_ms were not queried, so less-common dependency saturation modes were not verified.",
+    "Tool reliability: query_metrics(redis-cache, available_metrics) and query_metrics(user-db, available_metrics) both FAILED with not_found, limiting visibility into those dependencies' metric catalogs."
+  ],
+  "what_would_change_the_conclusion": [
+    "A successful cross-service comparison showing a matching latency/CPU onset in api-gateway or another co-tenant/credential service in the same 06:45-07:00Z window would support or overturn H4 over H3 (shifting weight toward shared-infrastructure contention).",
+    "Evidence that the request-rate surge is entirely client-side retry amplification rather than external bot/credential-stuffing traffic would reframe the cause but still point to the same capacity_saturation fix.",
+    "Discovery of an auth-service release or a bcrypt/crypto config change outside the queried window (e.g. older than 2026-04-16) would revive the reporter's H1 bcrypt-regression hypothesis.",
+    "Detection of elevated latency, errors or saturation on redis-cache, user-db or kyc-provider at onset (e.g. connection exhaustion, evictions, replication lag, or a kyc-provider slowdown) would support H2 (dependency failure) and point away from the local capacity cause.",
+    "A per-endpoint metric showing elevated latency on non-login endpoints or on health checks would argue against a login-path-specific surge and toward a broader/service-wide or node-level cause.",
+    "Evidence that replicas were in fact not capped (e.g. the maxReplicas=8 message was stale or not binding) would weaken the capacity-saturation mechanism underlying H3."
+  ],
+  "findings": [
+    {
+      "statement": "No auth-service deployment exists anywhere in the 2026-04-16T00:00Z -> 2026-04-22T08:59Z window (and none in the narrower 2026-04-19T07:00Z -> 2026-04-22T08:59Z window either): get_deployments for auth-service returned count 0, and the all-services query returned a single deployment belonging to portfolio-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"count\":0,\"deployments\":[],\"scope\":\"auth-service\"}"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"id\":\"dep-5803\",\"service\":\"portfolio-service\",\"version\":\"v4.4.0\",\"deployed_at\":\"2026-04-22T05:50:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service",
+        "portfolio-service"
+      ],
+      "time": "2026-04-22T08:59:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only config change in the whole window that touches auth-service is cfg-2801: key log.level changed INFO->WARN at 2026-04-22T03:40:00Z by config-bot ('Reduce log volume') — a logging verbosity change, not an auth/bcrypt/crypto parameter. No other config changes exist fleet-wide in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "\"id\":\"cfg-2801\",\"service\":\"auth-service\",\"key\":\"log.level\",\"old_value\":\"INFO\",\"new_value\":\"WARN\",\"changed_at\":\"2026-04-22T03:40:00Z\",\"author\":\"config-bot\",\"description\":\"Reduce log volume\""
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "\"count\":1"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The historical bcrypt precedent HIST-101 (2025-08-14) has the same symptom signature as the current report — 'login p99 4s', '503 on login', 'high cpu' — with root cause 'bcrypt cost factor raised 10->14 in release v6.4.0', category bad_deployment, resolved by 'Rolled back v6.4.0'. It is a matching lead only, not current evidence.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"title\":\"Login latency after auth-service release\",\"services\":[\"auth-service\"],\"symptoms\":[\"login p99 4s\",\"503 on login\",\"high cpu\"],\"root_cause\":\"bcrypt cost factor raised 10->14 in release v6.4.0\""
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"match_score\":5"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Because the bcrypt precedent required a release to raise the cost factor, and there is no auth-service release in this window, the current incident cannot be the same deployment-driven mechanism unless data outside this window is involved — the change history points away from an auth-service code/config cause.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "\"count\":0"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "bcrypt cost factor raised 10->14 in release v6.4.0"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service's login path depends on: user-db (postgres, kind=db), redis-cache (redis, kind=cache, marked shared=true — 'shared' datastores are used by several services), kyc-provider (external, has_telemetry=false), and is called by api-gateway (kind=http). redis-cache being shared with several services is a candidate vector for damage originating outside auth-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"from\":\"redis-cache\",\"kind\":\"cache\""
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "user-db",
+        "redis-cache",
+        "kyc-provider",
+        "api-gateway"
+      ],
+      "time": null,
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/2 refs verified (tc-004: quote not found in tool output)"
+    },
+    {
+      "statement": "Prior incident HIST-107 ('Cold cache storm after redis failover', 2025-12-09, services redis-cache + market-data-service, root cause 'Redis primary failure promoted an empty replica') shows the shared redis-cache has a history of degrading its consumers — a second, non-bcrypt lead consistent with a shared-dependency cause.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"title\":\"Cold cache storm after redis failover\",\"services\":[\"redis-cache\",\"market-data-service\"],\"root_cause\":\"Redis primary failure promoted an empty replica\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": false,
+      "verification_note": "0/1 refs verified (tc-007: quote not found in tool output)"
+    },
+    {
+      "statement": "auth-service p99 latency was flat ~85-95ms until 06:53Z, then jumped at 06:54Z to 3849.2ms and stayed ~3.5-4.0s through 08:59Z. The 4s bucket avg reported at 06:52 is a bucket artifact: the 60s-bucket zoom shows 06:52 = 93.19ms and the jump is exactly at 06:54Z (=3849.2ms).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":1925.68,\"max\":3849.2"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-04-22T06:53:00Z\",\"avg\":89.8"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-04-22T06:54:00Z\",\"avg\":3849.2"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:54:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "503s on POST /v1/auth/login are NOT bad-password/verify failures: every 503 is logged as an overload rejection. Top error pattern 'request rejected: accept queue full, returning 503 (POST /v1/auth/login)' count=372, first_seen 2026-04-22T06:55:42Z, last 08:58:57Z; error_rate jumped from ~0.2% (06:48) to 3.43% avg/13.19% max in the 06:52 bucket and ~14% sustained thereafter, with total_matched=372 ERROR entries (returned 30 of 372, truncated=true).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "request rejected: accept queue full, returning 503 (POST /v1/auth/login)"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"first_match\":\"2026-04-22T06:55:42Z\""
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":3.43,\"max\":13.19"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:55:42Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "At onset auth-service worker pool was fully saturated with a large waiting backlog, not CPU-idle: 32 WARN 'worker pool saturated (active=64/64, queue=...)' entries starting 06:54:53Z with queue depths of 3787-98763 (e.g. queue=39035, 94198, 98763); the first 503 at 06:55:42Z is the accept-queue-full rejection that follows.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "worker pool saturated (active=64/64, queue=39035)"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "worker pool saturated (active=64/64, queue=98763)"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "\"pattern\":\"worker pool saturated (active=<n>/<n>, queue=<n>)\",\"count\":32,\"first_seen\":\"2026-04-22T06:54:53Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:54:53Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service CPU saturated simultaneously with the latency jump: cpu_pct ~37-40% through 06:45, then 06:50 avg=71.88 max=96.96 and ~96-98% from 06:55 onward (max 99.54), while memory_pct stayed flat ~51-53% (max 57.07) — a CPU-bound signature with no memory growth.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-04-22T06:50:00Z\",\"avg\":71.88,\"max\":96.96"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-04-22T07:55:00Z\",\"avg\":96.73,\"max\":99.54}"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-04-22T07:55:00Z\",\"avg\":50.85,\"max\":54.79"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:50:00Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service request_rate more than tripled at onset: ~391-411 req/s baseline (06:00-06:45) to avg 680.57/max 1012.36 at 06:50 and ~1450-1520 req/s sustained afterward — a traffic surge coincides with the CPU saturation, and the autoscaler could not absorb it: 'autoscaler: desired replicas 14 exceeds maxReplicas 8; cannot scale further' (first 06:57:15Z, count=4).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "{\"ts\":\"2026-04-22T06:50:00Z\",\"avg\":680.57,\"max\":1012.36"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "{\"ts\":\"2026-04-22T06:45:00Z\",\"avg\":390.98,\"max\":415.9"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "autoscaler: desired replicas 14 exceeds maxReplicas 8; cannot scale further"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:50:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Only /v1/auth/login appears in the auth-service failure logs (all 372 ERRORs are that endpoint's accept-queue rejections); no health-check, verifyPassword-specific, or other-endpoint error signature appears in the returned log window.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"counts_by_level\":{\"ERROR\":372}"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "POST /v<n>/auth/login"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:55:42Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache (shared cache in auth-service login path) shows NO degradation at the auth-service onset: cpu_pct stayed flat 20.59-23.97% (06:40 avg 21.96 -> 06:54 avg 21.95) and hit_ratio_pct stayed ~94.4-97.3% (06:52 96.15, 06:54 96.09) through the whole window. The dependency is healthy on CPU and hit ratio across 06:40-07:20.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "{\"ts\":\"2026-04-22T06:54:00Z\",\"avg\":21.95,\"max\":22.56}"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "{\"ts\":\"2026-04-22T06:54:00Z\",\"avg\":96.09,\"max\":96.14}"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:54:00Z",
+      "id": "F13",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "user-db connections_active jumped at the same onset bucket but is a downstream consequence, not a saturated upstream: it rose from ~25 (06:40-06:50) to avg 73.31/max 74.03 at 06:52 and ~79 sustained, with slow_queries_per_min flat at 0.18-0.51 the entire time (06:54 avg 0.41). No slow-query or DB-saturation signature exists.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":73.31,\"max\":74.03}"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "\"summary\":{\"min\":0.18,\"max\":0.51,\"mean\":0.3"
+        }
+      ],
+      "services": [
+        "user-db"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F14",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service CPU saturation begins in the 06:52 120s bucket (avg 96.89, max 96.96, after 34.42 at 06:50), i.e. one 120s bucket BEFORE the latency p99 jump recorded at 06:54 (avg 3759.86 / max 3849.2, after 91.5 at 06:52). Local CPU is pinned well before/at the same time as measured latency, not after it.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":96.89,\"max\":96.96}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "{\"ts\":\"2026-04-22T06:54:00Z\",\"avg\":3759.86,\"max\":3849.2}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F15",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service latency is flat ~85-94ms for 06:40-06:52 and then jumps in one step to ~3.5-4.0s sustained through 07:20 (min 83.49, max 4015.31) - a local step change at its own CPU saturation, not a gradual ramp consistent with a downstream dependency slowing down.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"summary\":{\"min\":83.49,\"max\":4015.31,\"mean\":2514.88"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:54:00Z",
+      "id": "F16",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Neither login-path dependency shows an error/latency/saturation signal at the onset: redis-cache CPU ~22% and hit ratio ~96% flat, user-db slow_queries_per_min ~0.3 flat; the only rising upstream-facing number (user-db connections_active) rises simultaneously with auth-service CPU/latency, consistent with auth-service itself driving the extra connections during its own saturation. This points to a locally-caused (in-auth-service) saturation rather than downstream-propagated latency.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "\"summary\":{\"min\":20.59,\"max\":23.97,\"mean\":22.05"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "\"mean\":0.3"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "{\"ts\":\"2026-04-22T06:52:00Z\",\"avg\":73.31,\"max\":74.03}"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "user-db",
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:52:00Z",
+      "id": "F17",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The bcrypt-regression signature (slowness concentrated in password-verification CPU time) is NOT distinguishable from the observed data because auth-service CPU is pegged at 96-99% while memory stays flat - consistent with CPU-bound work in general - but no metric separates verifyPassword CPU from other CPU; the queue-saturation logs (active=64/64, queues up to 98763) and the 372 accept-queue-full 503s reported by T1 are an overload/queueing signature rather than a per-hash CPU-time signature. Ruling out blocked/waiting: no dependency shows elevated latency or saturation to blame, and auth CPU saturates simultaneously.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "{\"ts\":\"2026-04-22T07:00:00Z\",\"avg\":98.26,\"max\":98.35}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"bucket_seconds\":120"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-22T06:54:00Z",
+      "id": "F18",
+      "agent": "observability",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_disabled",
+  "stats": {
+    "latency_s": 102.16,
+    "llm_calls": 12,
+    "prompt_tokens": 62689,
+    "completion_tokens": 16702,
+    "total_tokens": 79391,
+    "tool_calls": 24,
+    "tool_attempts": 24,
+    "tool_failures": 2,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 3,
+    "tasks_failed": 0,
+    "findings": 18,
+    "findings_verified": 17,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 1,
+        "prompt_tokens": 811,
+        "completion_tokens": 771
+      },
+      "observability": {
+        "calls": 6,
+        "prompt_tokens": 41490,
+        "completion_tokens": 6474
+      },
+      "dependency": {
+        "calls": 3,
+        "prompt_tokens": 9766,
+        "completion_tokens": 2759
+      },
+      "reasoning": {
+        "calls": 1,
+        "prompt_tokens": 5063,
+        "completion_tokens": 2492
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 5559,
+        "completion_tokens": 4206
+      }
+    }
+  },
+  "warnings": [
+    "critic disabled (ablation); analysis unreviewed, confidence capped at 0.6",
+    "fact demoted to assumption: The bcrypt-regression signature is not distinguishable from observed data: CPU i"
+  ]
+}

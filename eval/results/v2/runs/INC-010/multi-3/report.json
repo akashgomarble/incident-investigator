@@ -1,0 +1,1553 @@
+{
+  "incident_id": "INC-010",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Settlement processing stalled at ~07:42Z because order-service v2.16.0 (deployed 07:40Z, the only deploy in the window) renamed the OrderExecuted field qty->quantity and added a v2 schema header, while settlement-service's consumer still expects schema v1; the first v2 message at orders-3@8841207 fails deserialization ('missing required field qty', header v2) and is retried forever, blocking that partition and freezing all settlement progress (confidence 0.72, medium). The onset is tightly aligned: deploy 07:40:00, lag rise 07:37-07:44, throughput collapse 07:42:00, first bad log 07:42:14. Alternatives were rejected on mechanical grounds rather than mere absence of evidence: the reporter's cfg-3004 poll change cannot block an offset (the consumer is actively polling and retrying), the shared ledger-db is healthy (flat db_pool_in_use and 5xx), and a broker-wide event is contradicted by the healthy sibling consumer notification-service on the same shared broker (flat lag ~60, normal throughput, zero under-replication). The remaining weakness is that no per-partition or producer-side telemetry directly proves offset 8841207 was emitted by order-service, and no rollback/restart was attempted to serve as a natural experiment.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "order-service v2.16.0 schema rename (qty->quantity, header v2) produces a poison message that blocks partition orders-3",
+      "statement": "order-service v2.16.0 (deployed 07:40) changed the OrderExecuted event schema: field qty renamed to quantity and a v2 schema header added. settlement-service's consumer (built for schema v1) cannot deserialize the first v2 message at orders-3@8841207, throws 'missing required field qty', and retries that offset indefinitely, blocking the partition. No offsets advance, so lag grows monotonically and zero settlements post.",
+      "category": "bad_deployment",
+      "root_cause_service": "order-service",
+      "trigger_change_id": "order-service v2.16.0 (2026-05-12T07:40:00Z)",
+      "confidence": 0.72,
+      "confidence_label": "medium",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "order-service v2.16.0 deploys at 07:40:00Z, the single deployment in the fleet window, renaming OrderExecuted field qty->quantity, adding field venue, and adding a v2 schema version header; status live, not rolled back",
+          "finding_ids": [
+            "F1",
+            "F32",
+            "F33"
+          ]
+        },
+        {
+          "claim": "order-service is a declared producer ('queue-produce') to the shared kafka broker that settlement-service consumes, so it is a legitimate writer to the orders topic",
+          "finding_ids": [
+            "F3",
+            "F5",
+            "F36"
+          ]
+        },
+        {
+          "claim": "settlement-service's consumer expects schema v1 and cannot deserialize the v2 message: 'failed to deserialize OrderExecuted at orders-3@8841207: missing required field qty (schema v1 expected, header says v2)'",
+          "finding_ids": [
+            "F10",
+            "F28",
+            "F32"
+          ]
+        },
+        {
+          "claim": "The error header version (v2) and the missing field name (qty) match order-service v2.16.0's declared changes exactly, linking the poison message content to that release",
+          "finding_ids": [
+            "F32",
+            "F10"
+          ]
+        },
+        {
+          "claim": "The single poison message at orders-3@8841207 blocks the partition and is retried without advancing the offset ('poison message: retrying orders-3@8841207, partition blocked')",
+          "finding_ids": [
+            "F10",
+            "F29",
+            "F13"
+          ]
+        },
+        {
+          "claim": "No offsets advance, so settlement throughput collapses (~65 -> ~0.4 req/s) and consumer lag grows monotonically (~50 -> 60k+)",
+          "finding_ids": [
+            "F8",
+            "F9",
+            "F30",
+            "F13"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F32",
+        "F33",
+        "F10",
+        "F28",
+        "F29",
+        "F8",
+        "F9",
+        "F30",
+        "F13",
+        "F3",
+        "F5",
+        "F36",
+        "F16",
+        "F25"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The v2 message at orders-3@8841207 was produced by order-service specifically (no per-partition producer telemetry exists; linkage rests on deploy-content + error-text match + timing)",
+        "settlement-service's consumer was not updated in lockstep with the v2 schema (no settlement-service deployment in window per F1/F35)",
+        "The poll-config change cfg-3004 is coincidental/ineffective as a stall cause (no poll/rebalance/timeout log evidence, F11)",
+        "The poison message blocks partition orders-3 only; errors on other partitions of the orders topic are not visible in the retrieved (truncated) logs"
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H3",
+      "title": "Broker-side partition reassignment / infra event on the shared kafka broker caused the stall (historical analogy)",
+      "statement": "A broker-side disruption (partition reassignment, rebalance, broker maintenance) on the shared kafka broker stalled the settlement consumer, matching HIST-112/HIST-104. The poison message and v2 deploy are incidental.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "kafka",
+      "trigger_change_id": "null",
+      "confidence": 0.06,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "A broker-side reassignment/rebalance occurs on the shared kafka broker (unrecorded; no broker rebalance/reassignment metric exists to observe it)",
+          "finding_ids": []
+        },
+        {
+          "claim": "settlement-service loses/regains partition assignment and stops advancing offsets",
+          "finding_ids": []
+        },
+        {
+          "claim": "Lag grows and settlements stall",
+          "finding_ids": [
+            "F9",
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F7",
+        "F14",
+        "F15",
+        "F19",
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F11",
+        "F6",
+        "F10",
+        "F20",
+        "F21",
+        "F22",
+        "F23",
+        "F25"
+      ],
+      "assumptions": [
+        "An unrecorded broker event occurred despite no kafka config change and no under-replication activity"
+      ],
+      "rejection_reason": "Rejected on direct sibling-consumer evidence, not merely absence of broker telemetry. The broker is shared by TWO consumers (F3, F25), yet the other consumer notification-service shows flat baseline lag (mean ~60, no rise at 07:42 or later — F20), fully normal flat throughput (132-167 req/s — F21), and no rebalance/session-timeout/poll-timeout logs (only one unrelated NTP message — F22). under_replicated_partitions is exactly 0.0 for every bucket (F23). A broker-wide reassignment affecting the shared broker would degrade both consumers; the impact is confined to settlement-service, and the observed error is a content-specific deserialization failure at a named offset (F10), not an assignment loss. Historical analogy (HIST-112/104) carries no dependency/partition telemetry (F14/F15) and no poison-message precedent exists in the corpus (F16)."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H2",
+      "title": "settlement-service cfg-3004 poll-settings change caused the consumer to stop fetching (reporter's suspicion)",
+      "statement": "The settlement-service config change cfg-3004 at 07:35 (consumer.max.poll.records 500->200) triggered the stall — e.g. a mis-set poll parameter caused the consumer to stop advancing. This is the reporter's stated suspicion.",
+      "category": "config_change",
+      "root_cause_service": "settlement-service",
+      "trigger_change_id": "cfg-3004",
+      "confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "cfg-3004 changes consumer.max.poll.records 500->200 at 07:35, preceding the stall",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "Mis-set poll parameter causes consumer to stop fetching/deserializing, so no offsets advance",
+          "finding_ids": []
+        },
+        {
+          "claim": "Throughput collapses and lag grows",
+          "finding_ids": [
+            "F8",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2"
+      ],
+      "contradicting_evidence": [
+        "F11",
+        "F10",
+        "F13",
+        "F17",
+        "F28"
+      ],
+      "assumptions": [
+        "max.poll.records=200 is small enough to throttle fetch to a full stall (implausible — 200 is a normal batch size)"
+      ],
+      "rejection_reason": "Mechanism mismatch: reducing max.poll.records to 200 slows batch size, it does not block an offset or stop all progress, and the consumer demonstrably IS polling and actively retrying offset 8841207 (F10/F28). No rebalance-loop, session-timeout, or poll-timeout logs exist — the only error signatures are the deserialization/poison patterns (F11). No precedent exists in the corpus for a max.poll.records-type setting causing a stall (F17). The actual failure is a content-specific deserialization error naming the v2 header and missing qty field (F10), which poll settings cannot produce."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H5",
+      "title": "Poison message from a source other than order-service's v2 schema blocks the partition",
+      "statement": "A malformed/poison message (from a non-order-service source, or a pre-existing corrupt event) sits at orders-3@8841207 and blocks the partition, with order-service v2.16.0 merely coincident in time. settlement-service is victim, not cause.",
+      "category": "data_issue",
+      "root_cause_service": "unknown (message producer)",
+      "trigger_change_id": "null",
+      "confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "A malformed message is produced to orders-3 (source and timing unknown)",
+          "finding_ids": []
+        },
+        {
+          "claim": "consumer cannot deserialize and retries offset 8841207 indefinitely, blocking the partition",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "Offsets stop advancing; throughput collapses and lag grows",
+          "finding_ids": [
+            "F8",
+            "F9",
+            "F13"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F10",
+        "F13"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F10",
+        "F32"
+      ],
+      "assumptions": [
+        "A malformed message could originate independently of the v2 schema change"
+      ],
+      "rejection_reason": "The error text explicitly names the v2 schema: 'missing required field qty (schema v1 expected, header says v2)' (F10). The v2 header exactly matches order-service v2.16.0's added v2 schema version header, and 'qty' is exactly the field that release renamed to 'quantity' (F1/F32). This is the new schema, not random corruption; timing (deploy 07:40, first bad message 07:42:14) also aligns (F13)."
+    },
+    {
+      "rank": 5,
+      "hypothesis_id": "H4",
+      "title": "Shared ledger-db degradation back-pressures settlement processing",
+      "statement": "The shared ledger-db (used by four services) degraded, causing settlement-service's calls to hang and back-pressure the consumer, stalling settlements. Because the broker is shared, other services would surface it too.",
+      "category": "dependency_failure",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "null",
+      "confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Shared ledger-db degrades (failover, IOPS throttling, disk full, slow scan — all precedented)",
+          "finding_ids": [
+            "F4",
+            "F18"
+          ]
+        },
+        {
+          "claim": "settlement-service DB calls slow/fail, holding the consumer",
+          "finding_ids": []
+        },
+        {
+          "claim": "Throughput collapses and offsets stop advancing",
+          "finding_ids": [
+            "F8",
+            "F9"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F4",
+        "F18"
+      ],
+      "contradicting_evidence": [
+        "F12",
+        "F11",
+        "F10"
+      ],
+      "assumptions": [
+        "ledger-db degradation can stall the consumer at the message-deserialization stage (it cannot — deserialization is pre-DB)"
+      ],
+      "rejection_reason": "Mechanism mismatch: the failing action is message DESERIALIZATION, which occurs before any DB call can fail, so a DB fault cannot produce 'missing required field qty (schema v1 expected, header says v2)'. Metrics also contradict it: db_pool_in_use flat (~5.8-6.5) and HTTP 5xx error_rate flat (~0.17-0.26%) with no step change (F12), and no DB/ledger/posting/5xx error logs exist (F11). Only weak precedent (F18) supports it."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "Exactly one deployment occurred across all services in 07:30-09:59: order-service v2.16.0 at 2026-05-12T07:40:00Z ('Order events v2'), which renames event field qty -> quantity, adds field venue, and adds event schema version header v2; status live, not rolled back.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "Exactly one config change occurred in the window: settlement-service cfg-3004 at 07:35:00Z changing consumer.max.poll.records from 500 to 200.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "The first bad log entry is at 07:42:14Z: deserialization failure 'failed to deserialize OrderExecuted at orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)' (213 occurrences, first_seen 07:42:14) plus 'poison message: retrying orders-3@8841207 (attempt <n>), partition blocked' (196 occurrences, first_seen 07:44:51).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "order-service's producer-side change content matches the consumer's poison-message signature exactly: dep-6010 lists 'OrderExecuted event: rename field qty -> quantity', 'add field venue', 'event schema version header v2' — the same missing field name and the same header version the consumer reports.",
+      "finding_ids": [
+        "F32",
+        "F10"
+      ]
+    },
+    {
+      "statement": "Settlement throughput collapsed from ~62-67 req/s to ~0.4 req/s between the 07:41 and 07:42 buckets and stayed at ~0.4 req/s through 09:55 (onset 07:42:00Z).",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "Consumer lag was flat/baseline (~36-56 messages) through 07:35, rose sharply from the 07:40-07:45 bucket (07:40 avg 515.03, 07:45 avg 2629.17), and grew monotonically to avg 60220.76 / max 61605.53 at 09:55.",
+      "finding_ids": [
+        "F9",
+        "F30"
+      ]
+    },
+    {
+      "statement": "The first error log (07:42:14Z) coincides with the first zero-throughput minute (07:42 bucket avg 0.39) and the lag rise in the 07:37-07:44 region, so all three signals onset together at ~07:42.",
+      "finding_ids": [
+        "F8",
+        "F30"
+      ]
+    },
+    {
+      "statement": "All 409 WARN+ entries in 07:30-09:59 are level ERROR and consist solely of the two orders-3 patterns; there are no rebalance-loop, session-timeout, poll-timeout, or DB/ledger/posting/5xx downstream-failure messages.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "Every WARN+ log entry names ONLY partition orders-3 at offset 8841207; targeted searches for 'orders-0' and 'orders-1' returned 0 matches, and no other topic name appears in settlement-service logs. All 213 deserialization errors are at orders-3@8841207.",
+      "finding_ids": [
+        "F27",
+        "F28",
+        "F29"
+      ]
+    },
+    {
+      "statement": "kafka is a shared broker with TWO consumers (settlement-service and notification-service), so a broker-wide disruption would affect both.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "notification-service consumer lag is flat/baseline throughout 06:30-09:57 (mean ~60.11, no rise at 07:42 or later) and its throughput is normal and flat (min 132.42, max 166.73 req/s); its only WARN+ entry is an unrelated NTP clock-drift message at 08:39:18Z.",
+      "finding_ids": [
+        "F20",
+        "F21",
+        "F22"
+      ]
+    },
+    {
+      "statement": "Broker metric under_replicated_partitions is exactly 0.0 for every 9-min bucket from 06:30 to 09:57 (no missing points).",
+      "finding_ids": [
+        "F23"
+      ]
+    },
+    {
+      "statement": "Downstream/DB health indicators stayed flat across the stall: db_pool_in_use held ~5.8-6.5 connections (06:30-09:57) and HTTP 5xx error_rate stayed ~0.17-0.26% with no step change, arguing against a downstream call failure, connection-pool exhaustion, or ledger-db fault.",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "statement": "No rollback of order-service v2.16.0 occurred (dep-6010 is live, rolled_back_at null) and no settlement-service deployment/restart event exists in 07:30-09:59, so no event could have reset the blocked offset.",
+      "finding_ids": [
+        "F33",
+        "F35"
+      ]
+    },
+    {
+      "statement": "order-service has a produce edge to the shared kafka broker, making it a legitimate writer to the topic settlement-service consumes.",
+      "finding_ids": [
+        "F36",
+        "F5"
+      ]
+    },
+    {
+      "statement": "No historical incident in the searchable corpus matches today's poison-message/deserialization or producer-schema-rename signature, nor any case of a max.poll.records-type setting causing a stall.",
+      "finding_ids": [
+        "F16",
+        "F17"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The v2 message at orders-3@8841207 was produced by order-service specifically. No per-partition or per-producer telemetry exists to link that offset to a producer (F26, F24); the linkage rests on deploy-content match (F32), the error text (F10), the produce edge from order-service to the shared broker (F36), and timing (F13).",
+    "settlement-service's consumer was not updated in lockstep with the v2 schema; the only deploy in the window is order-service v2.16.0 and there is no settlement-service deployment (F1, F35).",
+    "The cfg-3004 poll-settings change is coincidental/ineffective as a stall cause; there is no poll/rebalance/timeout log evidence and the consumer is actively polling and retrying the bad offset (F2, F10, F11).",
+    "The poison message blocks partition orders-3 only; the retrieved logs are truncated, so errors on other partitions of the orders topic may exist but are not visible (F27, F28, F31).",
+    "The retrieved log sample, though truncated, is assumed representative enough that no additional distinct error pattern (DB/posting/5xx) exists after 07:59; the pattern aggregate lists only the two orders-3 consumer-side patterns (F11, F31).",
+    "Historical precedent (HIST-112/HIST-104) is assumed non-diagnostic here: those broker/rebalance records carry no poison-message, partition, or offset telemetry and no producer-schema precedent exists in the corpus (F14, F15, F16, F19)."
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-12T07:35:00Z",
+      "event": "settlement-service config change cfg-3004: consumer.max.poll.records 500->200 by m.das (only config change in the window).",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:37:00Z",
+      "event": "Aggregate consumer_lag begins rising from a flat ~47 avg (07:30 bucket) to 202.21 (07:37) and 2616.82 (07:44).",
+      "finding_ids": [
+        "F30"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:40:00Z",
+      "event": "order-service v2.16.0 deployed ('Order events v2'): renames OrderExecuted field qty->quantity, adds venue, adds v2 schema header. Only deployment in the window; remains live.",
+      "finding_ids": [
+        "F1",
+        "F32",
+        "F33"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:41:00Z",
+      "event": "Last normal settlement throughput bucket (avg ~65.3 req/s).",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:42:00Z",
+      "event": "Settlement throughput collapses to ~0.4 req/s (07:42 bucket) and stays there through 09:55.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:42:14Z",
+      "event": "First deserialization error: 'failed to deserialize OrderExecuted at orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)' — onset of the poison-message loop.",
+      "finding_ids": [
+        "F10",
+        "F13"
+      ]
+    },
+    {
+      "time": "2026-05-12T07:44:51Z",
+      "event": "First 'poison message: retrying orders-3@8841207 (attempt n), partition blocked' log — the retry storm begins.",
+      "finding_ids": [
+        "F10",
+        "F29"
+      ]
+    },
+    {
+      "time": "2026-05-12T08:22:00Z",
+      "event": "Incident INC-010 reported by on-call SRE: no settlements posted ~40 minutes, consumer lag 60k and climbing.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-05-12T08:39:18Z",
+      "event": "Only notification-service WARN+ entry in the window: unrelated NTP clock-drift resync message.",
+      "finding_ids": [
+        "F22"
+      ]
+    },
+    {
+      "time": "2026-05-12T09:57:00Z",
+      "event": "Lag plateaus at avg 60713.43 / max 61605.53; under_replicated_partitions still 0.0; db_pool_in_use and 5xx error_rate still flat.",
+      "finding_ids": [
+        "F30",
+        "F23",
+        "F12"
+      ]
+    },
+    {
+      "time": "2026-05-12T09:58:00Z",
+      "event": "Last deserialization error logged; partition orders-3 still blocked with no rollback or consumer restart applied.",
+      "finding_ids": [
+        "F28",
+        "F35",
+        "F37"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back order-service to the pre-v2.16.0 producer contract (or set order-service to emit schema v1 / stop emitting the v2 header) so that new OrderExecuted events on orders-3 are again v1-compatible. This is the direct mitigation of the identified cause (the only deploy in-window, F1/F32/F33).",
+      "priority": "immediate",
+      "rationale": "The poison message is the v2-schema OrderExecuted event that settlement-service cannot deserialize (F10/F32); restoring v1 production stops new poison messages from being produced at the head of the partition.",
+      "finding_ids": [
+        "F1",
+        "F32",
+        "F33",
+        "F10"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Unblock partition orders-3 for settlement-service: skip/quarantine the single poison record at orders-3@8841207 (e.g. via an offset-skip/seek-past-bad-record admin action or a dead-letter/poison-message handler), then verify offsets advance and lag declines.",
+      "priority": "immediate",
+      "rationale": "The consumer is stuck retrying the same offset indefinitely (213 deserialize errors, 196 blocked-retry entries, all at orders-3@8841207 — F10/F28/F29/F27); only clearing that record restores forward progress. No offset-skip/rollback mechanism is currently recorded (F34) and no restart has been applied (F35).",
+      "finding_ids": [
+        "F10",
+        "F28",
+        "F29",
+        "F27",
+        "F34",
+        "F35"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Do NOT treat cfg-3004 (consumer.max.poll.records 500->200) as the cause and do not roll it back as the primary fix; keep it or revert at leisure. The consumer is demonstrably polling and actively retrying the bad offset, which a smaller batch size cannot produce.",
+      "priority": "immediate",
+      "rationale": "cfg-3004 is coincidental: the failure is a content-specific deserialization error naming the v2 header and missing qty field, a mechanism poll settings cannot produce (F10, F11, F17).",
+      "finding_ids": [
+        "F2",
+        "F10",
+        "F11",
+        "F17"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Confirm recovery after offset skip / rollback: verify settlement throughput returns toward ~62-67 req/s and consumer_lag declines monotonically from ~60k, and confirm the settlement-service ERROR patterns (orders-3@8841207) cease.",
+      "priority": "short_term",
+      "rationale": "Recovery is defined by the same signals that showed the fault: throughput collapse onset at 07:42 (F8), lag rise to ~60k (F9/F30), and the two orders-3 error patterns (F10/F31).",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F30",
+        "F10",
+        "F31"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add a poison-message / deserialization-failure dead-letter path with an alert that fires when a partition is blocked retrying a single offset, so a single unreadable record cannot silently halt an entire partition again.",
+      "priority": "short_term",
+      "rationale": "All 409 ERROR entries are retries of one offset on one partition (F10/F27/F28/F29); the existing tooling exposes no offset-skip or block-detection mechanism (F34), and the block persisted unnoticed from 07:42 to the 08:22 report.",
+      "finding_ids": [
+        "F10",
+        "F27",
+        "F28",
+        "F29",
+        "F34"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Introduce and enforce consumer-driven schema compatibility: versioned event contracts with backward compatibility, a schema registry / consumer contract test in CI, and required lockstep consumer updates when a producer bumps the event schema version.",
+      "priority": "long_term",
+      "rationale": "This is the first recorded schema-rename poisoning in the corpus (F16) and there is no precedent tying producer schema version bumps to consumer deserialization failures (F32 showed the exact schema change); a registry/contract gate prevents recurrence.",
+      "finding_ids": [
+        "F16",
+        "F32",
+        "F10",
+        "F1"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add per-partition lag/offset-progress and producer-side schema-version telemetry (plus the missing broker rebalance/reassignment/error metrics) so the causal hop — which producer emitted the blocking offset — can be proven directly next time.",
+      "priority": "long_term",
+      "rationale": "Metrics expose only aggregate consumer_lag; partition_lag, rebalance_count, partition_reassignment_count, broker_error_rate and offline_partitions all returned not_found (F26, F24), which is why the offset-to-producer link remains an assumption and could not be confirmed this time.",
+      "finding_ids": [
+        "F26",
+        "F24"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Do not pursue broker-side partition reassignment remediation (e.g. restarting the consumer group as in HIST-112): the shared broker's other consumer is unaffected and under-replication is zero, so a reassignment theory is contradicted by evidence.",
+      "priority": "long_term",
+      "rationale": "notification-service lag is flat (~60) and throughput normal (132-167 req/s) on the same shared broker, its only WARN+ entry is unrelated NTP, and under_replicated_partitions is 0.0 for every bucket (F20/F21/F22/F23/F25).",
+      "finding_ids": [
+        "F20",
+        "F21",
+        "F22",
+        "F23",
+        "F25"
+      ],
+      "hypothesis_id": "H3"
+    }
+  ],
+  "data_gaps": [
+    "No per-producer or per-partition telemetry exists to prove offset 8841207 was emitted by order-service: partition_lag returned not_found for settlement-service (only aggregate consumer_lag is exposed, F26), the kafka broker lacks rebalance/reassignment/error/offline metrics (F24), and order-service producer-metric queries were not completed (budget exhausted). The central causal hop therefore rests on deploy-content plus timing plus error-text match.",
+    "No consumer-group offset/commit view is exposed by any tool used, so it cannot be independently confirmed that the orders-3@8841207 record was produced after 07:40 rather than being an older record whose first parse attempt happened at 07:42.",
+    "Broker CPU and messages_in_per_s for the window were not queried (budget exhausted), leaving one remaining broker-health signal unchecked, though under_replicated_partitions=0.0 and both consumers' behavior indicate no broker-side disturbance.",
+    "Both log queries were truncated (409 and 52 total matches, 40 returned), so the complete absence of later (07:59-09:59) downstream/DB error signatures in the raw sample cannot be fully asserted, though the top_patterns aggregate lists only the two consumer-side patterns.",
+    "The producer-side schema version history for order-service and whether any other service emits to the orders topic could not be enumerated, so the assumption that orders-3's poison record is order-service v2 output is not directly verified at the source.",
+    "No historical precedent exists for a poison-message/deserialization stall or for a max.poll.records-type setting causing a stall, so neither today's signature nor the poll-config theory can be corroborated or refuted from precedent."
+  ],
+  "what_would_change_the_conclusion": [
+    "Per-partition offset/commit telemetry or producer-side metrics showing that orders-3@8841207 was produced by a service other than order-service (e.g. payment-service), or that the blocking record predates the 07:40 deploy — this would move the conclusion toward H5 (non-order-service poison message).",
+    "Evidence that notification-service (the other consumer on the shared broker) also shows lag rise, throughput drop, rebalance, or the same deserialization/blocked symptom — this would revive H3 (broker-side event) and undercut the confinement argument.",
+    "Discovery of rebalance/session-timeout/poll-timeout log entries or non-zero under_replicated_partitions / partition-reassignment activity in the window — this would support H3 against H1.",
+    "Proof that the v2 poison record is readable by another consumer (or that offsets on orders-3 advanced while orders-0/orders-1 lag rose), which would indicate a settlement-service-specific consumer defect rather than a producer schema break.",
+    "Evidence that cfg-3004 did in fact cause fetch to stop (e.g. poll-timeout logs, a rebalance loop, or offset advance resuming on config revert before any schema fix) — this would point back to H2.",
+    "A ledger-db fault or connection-pool exhaustion signature timed to the onset, or a DB/post/5xx error in the truncated log region, which would revive H4 despite the currently flat DB counters.",
+    "A completed natural experiment: if rolling back order-service v2.16.0 (or skipping the poison offset) restores throughput and lag declines, H1 is confirmed; if not, H1 is falsified."
+  ],
+  "findings": [
+    {
+      "statement": "Only ONE deployment occurred across all services in 07:30-09:59: order-service v2.16.0 at 2026-05-12T07:40:00Z ('Order events v2'), which renames event field qty -> quantity, adds field venue, and adds event schema version header v2. Status live, not rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"id\":\"dep-6010\",\"service\":\"order-service\",\"version\":\"v2.16.0\",\"deployed_at\":\"2026-05-12T07:40:00Z\""
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "OrderExecuted event: rename field qty -> quantity"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-12T07:40:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Only ONE config change occurred across all services in the window: settlement-service cfg-3004 at 2026-05-12T07:35:00Z, key consumer.max.poll.records changed from 500 to 200 by m.das ('Smaller poll batches to smooth DB writes'). This precedes the stall.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"id\":\"cfg-3004\",\"service\":\"settlement-service\",\"key\":\"consumer.max.poll.records\",\"old_value\":500,\"new_value\":200,\"changed_at\":\"2026-05-12T07:35:00Z\""
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:35:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "kafka is a SHARED broker: order-service and payment-service produce to it, while settlement-service AND notification-service both consume from it. So any broker-side disruption affects two consumers.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"from\":\"notification-service\",\"to\":\"kafka\",\"kind\":\"queue-consume\"}"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"from\":\"order-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"}"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"}"
+        }
+      ],
+      "services": [
+        "kafka",
+        "settlement-service",
+        "notification-service",
+        "order-service",
+        "payment-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "ledger-db is a SHARED postgres used by four services: order-service, portfolio-service, payment-service and settlement-service. settlement-service's only datastore edge is to this shared ledger-db.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"settlement-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"portfolio-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "{\"from\":\"settlement-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "settlement-service",
+        "order-service",
+        "portfolio-service",
+        "payment-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "settlement-service's declared dependencies are exactly two: it CONSUMES the shared kafka queue and calls the shared ledger-db. Direct upstream producers feeding the queue are order-service and payment-service; no dedicated 'posting/ledger' downstream service is declared beyond ledger-db.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"from\":\"settlement-service\",\"to\":\"kafka\",\"kind\":\"queue-consume\"}"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No config changes were found for kafka (scope=kafka returned count 0) in 07:30-09:59, so the broker/cluster infra shows no recorded config change in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"kafka\""
+        }
+      ],
+      "services": [
+        "kafka"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Historical precedent leads (not evidence for this incident): HIST-112 (2026-02-03) 'Settlement consumer stalled after partition reassignment' with symptoms 'consumer lag growing','settlements stuck' matched settlement-service+kafka with match_score 5; HIST-104 matched notification-service+kafka lag after broker rebalance. Both point to partition-reassignment/infra causes, unlike the config/event-schema changes seen today.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"id\":\"HIST-112\""
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "Settlement consumer stalled after partition reassignment"
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "kafka"
+      ],
+      "time": "2026-02-03T00:00:00Z",
+      "id": "F7",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Settlement throughput (request_rate) collapsed from ~62-67 req/s to ~0.4 req/s between the 07:41 bucket (avg 65.3) and the 07:42 bucket (avg 0.39), and stayed at ~0.4 req/s through 09:55. This is the throughput-drop onset: 07:42:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-05-12T07:41:00Z\",\"avg\":65.3,\"max\":65.3},{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":0.39,\"max\":0.39}"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-05-12T07:35:00Z\",\"avg\":62.45,\"max\":67.28},{\"ts\":\"2026-05-12T07:40:00Z\",\"avg\":25.87,\"max\":65.3},{\"ts\":\"2026-05-12T07:45:00Z\",\"avg\":0.41,\"max\":0.44}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Consumer lag was flat/baseline (~36-56 messages, 5-min buckets) through 07:35, then rose sharply: 07:40 avg 515.03 (max 1306.47), 07:45 avg 2629.17, and grew monotonically to avg 60220.76 / max 61605.53 at 09:55. Lag starts rising in the 07:40-07:45 bucket, i.e. concurrent with the throughput collapse at 07:42.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"ts\":\"2026-05-12T07:35:00Z\",\"avg\":49.82,\"max\":53.96},{\"ts\":\"2026-05-12T07:40:00Z\",\"avg\":515.03,\"max\":1306.47},{\"ts\":\"2026-05-12T07:45:00Z\",\"avg\":2629.17,\"max\":3512.17}"
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"last\":61605.53}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:40:00Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The first bad log entry is at 07:42:14Z: a deserialization failure on a single message. Dominant signature = poison message on partition orders-3 stuck at offset 8841207: 'failed to deserialize OrderExecuted at orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)' (213 occurrences, first_seen 07:42:14) and 'poison message: retrying orders-3@8841207 (attempt <n>), partition blocked' (196 occurrences, first_seen 07:44:51).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "failed to deserialize OrderExecuted at orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"pattern\":\"poison message: retrying orders-<n>@<n> (attempt <n>), partition blocked\",\"count\":196,\"first_seen\":\"2026-05-12T07:44:51Z\""
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"first_match\":\"2026-05-12T07:42:14Z\""
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:14Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "All 409 WARN+ log entries in 07:30-09:59 are level ERROR; there are no rebalance-loop, session-timeout, or poll-timeout messages, and no DB/ledger/posting/5xx downstream-failure messages. The only patterns present are the two above.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"total_matched\":409,\"returned\":40,\"truncated\":true,\"counts_by_level\":{\"ERROR\":409}"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"total_matched\":52,\"returned\":40,\"truncated\":true,\"counts_by_level\":{\"ERROR\":52}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:30:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Downstream/DB health indicators stayed flat across the stall, arguing against downstream call failure or connection-pool exhaustion: db_pool_in_use held ~5.8-6.5 connections throughout (06:30-09:57), and error_rate (HTTP 5xx) stayed ~0.17-0.26% with no step change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":6.08,\"max\":6.34},{\"ts\":\"2026-05-12T07:51:00Z\",\"avg\":6.03,\"max\":6.44}"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":0.17,\"max\":0.31},{\"ts\":\"2026-05-12T08:00:00Z\",\"avg\":0.21,\"max\":0.3}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:57:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/2 refs verified (tc-015: quote not found in tool output)"
+    },
+    {
+      "statement": "Ordering: first error log (07:42:14Z) coincides with the first zero-throughput minute (07:42 bucket avg 0.39) and the 07:40-07:45 lag rise, so all three signals onset together at ~07:42 RUNNING. A single poison message on orders-3 offset 8841207 is blocking the partition, which is consistent with (but does not alone prove) the throughput drop and lag growth being consumer-side rather than downstream.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "failed to deserialize OrderExecuted at orders-3@8841207"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-05-12T07:42:00Z\",\"avg\":0.39,\"max\":0.39}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F13",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent (broker/rebalance cause): HIST-112 (2026-02-03) 'Settlement consumer stalled after partition reassignment', services settlement-service+kafka, symptoms 'consumer lag growing','settlements stuck', root_cause 'Consumer lost partition assignment during broker maintenance', category infrastructure_failure, resolution 'Restarted consumer group', match_score 4-5 (highest match in every query). This is the single closest prior event to today's settlement stall.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "Settlement consumer stalled after partition reassignment"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "Consumer lost partition assignment during broker maintenance"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "\"resolution\":\"Restarted consumer group\""
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "kafka"
+      ],
+      "time": "2026-02-03T00:00:00Z",
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Historical precedent (second consumer-side storm): HIST-104 (2025-11-05) 'notification-service lag after Kafka broker rebalance', services notification-service+kafka, symptoms 'consumer lag spike','delayed emails', root_cause 'Partition reassignment caused consumer group rebalancing storm', category infrastructure_failure, resolution 'Throttled reassignment'. Same shared broker and the other kafka consumer as today.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "notification-service lag after Kafka broker rebalance"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "Partition reassignment caused consumer group rebalancing storm"
+        }
+      ],
+      "services": [
+        "notification-service",
+        "kafka"
+      ],
+      "time": "2025-11-05T00:00:00Z",
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No historical incident matches today's actual signature: searching 'poison message deserialization failure partition blocked offset' returned no poison-message/deserialization precedent -- top hits were HIST-104 (score 1), HIST-107 redis cache storm (score 1), HIST-112 (score 1). Likewise, searching for an upstream producer schema/rename breaking a consumer returned no such record (only unrelated HIST-103/104/112/116, all score 1). So there is NO historical precedent for the schema-header v2 / missing-field 'qty' poison-message pattern seen in INC-010.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"count\":3"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "\"count\":4"
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "kafka"
+      ],
+      "time": null,
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Consumer-side CONFIG-change precedents exist but are a different mechanism: HIST-115 (2025-09-25) 'order-service connection pool misconfiguration', symptoms 'connection is not available','request timed out','pool exhausted', category config_change, resolution 'Reverted config; added validation'. The only config-change-classified lag-adjacent precedent involving settlement-service is HIST-111 (2025-05-22) 'Reporting job full table scans slowed ledger-db' (services ledger-db,settlement-service), whose cause was a bad query on the shared ledger-db -- not a poll-settings change. No precedent was found where a max.poll.records-type consumer setting caused a stall.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "order-service connection pool misconfiguration"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "Reverted config; added validation"
+        }
+      ],
+      "services": [
+        "order-service",
+        "ledger-db",
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Shared-component precedents matching concurrent multi-service impact: the SHARED ledger-db has four separate incident precedents affecting more than one consumer service at once -- HIST-102 (2025-09-02) 'Portfolio timeouts during ledger-db failover' (services portfolio-service,ledger-db, '6 min of refused connections'), HIST-110 (2026-01-15) 'Slow orders from ledger-db IOPS throttling' (order-service,ledger-db), HIST-111 (2025-05-22, ledger-db+settlement-service) and HIST-114 (2025-04-18) 'ledger-db disk full from retained WAL' ('write failures'). All four are ledger-db-caused multi-service impacts.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "Portfolio timeouts during ledger-db failover"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "Inactive replication slot retained WAL until disk filled"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "Unplanned ledger-db primary failover; 6 min of refused connections"
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "portfolio-service",
+        "order-service",
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Detection signature across the historical broker/rebalance stalls: all report a lag-RISE symptom ('consumer lag growing' / 'consumer lag spike') plus a processing-side symptom ('settlements stuck' / 'delayed emails'), and all resolve via a consumer-group / reassignment action ('Restarted consumer group', 'Throttled reassignment'), i.e. detection was lag-growth + stalled processing -- the same surface symptoms as INC-010, even though today's logs show a poison message rather than a rebalance.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "consumer lag growing"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "settlements stuck"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "Throttled reassignment"
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "notification-service",
+        "kafka"
+      ],
+      "time": null,
+      "id": "F19",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "notification-service consumer_lag is flat/baseline throughout 06:30-09:57 with no rise at 07:42 or later: mean 60.11 messages, every 9-min bucket avg between ~52 and ~66 (e.g. 07:42 avg 62.1, 09:57 avg 52.57). No lag growth concurrent with the settlement stall.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "\"metric\":\"consumer_lag\""
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "\"avg\":62.1,\"max\":89.91"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "\"mean\":60.11"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-05-12T07:42:00Z",
+      "id": "F20",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "notification-service request_rate (throughput) is normal and flat across the whole window: min 132.42, max 166.73, mean 147.31 req/s; 07:42 avg 151.53, 09:57 avg 143.7 — no drop or spike, i.e. the other consumer kept processing normally while settlement-service stalled.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-027",
+          "quote": "\"mean\":147.31"
+        },
+        {
+          "call_id": "tc-027",
+          "quote": "\"avg\":151.53,\"max\":166.73"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-05-12T09:57:00Z",
+      "id": "F21",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The only WARN+ log from notification-service in 07:30-09:59 is a single unrelated NTP message: 'clock drift 38ms detected, resyncing with NTP' at 08:39:18Z (total_matched 1, truncated false). No rebalance, session-timeout, or poll-timeout symptom appears.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-025",
+          "quote": "clock drift 38ms detected, resyncing with NTP"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "\"total_matched\":1"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-05-12T08:39:18Z",
+      "id": "F22",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Broker metric under_replicated_partitions is exactly 0.0 for every 9-min bucket from 06:30 to 09:57 (min 0.0, max 0.0, missing_points 0) — no under-replication activity across the stall window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "\"min\":0.0,\"max\":0.0,\"mean\":0.0"
+        }
+      ],
+      "services": [
+        "kafka"
+      ],
+      "time": "2026-05-12T09:57:00Z",
+      "id": "F23",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The kafka broker exposes only three metrics — cpu_pct, messages_in_per_s, under_replicated_partitions — and has no rebalance_count, partition_reassignment_count, broker_error_rate, or offline_partitions metric (each returned not_found). So the specific broker-side reassignment/rebalance/error/offline counters requested by the task cannot be read for this broker.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-028",
+          "quote": "service 'kafka' has no metric 'rebalance_count'"
+        },
+        {
+          "call_id": "tc-029",
+          "quote": "available_metrics\":[\"cpu_pct\",\"messages_in_per_s\",\"under_replicated_partitions\""
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "service 'kafka' has no metric 'offline_partitions'"
+        }
+      ],
+      "services": [
+        "kafka"
+      ],
+      "time": null,
+      "id": "F24",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Pattern consistent with H1 and against H3: the kafka broker is shared by both consumers (F3), yet only settlement-service shows lag rise/throughput collapse while notification-service stays healthy on lag and throughput and the one available broker health metric is flat — a broker-wide event affecting both consumers and the broker is not visible in the data.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "\"mean\":60.11"
+        },
+        {
+          "call_id": "tc-027",
+          "quote": "\"mean\":147.31"
+        },
+        {
+          "call_id": "tc-031",
+          "quote": "\"min\":0.0,\"max\":0.0,\"mean\":0.0"
+        }
+      ],
+      "services": [
+        "settlement-service",
+        "notification-service",
+        "kafka"
+      ],
+      "time": null,
+      "id": "F25",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Per-partition broker metrics are NOT available for settlement-service: querying metric 'partition_lag' failed with not_found; the service exposes only ['consumer_lag','cpu_pct','db_pool_in_use','error_rate','latency_p99_ms','memory_pct','request_rate','restarts']. So per-partition lag/offset progress cannot be read from metrics; only the aggregate consumer_lag is exposed.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-033",
+          "quote": "service 'settlement-service' has no metric 'partition_lag'"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F26",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Every WARN+ log entry mentions ONLY partition orders-3 (offset 8841207): a targeted search for 'orders-0' returned 0 matches and 'orders-1' returned 0 matches over 07:30-09:59, while 'orders-3@8841207' appears in all 409 ERROR entries. No other orders partition and no other topic name appears in settlement-service logs.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-036",
+          "quote": "{\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-037",
+          "quote": "{\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-034",
+          "quote": "failed to deserialize OrderExecuted at orders-3@8841207"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F27",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The deserialization-failure signature is confined to a single message/partition: 213 occurrences, ALL at 'orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)', first_seen 07:42:14, last 09:58:00. No deserialization errors on any other partition or topic are present.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-035",
+          "quote": "counts_by_level"
+        },
+        {
+          "call_id": "tc-035",
+          "quote": "failed to deserialize OrderExecuted at orders-3@8841207: missing required field 'qty' (schema v1 expected, header says v2)"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:42:14Z",
+      "id": "F28",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The 'partition blocked' retry storm is likewise (216 aggregated) all on orders-3@8841207: the poison-message pattern counts 196 with first_seen 07:44:51, all quoting 'retrying orders-3@8841207 ... partition blocked'. No partition besides orders-3 is named.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "poison message: retrying orders-3@8841207 (attempt 92490), partition blocked"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "count\":196"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:44:51Z",
+      "id": "F29",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Aggregate consumer_lag rose from a flat ~47 avg (07:30 bucket) to 202.21 (07:37) and 2616.82 (07:44), continuing monotonically to 60713.43 avg / 61605.53 max at 09:57. The rise begins in the 07:37-07:44 region, i.e. within one 7-min bucket of both the deployment (07:40) and the first deserialize error (07:42:14); no metric evidence shows lag growing on a specific partition independently.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "{\"ts\":\"2026-05-12T07:37:00Z\",\"avg\":202.21,\"max\":819.95}"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "{\"ts\":\"2026-05-12T09:57:00Z\",\"avg\":60713.43,\"max\":61605.53}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T07:37:00Z",
+      "id": "F30",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "All 409 WARN+ entries in the window are level ERROR (counts_by_level ERROR:409) and consist solely of the two orders-3 patterns; a search for 'topic', 'offsets' or any other topic returned zero matches, so no other consumed topic shows any error/deserialization symptom. This is consistent with a single poison message blocking partition orders-3 only and does NOT show the failures spreading to other partitions or topics.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-034",
+          "quote": "counts_by_level"
+        },
+        {
+          "call_id": "tc-038",
+          "quote": "{\"total_matched\":0"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F31",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service producer-side change content matches the poison-message signature exactly: dep-6010 v2.16.0 at 07:40:00Z lists 'OrderExecuted event: rename field qty -> quantity', 'add field venue', 'event schema version header v2' — the same field name the consumer says is missing and the same header version the consumer reports.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-039",
+          "quote": "OrderExecuted event: rename field qty -> quantity"
+        },
+        {
+          "call_id": "tc-039",
+          "quote": "event schema version header v2"
+        },
+        {
+          "call_id": "tc-039",
+          "quote": "2026-05-12T07:40:00Z"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-12T07:40:00Z",
+      "id": "F32",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "No rollback of order-service v2.16.0 occurred in 07:30-09:59: the single deployment in the whole fleet window is dep-6010 with status 'live' and rolled_back_at null.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-043",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "\"count\":1"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F33",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No order-service config change or offset-skip/rollback mechanism is recorded: config changes for order-service returned count 0, and the fleet-wide config scan in 07:30-09:59 returned exactly one entry, settlement-service consumer.max.poll.records 500->200 at 07:35 — nothing touching offsets, resume/skip, or producer serialization.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-040",
+          "quote": "\"count\":0"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "consumer.max.poll.records"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "2026-05-12T07:35:00Z"
+        }
+      ],
+      "services": [
+        "order-service",
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F34",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "No settlement-service deployment/restart event exists in 07:30-09:59 (count 0), so the 'restart consumer group' resolution of the historical precedent was NOT applied today; no consumer-restart event could have reset the blocked offsets or restarted the lag counter.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-046",
+          "quote": "\"count\":0"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F35",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service's only queue edge is a produce edge to the shared kafka broker ('queue-produce'), making it a legitimate writer to the topic settlement-service consumes; its other dependencies are ledger-db, pricing-engine and exchange-gateway (plus api-gateway calling in), none of which is a plausible source of the v2 event header.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-041",
+          "quote": "{\"from\":\"order-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"}"
+        }
+      ],
+      "services": [
+        "order-service",
+        "kafka"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F36",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "H1's remaining gap is causal, not temporal: the deploy at 07:40:00Z precedes the first consumer deserialize error at 07:42:14Z naming header v2 vs schema v1, and no rollback/offset-skip/consumer restart occurred afterwards, so the stall persisted with no recovery event to serve as a confirming natural experiment.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-039",
+          "quote": "2026-05-12T07:40:00Z"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "order-service",
+        "settlement-service"
+      ],
+      "time": "2026-05-12T09:59:00Z",
+      "id": "F37",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_accepted",
+  "stats": {
+    "latency_s": 163.34,
+    "llm_calls": 26,
+    "prompt_tokens": 179044,
+    "completion_tokens": 30968,
+    "total_tokens": 210012,
+    "tool_calls": 46,
+    "tool_attempts": 46,
+    "tool_failures": 5,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 2,
+    "tasks": 6,
+    "tasks_failed": 0,
+    "findings": 37,
+    "findings_verified": 37,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 2,
+        "prompt_tokens": 3206,
+        "completion_tokens": 1296
+      },
+      "dependency": {
+        "calls": 10,
+        "prompt_tokens": 58092,
+        "completion_tokens": 7831
+      },
+      "observability": {
+        "calls": 9,
+        "prompt_tokens": 73779,
+        "completion_tokens": 8764
+      },
+      "reasoning": {
+        "calls": 2,
+        "prompt_tokens": 15220,
+        "completion_tokens": 6006
+      },
+      "critic": {
+        "calls": 2,
+        "prompt_tokens": 19200,
+        "completion_tokens": 2411
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 9547,
+        "completion_tokens": 4660
+      }
+    }
+  },
+  "warnings": []
+}

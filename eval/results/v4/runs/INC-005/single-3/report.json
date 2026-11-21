@@ -1,0 +1,649 @@
+{
+  "incident_id": "INC-005",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "payment-service's outbound mTLS client certificate (CN=payments-client.orangeinvest.internal) expired at 2026-04-02T12:15:00Z, causing every call to the external bank-partner-api to be rejected at the TLS handshake ('tls: expired certificate (alert 45)'). Onset is unambiguous: bank_api_error_rate jumped from ~0.2% to 100% and payment_success_rate from ~99% to ~2.5% starting in the 12:10–12:20 buckets, and a cert-watcher warned at 11:50. The HTTP error-rate dashboard stayed green because failed transfers are recorded asynchronously as PENDING_RETRY (ERROR logs) rather than as synchronous 5xx, so the 5xx-based panel sees nothing. No deployments occurred; the only config change (11:20 timeout bump) and flat request rate/p99 rule out deployment, config, capacity and partner-side-outage hypotheses. Root cause category: credential_expiry. Fix: renew/rotate the client certificate and restore bank calls; the PENDING_RETRY queue should be replayed.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "Expired mTLS client certificate breaks bank-partner-api calls",
+      "statement": "payment-service's outbound mTLS client certificate CN=payments-client.orangeinvest.internal expired at 2026-04-02T12:15:00Z. From that moment every call to the external bank-partner-api is rejected at the TLS handshake (alert 45), so fund transfers fail. Because failed transfers are recorded asynchronously as PENDING_RETRY rather than a synchronous 5xx, the HTTP error_rate panel stays green while bank_api_error_rate hits 100% and payment_success_rate drops to ~2.5%.",
+      "category": "credential_expiry",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": null,
+      "confidence": 0.93,
+      "pre_cap_confidence": 0.93,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Client cert reaches notAfter=2026-04-02T12:15:00Z without renewal (cert-watcher warned at 11:50)",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "Expiry -> mTLS handshake rejected with 'tls: expired certificate (alert 45)'",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "Handshake failure -> bank_api_error_rate 0.2%->100% and payment_success_rate 99%->~2.5%",
+          "finding_ids": [
+            "F3",
+            "F4"
+          ]
+        },
+        {
+          "claim": "Failed payments queued asynchronously as PENDING_RETRY (ERROR logs), so HTTP 5xx error_rate stays ~0.2%",
+          "finding_ids": [
+            "F5",
+            "F6"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F10",
+        "F11",
+        "F12",
+        "F13"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "Certificate renewal is manual; no automated rotation occurred before expiry.",
+        "The 'expired certificate' remote error is caused by our own client cert (log explicitly names our CN and notAfter), not by a partner-side cert change."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Bank partner API outage / dependency failure",
+      "statement": "The external bank-partner-api is degraded or returning errors, causing transfers to fail (as in HIST-105).",
+      "category": "dependency_failure",
+      "root_cause_service": "bank-partner-api",
+      "trigger_change_id": null,
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Partner API fails -> partner calls error -> payment failures",
+          "finding_ids": []
+        }
+      ],
+      "supporting_evidence": [
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F2",
+        "F5",
+        "F6"
+      ],
+      "assumptions": [
+        "Would require partner-side change, but no partner telemetry exists to confirm."
+      ],
+      "rejection_reason": "Error text names OUR client cert as expired (notAfter given), and a local cert-watcher warned 25 minutes before onset. The failure is at our TLS handshake (alert 45), not a partner 5xx; partner has no telemetry but the evidence points to our credential."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Timeout config change (bad deployment/config_change)",
+      "statement": "The 11:20 bank.api.timeout_ms change (3000->5000) caused the failures.",
+      "category": "config_change",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": "cfg-2502",
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "cfg-2502 raises timeout -> ... -> payment failures",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F8"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F2",
+        "F3"
+      ],
+      "assumptions": [
+        "A timeout increase could manifest as handshake cert errors (implausible)."
+      ],
+      "rejection_reason": "Change landed 55 min before onset (11:20 vs 12:15) and the symptom is a TLS cert expiry matching notAfter exactly; p99 latency fell rather than rose, inconsistent with a timeout effect. No deployments occurred at all."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Traffic surge / capacity saturation",
+      "statement": "A load spike saturated payment-service or its downstream and caused failures.",
+      "category": "capacity_saturation",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": null,
+      "confidence": 0.01,
+      "pre_cap_confidence": 0.01,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Load up -> saturation -> failures",
+          "finding_ids": []
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F10",
+        "F11"
+      ],
+      "assumptions": [],
+      "rejection_reason": "request_rate was flat ~100 req/s and p99 latency decreased at onset; error is a deterministic TLS handshake rejection, not saturation."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "payment-service logs show mTLS handshake failures naming our expired client cert: 'remote error: tls: expired certificate (alert 45); our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z'.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "A cert-watcher warned at 11:50:26Z that the certificate would expire at 12:15:00Z.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "bank_api_error_rate rose from ~0.2% to 100% starting in the 12:10–12:20 buckets.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "payment_success_rate fell from ~99% to ~2.5% over the same buckets and remained there.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "The HTTP 5xx error_rate metric stayed flat at ~0.2%, which is why the dashboard looked green.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "Failed payments were recorded asynchronously as PENDING_RETRY errors (140 occurrences).",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "No code deployments occurred for any service in the incident window.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "The only config change was bank.api.timeout_ms 3000->5000 at 11:20Z, 55 minutes before onset.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "bank-partner-api is external with no telemetry; api-gateway and ledger-db logged no warnings/errors.",
+      "finding_ids": [
+        "F9",
+        "F12"
+      ]
+    },
+    {
+      "statement": "Request rate was flat (~100 req/s) and p99 latency fell at onset, ruling out load/saturation.",
+      "finding_ids": [
+        "F10",
+        "F11"
+      ]
+    },
+    {
+      "statement": "A past incident (HIST-106) had the identical 'client certificate expired; no renewal automation' signature.",
+      "finding_ids": [
+        "F13"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The 'expired certificate (alert 45)' remote error is triggered by our client certificate (the log names our CN and notAfter), not a partner-side certificate.",
+    "PENDING_RETRY payments are recoverable via retry/replay and were not permanently lost."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-02T11:20:00Z",
+      "event": "Config change cfg-2502: bank.api.timeout_ms 3000->5000 (unrelated to onset)",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-04-02T11:50:26Z",
+      "event": "cert-watcher warns client cert expires in 25 minutes (notAfter 12:15:00Z)",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:15:00Z",
+      "event": "Client certificate expires; mTLS handshakes to bank-partner-api begin failing",
+      "finding_ids": [
+        "F2",
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:15:27Z",
+      "event": "First payment marked PENDING_RETRY due to rejected handshake",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:16:44Z",
+      "event": "First 'tls: expired certificate (alert 45)' error logged",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:20:00Z",
+      "event": "bank_api_error_rate reaches 100%, payment_success_rate drops to ~2.5%",
+      "finding_ids": [
+        "F3",
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-04-02T12:32:00Z",
+      "event": "Support reports ~40 payment-failure tickets; HTTP error-rate panel still green",
+      "finding_ids": [
+        "F5"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Renew/rotate the payments-client client certificate for bank-partner-api and reload it in payment-service to restore mTLS handshakes.",
+      "priority": "immediate",
+      "rationale": "The expired cert (notAfter 2026-04-02T12:15:00Z) is the direct cause of 100% bank API failures.",
+      "finding_ids": [
+        "F1",
+        "F2",
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Replay the queued PENDING_RETRY payments once connectivity is restored and reconcile against the bank.",
+      "priority": "immediate",
+      "rationale": "140 payments were absorbed into a retry queue and may need explicit reprocessing.",
+      "finding_ids": [
+        "F6"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add an alerting SLO on payment_success_rate and bank_api_error_rate (not just HTTP 5xx error_rate) so async-absorbed failures page on call.",
+      "priority": "short_term",
+      "rationale": "The 5xx error_rate panel stayed flat while ~97% of payments failed, hiding the incident.",
+      "finding_ids": [
+        "F5",
+        "F4"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Implement automated certificate rotation with expiry alerting (as done after HIST-106) and make the cert-watcher warning actionable/paging.",
+      "priority": "long_term",
+      "rationale": "Same root cause recurred; renewal is manual and the 25-minute warning did not trigger action.",
+      "finding_ids": [
+        "F2",
+        "F13"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "bank-partner-api has no telemetry, so partner-side health cannot be independently confirmed; the conclusion rests on our own logs naming our expired client cert.",
+    "The first INFO-level payment-service log query (call tc-011) failed with invalid_arguments (missing start); a follow-up at 11:45-12:16 (tc-015, not truncated) showed no additional INFO events, but full INFO history was not exhaustively reviewed.",
+    "No data on when the certificate was last renewed or which secret store holds it, so the renewal-ownership gap is inferred from HIST-106 rather than observed."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "payment-service logs show mTLS handshake failures with bank-partner-api: 'remote error: tls: expired certificate (alert 45); our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z', 171 occurrences, first seen 2026-04-02T12:16:44Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "bank-partner-api call failed: remote error: tls: expired certificate (alert 45); our client cert CN=payments-client.orangeinvest.internal notAfter=2026-04-02T12:15:00Z"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:16:44Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A cert-watcher WARN at 11:50:26Z gave 25 minutes notice: client certificate CN=payments-client.orangeinvest.internal expires at notAfter=2026-04-02T12:15:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "cert-watcher: client certificate CN=payments-client.orangeinvest.internal expires in 25 minutes (notAfter=2026-04-02T12:15:00Z)"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:50:26Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "bank_api_error_rate jumped from ~0.2% to 50% in the 12:10 bucket and 100% from the 12:20 bucket onward, remaining at 100% through 13:50.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-04-02T12:10:00Z\",\"avg\":50.1,\"max\":100}"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":100.0,\"max\":100}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:10:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment_success_rate collapsed from ~99% to ~2.6% in the same 12:10/12:20 buckets and stayed near 2.5% (min 1.44) through 13:50, i.e. roughly 97% of payments failing.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":2.6,\"max\":3.3}"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"min\":1.44"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:20:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The HTTP error_rate metric (5xx % of requests) stayed flat at ~0.2% across the whole window, never rising above max 0.32 — this is the green dashboard the report mentions.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":0.2,\"max\":0.32}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:32:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "140 ERROR logs show payments absorbed asynchronously: 'payment <id> marked PENDING_RETRY: mTLS handshake with bank-partner-api rejected', first seen 12:15:27Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "payment 45f233b6 marked PENDING_RETRY: mTLS handshake with bank-partner-api rejected"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:15:27Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No code deployments occurred for any service in 2026-04-02T11:00–13:59Z (count 0).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"count\":0,\"deployments\":[]"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T13:59:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only config change in the window was payment-service bank.api.timeout_ms raised from 3000 to 5000 at 11:20:00Z, ~55 minutes before onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"key\":\"bank.api.timeout_ms\",\"old_value\":3000,\"new_value\":5000,\"changed_at\":\"2026-04-02T11:20:00Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T11:20:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "bank-partner-api is an external dependency with has_telemetry=false; there are no config changes recorded for it.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "\"name\":\"bank-partner-api\",\"type\":\"external\",\"owner\":\"vendor\",\"has_telemetry\":false"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "bank-partner-api"
+      ],
+      "time": "2026-04-02T13:59:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Payment request_rate stayed steady ~100 req/s before and during the incident (min 90.22, max 109.57), so the failure is not a traffic surge.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":100.77,\"max\":105.64}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:20:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "p99 latency dropped (320ms -> ~140ms) at onset rather than rising — consistent with requests failing fast at handshake instead of hanging.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":138.1,\"max\":150.28}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:20:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No WARN/ERROR logs from api-gateway or ledger-db in the window, so upstream edge and shared database were not the source of the failure.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"total_matched\":0"
+        }
+      ],
+      "services": [
+        "api-gateway",
+        "ledger-db"
+      ],
+      "time": "2026-04-02T13:59:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "A prior incident HIST-106 (settlement-service, 2025-06-30) had the same signature: 'Client certificate expired; no renewal automation', category credential_expiry, resolution 'Issued new cert; added expiry alert'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "Client certificate expired; no renewal automation"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2025-06-30T00:00:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Failures are logged at ERROR in payment-service but the synchronous HTTP path returns success (marked PENDING_RETRY, queued retry), so the 5xx-based error_rate panel cannot see them.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"metric\":\"error_rate\",\"unit\":\"% of requests (HTTP 5xx)\""
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-04-02T12:20:00Z\",\"avg\":2.6,\"max\":3.3}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-04-02T12:20:00Z",
+      "id": "F14",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 61.71,
+    "llm_calls": 4,
+    "prompt_tokens": 32141,
+    "completion_tokens": 6896,
+    "total_tokens": 39037,
+    "tool_calls": 15,
+    "tool_attempts": 14,
+    "tool_failures": 1,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 14,
+    "findings_verified": 14,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 4,
+        "prompt_tokens": 32141,
+        "completion_tokens": 6896
+      }
+    }
+  },
+  "warnings": []
+}

@@ -1,0 +1,572 @@
+{
+  "incident_id": "INC-001",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order placement 500s began at ~12:12Z, ~2.5 minutes after order-service v2.14.0 (dep-5101, 12:10Z) deployed a refactor that added MarginCheckValidator for F&O orders and removed legacy OrderRules.validateMargin(). All 426 errors are NullPointerExceptions in MarginCheckValidator.validate (line 88) with 'marginProfile is null', exclusively for orderType=FNO, producing HTTP 500 and an ~18% error rate that persists unchanged to 13:59Z. Alternative causes are ruled out: pricing-engine/exchange-gateway/ledger-db show no errors, no dependency or latency degradation, no CPU/memory/pool/restart signal, and the only config change (notification email batch size) is unrelated. Root cause is the bad deployment of the new validator's unguarded null dereference; remediation is rollback of dep-5101 / fix the null handling.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "New MarginCheckValidator in dep-5101 dereferences a null margin profile for F&O orders",
+      "statement": "order-service v2.14.0 (dep-5101, deployed 12:10Z) added MarginCheckValidator to the validation chain for F&O orders. The new validator reads a margin profile that is null/absent for FNO orders and dereferences it at MarginCheckValidator.java:88 without a null guard, throwing NullPointerException and returning HTTP 500. Because the faulty path is only reached for derivatives (FNO) orders, ~18% of traffic (the FNO share) fails while other order types are unaffected. Replacing legacy OrderRules.validateMargin() with the new validator removed the previously-working handling.",
+      "category": "bad_deployment",
+      "root_cause_service": "order-service",
+      "trigger_change_id": "dep-5101",
+      "confidence": 0.86,
+      "pre_cap_confidence": 0.86,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5101 deploys order-service v2.14.0 at 12:10Z introducing MarginCheckValidator",
+          "finding_ids": [
+            "F4",
+            "F5"
+          ]
+        },
+        {
+          "claim": "First NPE in MarginCheckValidator.validate at 12:12:31Z, 2.5 min later",
+          "finding_ids": [
+            "F2",
+            "F5"
+          ]
+        },
+        {
+          "claim": "All failures are orderType=FNO with 'marginProfile is null' -> HTTP 500",
+          "finding_ids": [
+            "F3",
+            "F8"
+          ]
+        },
+        {
+          "claim": "Error rate locks at ~18% (FNO share) with no recovery, no resource/pool/dependency signal",
+          "finding_ids": [
+            "F1",
+            "F7",
+            "F9",
+            "F10"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F8",
+        "F10"
+      ],
+      "contradicting_evidence": [
+        "F9"
+      ],
+      "assumptions": [
+        "The null margin profile is not itself caused by an upstream data change — no data-owning service deployed or changed config in the window.",
+        "MarginCheckValidator.java:88 is the dereference of the margin profile returned by the (assumed) lookup.",
+        "The FNO share of order traffic is ~18%, consistent with the observed error rate."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Upstream margin/profile data became missing for F&O accounts (data_issue)",
+      "statement": "A margin-profile source (e.g., a reference/margin data store) stopped returning profiles for FNO accounts, so the validator received null even though its logic is correct; the deployment coincidence would then be incidental.",
+      "category": "data_issue",
+      "root_cause_service": "unknown",
+      "trigger_change_id": null,
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F4",
+        "F6",
+        "F7"
+      ],
+      "assumptions": [],
+      "rejection_reason": "No data-owning service deployed or changed config in the window (only dep-5088 portfolio-service grpc bump and cfg-2101 notification email batch size). The failure set is 100% FNO and tied to a brand-new code path; historically FNO orders worked with the legacy validator, so the missing profile only becomes fatal after the refactor removed the legacy handling. No telemetry shows a data source failing."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Dependency failure in pricing-engine / exchange-gateway / external exchange",
+      "statement": "A downstream dependency (pricing-engine, exchange-gateway, or the external exchange-api) degraded and caused order placement 500s.",
+      "category": "dependency_failure",
+      "root_cause_service": "pricing-engine",
+      "trigger_change_id": null,
+      "confidence": 0.04,
+      "pre_cap_confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F3",
+        "F7"
+      ],
+      "assumptions": [],
+      "rejection_reason": "pricing-engine, exchange-gateway and ledger-db produced zero ERROR logs over the whole window, and order-service latency stayed flat (~150ms, no timeouts/504s). The error is a local NullPointerException in order-service validation, not an upstream call failure."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Resource exhaustion / capacity saturation in order-service",
+      "statement": "CPU, memory, DB connection pool or thread exhaustion in order-service produced the 500s.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "order-service",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F7",
+        "F9"
+      ],
+      "assumptions": [],
+      "rejection_reason": "cpu ~40%, memory ~60%, db_pool_in_use ~14/15 with no saturation, zero restarts, and request_rate flat (~233 req/s). Errors are deterministic NPEs in a specific validator, not load-driven timeouts."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "order-service error_rate rose from ~0.22% before 12:00 to 14.74% at 12:10 and ~18% thereafter.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "First order-service error logged at 2026-03-03T12:12:31Z.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "426 ERROR entries, all NullPointerException in MarginCheckValidator.validate with orderType=FNO / 'marginProfile is null'.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "dep-5101 (order-service v2.14.0) at 12:10Z added MarginCheckValidator and removed legacy OrderRules.validateMargin().",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "Deployment rollout completed at 12:10:08Z, before the first error at 12:12:31Z.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "Only config change was notification-service email.batch_size 200->250, unrelated.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "pricing-engine, exchange-gateway and ledger-db had zero ERROR logs; order-service latency/cpu/memory/request_rate flat.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "No EQ (non-FNO) order errors occurred; failures are exclusively derivatives orders.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "No order-service restarts; db_pool_in_use flat at ~14 connections.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "Errors persist steadily to 13:58Z with no recovery.",
+      "finding_ids": [
+        "F10"
+      ]
+    }
+  ],
+  "assumptions": [
+    "MarginCheckValidator.java:88 is where the (assumed) null margin profile is dereferenced; source not available in tools.",
+    "The null margin profile is produced/fetched within order-service rather than by an external data source, since no data-owning service deployed or changed config in the window.",
+    "The ~18% steady error rate equals the FNO share of order traffic.",
+    "query_logs results for order-service were truncated (426 matched, 40 returned) but two independent queries confirmed the same two error patterns and no other error types."
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-03T11:21:00Z",
+      "event": "notification-service config change cfg-2101 (email.batch_size 200->250) — unrelated to orders",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:10:00Z",
+      "event": "order-service v2.14.0 (dep-5101) deployed: new MarginCheckValidator, legacy validateMargin removed",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:10:08Z",
+      "event": "dep-5101 rollout complete, all pods ready",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:12:31Z",
+      "event": "First NullPointerException in MarginCheckValidator.validate (orderType=FNO) — incident onset",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:20:00Z",
+      "event": "error_rate stabilizes at ~18-19% and remains there through end of window",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-03-03T12:22:00Z",
+      "event": "Incident INC-001 reported by on-call SRE",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-03-03T13:58:50Z",
+      "event": "Latest FNO MarginCheckValidator NPE logged; no recovery, deploy still live",
+      "finding_ids": [
+        "F10"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back order-service dep-5101 (v2.14.0) to the prior version to restore F&O order placement immediately.",
+      "priority": "immediate",
+      "rationale": "The faulty validator was introduced by this deployment; rollback removes the unguarded null dereference and is the fastest mitigation.",
+      "finding_ids": [
+        "F2",
+        "F4",
+        "F10"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a null guard / default handling for missing marginProfile in MarginCheckValidator.validate (line 88) and re-establish the F&O margin validation logic that the legacy OrderRules.validateMargin provided.",
+      "priority": "short_term",
+      "rationale": "Root cause is the unguarded dereference of a null margin profile for FNO orders.",
+      "finding_ids": [
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a canary/staged rollout with F&O-order synthetic checks so a validator regression is caught before full rollout.",
+      "priority": "short_term",
+      "rationale": "The bad deploy reached 100% of pods with no gate; FNO fraction of traffic (~18%) is enough to be detected in canary.",
+      "finding_ids": [
+        "F4",
+        "F8"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Alert on per-order-type error rate and on NullPointerException patterns in validation, not just aggregate 5xx.",
+      "priority": "long_term",
+      "rationale": "Aggregate error_rate only flagged the issue ~10 min after onset; order-type scoping would localize it faster.",
+      "finding_ids": [
+        "F1",
+        "F8"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "No trace/stack detail beyond 'MarginCheckValidator.java:88' or the source of marginProfile (DB query, cache, or field) — root cause is inferred from the deployment diff plus log message.",
+    "order-service error logs were truncated (truncated:true, 426 matched); a small number of non-FNO/non-margin errors cannot be strictly excluded, though two queries showed only the two FNO patterns.",
+    "No per-order-type request/error breakdown metric available to confirm quantitatively that the ~18% equals the FNO traffic share.",
+    "No data-service telemetry to fully prove margin-profile source data was healthy; ruled out only by absence of related deploys/config changes and by historical FNO success under the legacy validator."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service error_rate jumped from ~0.2% (pre-12:00) to ~14.7% in the 12:10 bucket and stayed ~18-19% through 13:59.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"ts\":\"2026-03-03T12:10:00Z\",\"avg\":14.74"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"ts\":\"2026-03-03T12:00:00Z\",\"avg\":0.22"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:10:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The first error log in order-service is at 12:12:31Z, inside the same 10-minute bucket where error_rate spiked; the incident onset is therefore ~12:12Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"first_match\":\"2026-03-03T12:12:31Z\""
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO orderId=9326cc69"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:12:31Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Every order-service error is a NullPointerException in the new MarginCheckValidator.validate, with 'marginProfile is null' and orderType=FNO. 426 ERROR entries total; 224 are the NPE pattern and 202 the rejection pattern.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "NullPointerException at MarginCheckValidator.validate(MarginCheckValidator.java:88) orderType=FNO"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "\"total_matched\":426"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "marginProfile is null for account 88373"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": null,
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Deployment dep-5101 (order-service v2.14.0, 12:10:00Z) introduced 'new MarginCheckValidator in validation chain' and removed 'legacy OrderRules.validateMargin()'; it is live and not rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "new MarginCheckValidator in validation chain"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"deployed_at\":\"2026-03-03T12:10:00Z\""
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "remove legacy OrderRules.validateMargin()"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:10:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The rollout-complete log for dep-5101 is at 12:10:08Z, ~2.5 minutes before the first error at 12:12:31Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "deployment dep-5101 (v2.14.0) rollout complete, all pods ready"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T12:10:08Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only config change in the window is notification-service 'email.batch_size' 200->250 at 11:21Z, unrelated to order validation.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"key\":\"email.batch_size\",\"old_value\":200,\"new_value\":250"
+        }
+      ],
+      "services": [
+        "notification-service"
+      ],
+      "time": "2026-03-03T11:21:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "pricing-engine, exchange-gateway and ledger-db show zero ERROR logs across 08:00-13:59Z, and order-service latency_p99 (~150ms), cpu (~40%), memory (~60%) and request_rate (~233 req/s) are flat across the incident.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "\"total_matched\":0"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"mean\":150.01"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "\"mean\":232.73"
+        }
+      ],
+      "services": [
+        "pricing-engine",
+        "exchange-gateway",
+        "ledger-db",
+        "order-service"
+      ],
+      "time": null,
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "5/5 refs verified"
+    },
+    {
+      "statement": "No EQ (non-derivative) order produced any error; only orderType=FNO orders appear in the failures, matching the report's 'mostly derivatives orders'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"total_matched\":0"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": null,
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No order-service restarts occurred during the window (restarts metric stays 0), and db_pool_in_use stays ~14 connections (no saturation).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "\"max\":0.0"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"mean\":14.04"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": null,
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Errors are continuous and steady from 12:12 to 13:58 (~18-19% error rate, no recovery), consistent with a persistent code defect rather than a transient blip or recovery.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"last_match\":\"2026-03-03T13:58:50Z\""
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"last\":18.33"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-03T13:58:50Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 57.53,
+    "llm_calls": 5,
+    "prompt_tokens": 54172,
+    "completion_tokens": 6805,
+    "total_tokens": 60977,
+    "tool_calls": 21,
+    "tool_attempts": 21,
+    "tool_failures": 0,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 10,
+    "findings_verified": 10,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 5,
+        "prompt_tokens": 54172,
+        "completion_tokens": 6805
+      }
+    }
+  },
+  "warnings": []
+}

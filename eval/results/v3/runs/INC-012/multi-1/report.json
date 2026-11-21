@@ -1,0 +1,1643 @@
+{
+  "incident_id": "INC-012",
+  "system": "multi_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The payment-service failures in INC-012 were not caused by the v6.0.0 mandate release (dep-6203). The root cause is ledger-db disk exhaustion: the inactive replication slot 'analytics_cdc' retained WAL for hours, filling /var/lib/postgresql/data (78.16% at 11:00Z, monotonically to 100% by 14:55-14:58Z), after which PostgreSQL could not extend files or write WAL and 'No space left on device' propagated up the direct DB write path to every writer inserting into ledger-db. Confidence is high (0.83, capped at 0.88 by the Critic) — the disk-fill metric series, the slot WAL-retention logs, the PG PANIC/storage error text, and the identical 14:55-14:58 onset across three of four ledger-db writers (payment-, settlement- and order-service, including services the deploy never touched) all cohere, while rollback of v6.0.0 did not clear the ~60% error rate. The deploy is coincidental: it postdates the start of the disk climb by ~3h48m.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "ledger-db disk exhaustion from WAL retained by inactive replication slot analytics_cdc (state/monitoring failure, not app code)",
+      "statement": "The shared postgres datastore ledger-db exhausted its /var/lib/postgresql/data filesystem because the inactive replication slot 'analytics_cdc' retained WAL for hours (log-visible from 12:19:34Z, but the disk was already 78% full at the start of the observable window, 11:00Z, and the metric climbs monotonically from there to 100% by 14:55-15:00). PostgreSQL then could not extend files or write WAL, and 'No space left on device' propagated up the direct DB write path to every writer that was actively INSERTing (payment-service, settlement-service, order-service all break within the 14:55-14:58 buckets with identical storage error text), while portfolio-service — which emitted zero errors — did not. The v6.0.0 mandate deploy (dep-6203) is coincidental: it postdates the start of the disk climb by ~3h48m, and its rollback at 15:12Z did not clear the ~60% error rate.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "null",
+      "confidence": 0.83,
+      "pre_cap_confidence": 0.83,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Replication slot 'analytics_cdc' went inactive and began retaining WAL; earliest log evidence 12:19:34Z shows 63157MB retained, and retention oscillated 63-92GB all morning (12:19-14:16), sitting at 69518MB at 14:46:32Z inside an ongoing pattern, not a step at deploy.",
+          "finding_ids": [
+            "F30",
+            "F31"
+          ]
+        },
+        {
+          "claim": "The retained WAL plus normal growth filled ledger-db's data volume: disk_used_pct rises monotonically 78.16% (11:00) -> 89.18% (13:00) -> 98.38% (14:35-40) -> 99.93% (14:56) -> 100.0% (14:58 onward), mean 97.27, 0 missing points.",
+          "finding_ids": [
+            "F25",
+            "F26",
+            "F27",
+            "F33"
+          ]
+        },
+        {
+          "claim": "The fill began hours before the only change artifact: disk was already 78.26% at the first available sample (11:00Z) and the log-derived 98% warning appears at 14:48:20Z; the reference window shows no fresh start.",
+          "finding_ids": [
+            "F10",
+            "F26",
+            "F33"
+          ]
+        },
+        {
+          "claim": "With the volume hard-full, PostgreSQL failed to write WAL / extend relation files: PANIC 'could not write to file pg_wal/xlogtemp.37478: No space left on device' starting 15:01:01Z and 'could not extend file base/16402/2619'; 47 ERROR lines in ledger-db 14:34-15:19.",
+          "finding_ids": [
+            "F10"
+          ]
+        },
+        {
+          "claim": "That DB storage error propagated verbatim up the direct payment-service -> ledger-db edge (no intermediate ledger-service exists): 'ledger write failed: ERROR: could not extend file: No space left on device', 59 occurrences, first 15:00:26Z.",
+          "finding_ids": [
+            "F9",
+            "F1",
+            "F17"
+          ]
+        },
+        {
+          "claim": "order-service, another direct ledger-db writer, emits the same signature: 'INSERT INTO orders failed: No space left on device', 236 ERROR entries, first 15:00:42Z through 16:57:47Z.",
+          "finding_ids": [
+            "F20"
+          ]
+        },
+        {
+          "claim": "Because ledger-db is shared and high-fan-in (four direct writers), all *actively writing* clients degrade together with the same onset and shape: payment-service ~60-63%, settlement-service ~54-56%, order-service ~47-48%, all jumping in the 14:55-14:58 buckets.",
+          "finding_ids": [
+            "F2",
+            "F7",
+            "F8",
+            "F19",
+            "F23"
+          ]
+        },
+        {
+          "claim": "The deploy is coincidental: dep-6203 landed 14:46:00Z, ~3h48m after the disk climb is already observable at 11:00Z, and rolling it back at 15:12:00Z leaves payment-service error_rate at ~60-63% — removing the v6.0.0 code did not clear the failure.",
+          "finding_ids": [
+            "F16",
+            "F26",
+            "F13"
+          ]
+        },
+        {
+          "claim": "No competing resource on ledger-db saturated: cpu_pct oscillates ~29-31% all window, connections_active flat ~60-64, slow_queries_per_min flat ~1.0 — so disk is the sole measurable exhausted resource, and no IOPS metric exists to support HIST-110.",
+          "finding_ids": [
+            "F28",
+            "F29",
+            "F24"
+          ]
+        },
+        {
+          "claim": "The shape is a steady pre-existing degradation, not an event: replication_lag_ms rose smoothly 923.9ms (11:00) -> 3703.04ms (14:52) with no discontinuity at 14:46.",
+          "finding_ids": [
+            "F34"
+          ]
+        },
+        {
+          "claim": "Precedent HIST-114 ('ledger-db disk full from retained WAL', fix: drop slot + slot-lag alert) matches symptom and root cause exactly.",
+          "finding_ids": [
+            "F5",
+            "F18"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F13",
+        "F16",
+        "F18",
+        "F19",
+        "F20",
+        "F23",
+        "F25",
+        "F26",
+        "F27",
+        "F28",
+        "F29",
+        "F30",
+        "F31",
+        "F33",
+        "F34",
+        "F5"
+      ],
+      "contradicting_evidence": [
+        "F21",
+        "F22"
+      ],
+      "assumptions": [
+        "The disk_used_pct series (F25/F26/F27/F33) and the WARN/ERROR log lines (F10/F11/F30) describe the same data volume /var/lib/postgresql/data; no IOPS or disk-throughput metric exists to independently confirm disk is the ONLY exhausted resource, but no other exposed metric saturates (F28, F29).",
+        "The analytics_cdc slot became inactive before the visible window; its exact stop time is unobservable (logs retained only from 11:00Z; no slot-level metric per F35). F30's 12:19:34Z is a lower bound and disk was already 78% at 11:00Z, so it cannot have been caused by the 14:46 deploy.",
+        "portfolio-service's immunity (F21, F22) reflects a different access pattern (read-mostly / separate connection / not writing during the window) rather than a different physical datastore — unproven but consistent with a single shared ledger-db."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H5",
+      "title": "Second ledger-db write-path failure (order-service's datastore) or a second, independent shared-dependency origin",
+      "statement": "order-service's error signature is 'INSERT INTO orders failed: No space left on device' — a write to its own orders table/datastore, not necessarily the ledger write path. If order-service writes to a *different* postgres instance (or a different volume) that also filled, then the simultaneous 14:55-14:58 onset across payment-service, settlement-service and order-service could reflect a cluster-wide / shared-volume / shared-host disk exhaustion (e.g. a common host or shared storage layer) rather than one ledger-db volume — a different origin, and a different fix (free the shared volume / host), even though the proximate mechanism (no space) is the same.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "null",
+      "confidence": 0.1,
+      "pre_cap_confidence": 0.1,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "order-service errors on 'INSERT INTO orders failed', a table that need not reside in ledger-db.",
+          "finding_ids": [
+            "F20"
+          ]
+        },
+        {
+          "claim": "order-service, payment-service and settlement-service all break within the same 14:55-14:58 buckets with identical storage text.",
+          "finding_ids": [
+            "F19",
+            "F7",
+            "F8"
+          ]
+        },
+        {
+          "claim": "If these are distinct datastores/volumes, a shared underlying disk or host exhausted space at once — a broader infrastructure origin than a single ledger volume.",
+          "finding_ids": []
+        },
+        {
+          "claim": "ledger-db itself shows the no-space errors and 100% disk, so at minimum the ledger volume is full; whether order-service shares it is unresolved.",
+          "finding_ids": [
+            "F10",
+            "F25"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F20",
+        "F19"
+      ],
+      "contradicting_evidence": [
+        "F2",
+        "F17"
+      ],
+      "assumptions": [
+        "order-service's orders table lives somewhere other than ledger-db, or shares a common physical disk/volume with it — not established; F2 lists order-service as a direct writer to ledger-db, which weakens this.",
+        "No evidence of any second datastore or shared host volume was retrieved."
+      ],
+      "rejection_reason": "F2 explicitly lists order-service as one of four direct writers to the shared ledger-db, and F17 places the failing write on the direct DB edges to ledger-db. The simplest reading — all three writers hit the same exhausted ledger-db volume — is already H1; nothing in the findings shows a second datastore, a shared host, or a cluster-wide volume. Kept only to record that 'order-service writes its own table' is not by itself evidence of a second origin."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H4",
+      "title": "Capacity saturation: v6.0.0 mandate traffic overloaded the ledger write path within normal limits",
+      "statement": "The new mandate flow raised write volume on ledger-db beyond provisioned capacity, saturating the database and producing write failures — a load-versus-capacity failure rather than a correctness bug.",
+      "category": "capacity_saturation",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "dep-6203",
+      "confidence": 0.08,
+      "pre_cap_confidence": 0.08,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "dep-6203 adds high-volume mandate endpoints increasing ledger writes.",
+          "finding_ids": [
+            "F3",
+            "F14"
+          ]
+        },
+        {
+          "claim": "Increased write volume saturates ledger-db past provisioned capacity.",
+          "finding_ids": []
+        },
+        {
+          "claim": "ledger writes fail and error rate reaches ~60%.",
+          "finding_ids": [
+            "F7"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2"
+      ],
+      "contradicting_evidence": [
+        "F25",
+        "F26",
+        "F27",
+        "F28",
+        "F29",
+        "F11",
+        "F30",
+        "F16",
+        "F8"
+      ],
+      "assumptions": [
+        "Mandate volume was materially higher than normal within a 10-minute window — no traffic metric shows any increase."
+      ],
+      "rejection_reason": "The disk was already filling for hours before the deploy (F26: 78% at 11:00Z, ~0.6%/6min) and reached 100% by 14:58 from retained WAL of a slot inactive since <=12:19:34Z (F30, F31) — a state cause, not load growth. cpu_pct, connections_active and slow_queries are all flat (F28, F29), so no saturation follows from added load. settlement-service/order-service failures were not caused by payment mandate traffic (F8, F19), and rollback did not recover service (F16)."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H2",
+      "title": "payment-service v6.0.0 mandate flow / new MANDATE_HOLD entry type broke the ledger write contract",
+      "statement": "v6.0.0 (dep-6203) introduced the MANDATE_HOLD ledger entry type written by payment-service directly to ledger-db; that entry type was rejected/unsupported (missing schema/constraint/validation gate), so mandate writes failed and payment-service error rate climbed to ~60%. (Reporter's suspicion.)",
+      "category": "bad_deployment",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": "dep-6203",
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "Deploy dep-6203 (payment-service v6.0.0, 14:46:00Z) adds mandate endpoints and new ledger entry type MANDATE_HOLD.",
+          "finding_ids": [
+            "F3",
+            "F14"
+          ]
+        },
+        {
+          "claim": "MANDATE_HOLD rows are rejected by an unsupported schema/validation gate on the direct payment-service -> ledger-db edge.",
+          "finding_ids": [
+            "F17"
+          ]
+        },
+        {
+          "claim": "payment-service error_rate jumps to ~60% at 14:56.",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "Entry type rejected / validated incorrectly.",
+          "finding_ids": []
+        }
+      ],
+      "supporting_evidence": [
+        "F3",
+        "F14",
+        "F17"
+      ],
+      "contradicting_evidence": [
+        "F9",
+        "F10",
+        "F20",
+        "F16",
+        "F8",
+        "F19",
+        "F13",
+        "F18",
+        "F15",
+        "F4",
+        "F26"
+      ],
+      "assumptions": [
+        "A schema/validation gate for entry types exists and rejected MANDATE_HOLD — no ledger-service exists (F1) and this is entirely unobservable."
+      ],
+      "rejection_reason": "The actual error is a DB storage error ('could not extend file: No space left on device'), not a validation rejection (F9, F10, F20). settlement-service and order-service — which did not receive v6.0.0 — fail with the same onset, shape and error text (F8, F19, F20). Rollback at 15:12 did not recover service (F16). No config/schema change exists in the window (F4, F15) and the disk climb predates the deploy by ~3h48m (F26)."
+    },
+    {
+      "rank": 5,
+      "hypothesis_id": "H3",
+      "title": "Shared message broker / queue (kafka) on the write path degraded around onset",
+      "statement": "A shared downstream dependency in the write path — the kafka queue-produce edge from payment-service — was changed or saturated around 14:56, causing failures across multiple writers rather than a single-service code bug.",
+      "category": "dependency_failure",
+      "root_cause_service": "kafka",
+      "trigger_change_id": "null",
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "payment-service queue-produces to kafka, a shared component on the write path.",
+          "finding_ids": [
+            "F17",
+            "F6"
+          ]
+        },
+        {
+          "claim": "kafka or the queue path degraded around onset, degrading multiple writers.",
+          "finding_ids": []
+        },
+        {
+          "claim": "payment-service, settlement-service and order-service error rates rise together at 14:56.",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F19"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F17"
+      ],
+      "contradicting_evidence": [
+        "F9",
+        "F10",
+        "F20",
+        "F13",
+        "F18"
+      ],
+      "assumptions": [
+        "kafka was degraded — no evidence; no kafka deploy/config in window (F13)."
+      ],
+      "rejection_reason": "The error is a PostgreSQL storage error in ledger-db (F9, F10, F20), not a broker error; no kafka change exists in the window (F13). Shared-dependency scope is fully explained by ledger-db fan-in (F2)."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "There is no service named 'ledger-service'; payment-service writes directly to the shared postgres datastore 'ledger-db', owned by 'platform'.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "ledger-db is a shared, high-fan-in component written to directly by order-service, portfolio-service, payment-service and settlement-service (type 'postgres', shared=true).",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "payment-service v6.0.0 (dep-6203, deployed 2026-06-01T14:46:00Z) introduced the 'new ledger entry type MANDATE_HOLD' via a new UPI mandate flow; it was rolled back at 15:12:00Z.",
+      "finding_ids": [
+        "F3",
+        "F14"
+      ]
+    },
+    {
+      "statement": "Sweeping all services for deployments in 13:00-16:59Z returns exactly one change artifact: dep-6203. No deploy exists for ledger-db, settlement-service, order-service, portfolio-service or kafka; config-change sweep over 00:00-16:59Z returns count 0.",
+      "finding_ids": [
+        "F13",
+        "F4",
+        "F15",
+        "F18"
+      ]
+    },
+    {
+      "statement": "ledger-db disk_used_pct climbed monotonically from 78.16% at 11:00Z (89.18% at 13:00, 95.25% by 14:05, 98.38% by 14:35-14:40) to 100.0% at the 14:55-15:00 bucket, holding 100.0 thereafter; missing_points 0.",
+      "finding_ids": [
+        "F25",
+        "F26",
+        "F33"
+      ]
+    },
+    {
+      "statement": "At 2-minute resolution across the onset window the disk was already 98.73% at 14:46, 99.28% at 14:48, 99.72% at 14:54, 99.93% at 14:56 and exactly 100.0 at 14:58 — i.e. effectively full before/at the error onset.",
+      "finding_ids": [
+        "F27"
+      ]
+    },
+    {
+      "statement": "The disk fill began at or before 11:00Z — roughly 3h48m before the 14:46Z deploy — so the deploy cannot be its cause.",
+      "finding_ids": [
+        "F26",
+        "F33"
+      ]
+    },
+    {
+      "statement": "No other exposed ledger-db resource is saturated: cpu_pct oscillates ~29-31% (min 25.73, max 33.86) and connections_active is flat ~60-64 (slow_queries_per_min ~1.0/min) across 13:00-16:59Z.",
+      "finding_ids": [
+        "F28",
+        "F29"
+      ]
+    },
+    {
+      "statement": "ledger-db exposes only five metrics (connections_active, cpu_pct, disk_used_pct, replication_lag_ms, slow_queries_per_min); there is no IOPS/disk-throughput metric and no slot-level/WAL-retention metric.",
+      "finding_ids": [
+        "F24",
+        "F35"
+      ]
+    },
+    {
+      "statement": "ledger-db logs show the origin: disk usage 98% on /var/lib/postgresql/data at 14:48:20Z, then PostgreSQL PANICs 'could not write to file \"pg_wal/xlogtemp.37478\": No space left on device' from 15:01:01Z and 'could not extend file \"base/16402/2619\"' (47 ERROR lines in 14:34-15:19Z).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "The inactive replication slot 'analytics_cdc' was retaining WAL: 33916 MB (14:34:05Z) -> 69518 MB (14:46:32Z) -> 77371 MB (14:49:47Z), immediately preceding the 98% disk WARN.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "The 'analytics_cdc' slot was already flagged inactive with massive retained WAL hours before the incident: earliest slot WARN is 12:19:34Z ('inactive; retaining 63157 MB of WAL'), predating the 14:46 deploy by ~2.5 hours, with retention oscillating 63157-92599 MB through 14:49:47Z.",
+      "finding_ids": [
+        "F30",
+        "F31"
+      ]
+    },
+    {
+      "statement": "ledger-db replication_lag_ms was already ~923.9 ms (avg) at 11:00Z and rose steadily to 3703.04 by the 14:52 bucket, a smooth continuation with no discontinuity at the 14:46 deploy.",
+      "finding_ids": [
+        "F34"
+      ]
+    },
+    {
+      "statement": "ledger-db logs are only retained from 2026-06-01T11:00:00Z and no slot-level metric exists, so the true start of WAL retention/slot inactivity cannot be observed and is bounded only to <=12:19:34Z (likely before 11:00Z, since disk was already 78.26% and lag 924 ms at the first sample).",
+      "finding_ids": [
+        "F32",
+        "F35",
+        "F33"
+      ]
+    },
+    {
+      "statement": "The user-visible payment-service error is a DB storage error, not an application/validation exception: 'ledger write failed: ERROR: could not extend file: No space left on device' — 59 occurrences, first seen 15:00:26Z.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "payment-service error_rate was flat ~0.2% through 14:48, then jumped to avg 30.17% (max 60.8) in the 14:56 bucket and held ~60-63% for the rest of the window.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "settlement-service — an independent ledger-db writer not receiving v6.0.0 — shows the same onset and shape: flat ~0.2% through 14:48, then avg 27.14% (max 54.84) at 14:56 and ~54-56% sustained.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "order-service shows the same onset (flat ~0.19-0.23% through 14:55, then avg 16.71% max 49.57 in the 14:55-14:58 bucket, sustained ~47-48%) with the identical storage error text: 236 ERROR entries 'INSERT INTO orders failed: No space left on device' from 15:00:42Z to 16:57:47Z.",
+      "finding_ids": [
+        "F19",
+        "F20"
+      ]
+    },
+    {
+      "statement": "Three of the four direct ledger-db writers (payment-service, settlement-service, order-service) break in the same 14:55-14:58 buckets with the same PostgreSQL storage signature, while the fourth, portfolio-service, emits zero ERROR logs and shows no error_rate rise (flat ~0.19-0.27% all window).",
+      "finding_ids": [
+        "F21",
+        "F22"
+      ]
+    },
+    {
+      "statement": "payment-service's own resources are not saturated: cpu_pct flat ~29-31% and db_pool_in_use flat ~7.9-8.2 connections while error_rate is ~61%, i.e. failures are downstream of payment-service.",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "statement": "payment-service's dependency graph reaches ledger-db (kind 'db'), bank-partner-api (external, no telemetry) and kafka (queue-produce); the only write path touched by the MANDATE_HOLD change is the direct payment-service -> ledger-db edge.",
+      "finding_ids": [
+        "F17"
+      ]
+    },
+    {
+      "statement": "No historical incident mentions a ledger entry-type/schema-validation rejection, but the precedent HIST-114 (2025-04-18) matches this incident exactly on symptom and root cause: 'Inactive replication slot retained WAL until disk filled', 'no space left on device', fix 'Dropped slot; added slot-lag alert'.",
+      "finding_ids": [
+        "F5",
+        "F18"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The disk_used_pct series and the WARN/ERROR log lines describe the same data volume /var/lib/postgresql/data; no IOPS or disk-throughput metric exists, so it is assumed disk is the only exhausted resource because no other exposed metric saturates (cpu_pct, connections_active, slow_queries_per_min are all flat).",
+    "The analytics_cdc slot became inactive before the observable window; its exact stop time is unobservable (ledger-db logs are retained only from 11:00Z and there is no slot-level metric). The 12:19:34Z slot WARN is a lower bound only, and the 14:46 deploy cannot have caused it since disk was already 78% full at 11:00Z.",
+    "portfolio-service's immunity reflects a different access pattern (read-mostly, a separate connection, or not writing during the window) rather than a different physical datastore — unproven but consistent with a single shared ledger-db.",
+    "All three failing writers (payment-service, settlement-service, order-service) issue their writes to the same ledger-db volume rather than to second datastores or shared host volumes; no evidence of any second datastore, shared host, or cluster-wide volume was retrieved.",
+    "The error onset in the 14:55-14:58 buckets is treated as contemporaneous with disk reaching hard-full (100.0 at 14:58) rather than with PostgreSQL's first PANIC log line at 15:01:01Z, since the metric resolution and log timing may differ.",
+    "The reported v6.0.0 deploy time (14:46:00Z) was not confirmed from an independent deploy/version metric, only from the change ledger; the deploy-independence conclusion does not depend on its exact minute.",
+    "(demoted from facts: no verified observation backs it) Removing the v6.0.0 code did not fix the incident: after the 15:12:00Z rollback, payment-service error_rate stayed ~60-63%, consistent with a non-deploy cause that the deploy merely coincided with."
+  ],
+  "timeline": [
+    {
+      "time": "2026-06-01T11:00:00Z",
+      "event": "Earliest observable ledger-db data point: disk_used_pct already 78.16% and replication_lag_ms already ~923.9 ms and climbing — the disk fill is already underway, bounding the true onset to at or before this time (logs retained only from 11:00Z).",
+      "finding_ids": [
+        "F26",
+        "F33",
+        "F34",
+        "F32"
+      ]
+    },
+    {
+      "time": "2026-06-01T12:19:34Z",
+      "event": "Earliest slot WARN: replication slot 'analytics_cdc' reported inactive and retaining 63157 MB of WAL — ~2.5 h before the v6.0.0 deploy.",
+      "finding_ids": [
+        "F30"
+      ]
+    },
+    {
+      "time": "2026-06-01T12:00:00Z-2026-06-01T13:00:00Z",
+      "event": "Disk continues its steady pre-existing climb: 83.72% at 12:00, 87.12% at 12:36, 88.68% at 12:54, 89.18% at 13:00 (~0.6%/6min).",
+      "finding_ids": [
+        "F26",
+        "F25"
+      ]
+    },
+    {
+      "time": "2026-06-01T13:48:09Z",
+      "event": "Retained WAL from the inactive analytics_cdc slot at 92599 MB, still oscillating high — suppression is ongoing, not a deploy-time event.",
+      "finding_ids": [
+        "F31"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:05:00Z-2026-06-01T14:40:00Z",
+      "event": "ledger-db disk crosses 95% (14:05, 95.25%) and reaches 98% (14:35-14:40, 98.38%) — all before the deploy.",
+      "finding_ids": [
+        "F25",
+        "F33"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:46:00Z",
+      "event": "payment-service v6.0.0 (dep-6203, new UPI mandate flow, new MANDATE_HOLD ledger entry type) is deployed into an already 98.73%-full ledger-db; retained WAL measured at 69518 MB inside an ongoing retention pattern, and replication_lag_ms at ~3573.57 ms with no discontinuity.",
+      "finding_ids": [
+        "F3",
+        "F14",
+        "F27",
+        "F31",
+        "F34"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:48:20Z",
+      "event": "ledger-db logs 'disk usage 98% on /var/lib/postgresql/data'.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:49:47Z",
+      "event": "Retained WAL from analytics_cdc at 77371 MB, immediately preceding the disk WARN — root cause of the exhaustion visible in WARN logs.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:55:00Z-2026-06-01T14:58:00Z",
+      "event": "Disk hits hard-full: 99.72% at 14:54, 99.93% at 14:56, exactly 100.0 at 14:58. In the same buckets error_rate onsets in three ledger-db writers: payment-service (14:56 bucket, avg 30.17%, max 60.8), settlement-service (14:56 bucket, avg 27.14%, max 54.84), order-service (14:55-14:58 bucket, avg 16.71%, max 49.57). portfolio-service stays flat.",
+      "finding_ids": [
+        "F27",
+        "F7",
+        "F8",
+        "F19",
+        "F21"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:00:26Z",
+      "event": "First payment-service 'ledger write failed: ERROR: could not extend file: No space left on device' (59 occurrences total).",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:00:42Z",
+      "event": "First order-service 'INSERT INTO orders failed: No space left on device' (236 occurrences through 16:57:47Z).",
+      "finding_ids": [
+        "F20"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:01:01Z",
+      "event": "PostgreSQL PANICs: 'could not write to file \"pg_wal/xlogtemp.37478\": No space left on device' (47 ERROR lines in ledger-db, 14:34-15:19Z).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:10:00Z",
+      "event": "Incident INC-012 reported by on-call SRE: payment-service error rate 60%, ledger write failures; reporter attributes it to v6.0.0.",
+      "finding_ids": [
+        "F7",
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:12:00Z",
+      "event": "payment-service v6.0.0 (dep-6203) rolled back — 26 minutes after deploy. Removing the new code does not clear the failure; error_rate remains ~60-63% for the rest of the window.",
+      "finding_ids": [
+        "F16",
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:00:00Z-2026-06-01T16:55:00Z",
+      "event": "ledger-db disk_used_pct holds 100.0 for every bucket; payment/settlement/order error rates stay saturated (~47-63%) while portfolio-service and payment-service's local resources (cpu ~30%, db_pool ~8) remain flat.",
+      "finding_ids": [
+        "F27",
+        "F25",
+        "F7",
+        "F8",
+        "F19",
+        "F21",
+        "F12"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Break the disk exhaustion on ledger-db now: drop (or reactivate/pause-and-advance) the inactive replication slot 'analytics_cdc' to release the retained WAL — the same fix used for precedent HIST-114 ('Dropped slot; added slot-lag alert') — then verify disk_used_pct returns to a normal baseline and confirm writers recover.",
+      "priority": "immediate",
+      "rationale": "The retention of WAL by the inactive slot analytics_cdc is the log-visible cause of the full /var/lib/postgresql/data volume (F11, F30, F31); freeing it restores the shared write path for payment-, settlement- and order-service (F9, F20, F8).",
+      "finding_ids": [
+        "F11",
+        "F30",
+        "F31",
+        "F5",
+        "F18"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Do NOT treat the rollback of dep-6203 (payment-service v6.0.0) as a mitigation or as confirmation of a deploy fault; dep-6203 has already been rolled back and it did not clear the ~60% error rate. Keep the rollback in place (no re-deploy of v6.0.0) and reframe the incident as ledger-db infrastructure. Optionally re-deploy v6.0.0 once disk is healthy to confirm it is not implicated.",
+      "priority": "immediate",
+      "rationale": "The deploy postdates the start of the disk climb by ~3h48m and removal of the code did not restore service (F26, F16, F7); the only write path it touched is the direct payment-service -> ledger-db edge that failed with a storage error (F17, F9).",
+      "finding_ids": [
+        "F16",
+        "F26",
+        "F7",
+        "F17",
+        "F13"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Confirm recovery with concrete checks: ledger-db disk_used_pct falling from 100% and holding below threshold, replication_lag_ms falling back from ~3.7 s, and error_rate in payment-service, settlement-service and order-service returning to the <0.3% baseline. Order the checks by writer so all three are explicitly verified — not just payment-service.",
+      "priority": "immediate",
+      "rationale": "Blast radius was three of four direct writers, all with the same 14:55-14:58 onset and PostgreSQL storage signature, so recovery must be verified across all of them (F25, F34, F7, F8, F19, F20).",
+      "finding_ids": [
+        "F25",
+        "F34",
+        "F7",
+        "F8",
+        "F19",
+        "F20"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add a slot-lag / retained-WAL alert for ledger-db (and the platform-owned repositories generally), firing on replication-slot inactivity and on retained-WAL growth, plus a disk-usage forecast alert at e.g. 85% with time-to-full estimation. This is the control missing in the current telemetry, where five metrics are exposed and none is slot- or WAL-level.",
+      "priority": "short_term",
+      "rationale": "The disk climbed from 78% (before 11:00Z) to 100% over roughly four hours with no alert, and no slot-level or WAL-retention metric exists to detect or forecast it (F26, F25, F35, F24).",
+      "finding_ids": [
+        "F26",
+        "F25",
+        "F35",
+        "F24",
+        "F5"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Add WAL-retention / slot-level metrics to ledger-db telemetry and a disk-throughput/IOPS metric so 'disk full' and 'IOPS saturation' can be distinguished by measurement rather than inferred, and so the exact slot-stop instant is observable instead of being bounded only by WARN logs.",
+      "priority": "short_term",
+      "rationale": "Available metrics are only connections_active, cpu_pct, disk_used_pct, replication_lag_ms and slow_queries_per_min, so an unmeasurable IOPS mechanism cannot be fully excluded (F24, F35).",
+      "finding_ids": [
+        "F24",
+        "F35"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Verify whether portfolio-service, a direct ledger-db writer that stayed clean through the outage, genuinely shares the same physical volume and insert pattern as the other three writers; instrument or document its ledger write path.",
+      "priority": "short_term",
+      "rationale": "portfolio-service's immunity is the one unexplained observation within the single-shared-volume explanation and no telemetry currently resolves it (F21, F22, F23).",
+      "finding_ids": [
+        "F21",
+        "F22",
+        "F23"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Harden the replication-slot lifecycle: require an owning consumer and TTL for every slot, alert when a slot produces no consumer activity for N minutes, and automate (or gate behind an explicit runbook) the drop of abandoned slots. Rehearse with a periodic 'retained WAL grows unbounded' game-day.",
+      "priority": "long_term",
+      "rationale": "This is a recurrence of HIST-114, whose root cause was exactly 'Inactive replication slot retained WAL until disk filled' — the same failure mode has now hit production a second time (F5, F18, F30, F31).",
+      "finding_ids": [
+        "F5",
+        "F18",
+        "F30",
+        "F31"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Close the change-ledger blind spot for database state: disk/replication-slot state changes are not deploy or config artifacts and do not appear in change sweeps, so add slot drops/creations and major storage state transitions to the change/audit stream.",
+      "priority": "long_term",
+      "rationale": "The 13:00-16:59Z deploy sweep returned only dep-6203 and the 00:00-16:59Z config sweep returned count 0, which is why the deploy was wrongly suspected and the slot inactivity could not be dated from change data (F13, F4, F15, F18).",
+      "finding_ids": [
+        "F13",
+        "F4",
+        "F15",
+        "F18"
+      ],
+      "hypothesis_id": null
+    }
+  ],
+  "data_gaps": [
+    "No IOPS or disk-throughput metric exists for ledger-db (available metrics are only connections_active, cpu_pct, disk_used_pct, replication_lag_ms, slow_queries_per_min), so IOPS saturation (as in precedent HIST-110) cannot be measured or formally excluded — only inferred to be absent because no other exposed resource saturated.",
+    "No slot-level or WAL-retention metric exists for ledger-db, so the analytics_cdc slot's exact inactivity/consumer-stop instant rests entirely on WARN logs plus disk/lag proxies; the true origin of the retention cannot be dated.",
+    "ledger-db logs are retained only from 2026-06-01T11:00:00Z, and the earliest sampled disk point is already 78.16% with replication_lag_ms already ~924 ms, so the exact start of the disk fill is undetermined and bounded only to 'at or before 11:00Z'; pre-11:00 metric history was not retrieved (tool budget exhausted).",
+    "No slot state or 'consumer' activity log line confirming an explicit slot-drop/last-consumer-stop event was found (a 'consumer' keyword search over 11:00-16:59Z returned 0), so the retention start is inferred rather than directly evidenced.",
+    "portfolio-service's immunity is unexplained: no telemetry resolves whether its write pattern differs, whether it uses a separate connection, or whether it had a sub-threshold/non-error symptom (only its error_rate metric and an ERROR-level log query were run, both clean).",
+    "The blast radius over ledger-db consumers is only confirmable for the four writers named in F2; the full consumer list could not be independently re-verified (get_service_dependencies for ledger-db returned budget_exhausted), and other consumers beyond payment/settlement/order/portfolio may exist and may also have been silently affected.",
+    "Whether a schema/constraint or validation gate inside ledger-db accompanied or rejected the MANDATE_HOLD entry type is entirely unobservable: no ledger-service exists, no config/schema change was recorded in the window, and get_service_dependencies does not expose schema internals.",
+    "The reported deploy time of payment-service v6.0.0 was taken from the change ledger and not independently confirmed from a deploy/version metric or log.",
+    "Order-service's error signature ('INSERT INTO orders failed: No space left on device') was not independently traced to the ledger-db volume via storage-level evidence; the shared-volume attribution relies on F2 listing order-service as a direct ledger-db writer (H5, the alternative second/shared-origin hypothesis, remains formally unrefuted by storage-level data although it is unsupported)."
+  ],
+  "what_would_change_the_conclusion": [
+    "Storage-level evidence that the failing writers (payment-service, settlement-service, order-service) write to different physical volumes/datastores or to a shared host volume rather than to the single ledger-db volume — this would move the origin toward a cluster-wide/shared-host disk exhaustion (the rejected H5) and change the remediation target.",
+    "A metric or log showing a second exhausted resource on ledger-db (measured IOPS/throughput saturation, connection pile-up, memory pressure) concurrently with the disk exhaustion — this would make 'disk is the sole exhausted resource' false and reopen the ranked alternatives.",
+    "Evidence that the analytics_cdc slot retention only began at or after the 14:46 deploy (e.g. a pre-11:00 history showing normal retention followed by a step change) — this would restore a deploy-linked causal chain.",
+    "Recovery of payment/settlement/order error rates immediately following the 15:12 rollback of v6.0.0, or proof that the actual error is a validation/schema rejection of MANDATE_HOLD rather than a PostgreSQL storage error — this would support H2 (bad deployment) and demote H1.",
+    "Discovery that the MANDATE_HOLD write is somehow the dominant contributor to the WAL retention (e.g. mandate traffic generating the retained WAL volume) — this would re-link the deploy to the WAL growth, moving toward H4.",
+    "Revised telemetry showing the onset was specific to payment-service only (i.e. settlement-service and order-service error rates were not in fact elevated in the 14:55-14:58 buckets) — this would undermine the shared-dependency scope argument.",
+    "A portfolio-service write pattern that shows it genuinely shares the same volume and insert behaviour as the three failing writers, making its zero-error status an unexplained anomaly that weakens the single-volume explanation."
+  ],
+  "findings": [
+    {
+      "statement": "There is no service named 'ledger-service'. It does not exist in the dependency graph or the list of known services; payment-service's ledger write path goes directly to the shared postgres datastore 'ledger-db' (kind 'db'), owned by 'platform'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "unknown service 'ledger-service'"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"ledger-db\",\"user-db\",\"redis-cache\",\"kafka\""
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        }
+      ],
+      "services": [
+        "payment-service",
+        "ledger-db"
+      ],
+      "time": "2026-06-01T15:10:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "ledger-db is a shared, high-fan-in component: four services write to it directly (order-service, portfolio-service, payment-service, settlement-service). A ledger-db failure would degrade all four, not just payment-service. Its type is 'postgres', owner 'platform', shared=true.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"settlement-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"name\":\"ledger-db\",\"type\":\"postgres\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true"
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "order-service",
+        "portfolio-service",
+        "payment-service",
+        "settlement-service"
+      ],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment-service v6.0.0 (dep-6203, author p.nair, deployed 2026-06-01T14:46:00Z) introduced exactly 'new ledger entry type MANDATE_HOLD' via 'New UPI mandate flow'. It was rolled back at 15:12:00Z — 26 minutes after deploy, ~2 min after the 15:10Z report.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "new ledger entry type MANDATE_HOLD"
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"deployed_at\":\"2026-06-01T14:46:00Z\""
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"rolled_back_at\":\"2026-06-01T15:12:00Z\""
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"status\":\"rolled_back\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T14:46:00Z",
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "No config or feature-flag changes were made for any service in 2026-06-01T12:00Z–16:59Z (count 0). The only change artifact in the window is the payment-service v6.0.0 deployment; this does not exclude a schema/validation gate residing in ledger-db itself.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "payment-service",
+        "ledger-db"
+      ],
+      "time": "2026-06-01T12:00:00Z",
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No historical incident mentions a ledger entry type / schema-validation incompatibility, a MANDATE_HOLD-type rejection, or a 'new entry type' rejection. The closest ledger write-failure precedent is HIST-114 (2025-04-18): 'ledger-db disk full from retained WAL', symptoms 'no space left on device','write failures', root cause 'Inactive replication slot retained WAL until disk filled', fix 'Dropped slot; added slot-lag alert'. Recurring ledger-db precedents (HIST-110 IOPS throttling, HIST-111 unindexed full scans, HIST-102 primary failover) are all infra/query issues, not validation. These are leads, not evidence about this incident.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "Inactive replication slot retained WAL until disk filled"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"symptoms\":[\"no space left on device\",\"write failures\"]"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "New report query without index did sequential scans"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "Unplanned ledger-db primary failover; 6 min of refused connections"
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:10:00Z",
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "The only payment-service precedent found, HIST-105 (2025-11-19), was a dependency_failure: 'Bank partner API returned 5xx for 40 minutes (their incident)'. payment-service holds an external dependency on bank-partner-api (has_telemetry=false, so it emits no telemetry in our data) plus queue-produce to kafka. An external-dependency cause for a 60% payment error rate is therefore plausible for the symptom but is NOT what the v6.0.0 change touched.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "Bank partner API returned 5xx for 40 minutes (their incident)"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"bank-partner-api\",\"kind\":\"external\"}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "\"name\":\"bank-partner-api\",\"type\":\"external\",\"owner\":\"vendor\",\"has_telemetry\":false"
+        }
+      ],
+      "services": [
+        "payment-service",
+        "bank-partner-api",
+        "kafka"
+      ],
+      "time": "2026-06-01T15:10:00Z",
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "payment-service error_rate was flat ~0.2% through 14:48, then jumped to avg 30.17% (max 60.8) in the 14:56 bucket and held ~60-63% for the rest of the window, so the onset is at/just before 14:56 — the deploy+15min (15:00-15:10) framing is too late.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-06-01T14:48:00Z\",\"avg\":0.24,\"max\":0.31},{\"ts\":\"2026-06-01T14:56:00Z\",\"avg\":30.17,\"max\":60.8}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T14:56:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "settlement-service — a second, independent consumer of the ledger write path — shows the same onset and shape: flat ~0.2% through 14:48, then avg 27.14% (max 54.84) at 14:56 and ~54-56% sustained thereafter. Two services degrading simultaneously indicates a shared dependency, not a single-service code bug.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-06-01T14:48:00Z\",\"avg\":0.17,\"max\":0.29},{\"ts\":\"2026-06-01T14:56:00Z\",\"avg\":27.14,\"max\":54.84}"
+        }
+      ],
+      "services": [
+        "settlement-service"
+      ],
+      "time": "2026-06-01T14:56:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The 'ledger write failure' signature reports exactly: 'ledger write failed: ERROR: could not extend file: No space left on device' — 59 occurrences in payment-service logs, first seen 15:00:26Z. It is a storage error passed up from the DB, not an application exception.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "ledger write failed: ERROR: could not extend file: No space left on device"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"first_match\":\"2026-06-01T15:00:26Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:00:26Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db (the ledger write datastore) shows the origin: 'disk usage 98% on /var/lib/postgresql/data' at 14:48:20Z, then PostgreSQL PANICs 'could not write to file \"pg_wal/xlogtemp.37478\": No space left on device' starting 15:01:01Z and 'could not extend file \"base/16402/2619\"' — 47 ERROR-level lines in ledger-db in 14:34-15:19.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "disk usage 98% on /var/lib/postgresql/data"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "PANIC: could not write to file \"pg_wal/xlogtemp.37478\": No space left on device"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "could not extend file \"base/16402/2619\": No space left on device"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:48:20Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Root cause of the disk exhaustion is visible in ledger-db WARN logs before the outage: an inactive replication slot 'analytics_cdc' retaining WAL that grew 33916 MB (14:34:05) -> 69518 MB (14:46:32) -> 77371 MB (14:49:47), immediately preceding the 98% disk WARN.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "replication slot 'analytics_cdc' is inactive; retaining 33916 MB of WAL"
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "replication slot 'analytics_cdc' is inactive; retaining 77371 MB of WAL"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:49:47Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment-service shows clean-but-erroring resource behaviour: cpu_pct stays flat ~29-31% across the whole window (14:00-16:56) and db_pool_in_use stays flat ~7.9-8.2 connections, with no saturation, while error_rate is ~61% — i.e. the failures are downstream, not local resource pressure in payment-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-06-01T14:56:00Z\",\"avg\":30.61,\"max\":32.62},{\"ts\":\"2026-06-01T15:04:00Z\",\"avg\":29.91,\"max\":30.86}"
+        },
+        {
+          "call_id": "tc-015",
+          "quote": "\"min\":7.08,\"max\":8.87,\"mean\":8.01"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:04:00Z",
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Sweep of ALL services for deployments in 2026-06-01T13:00-16:59Z returns exactly one change artifact: dep-6203, payment-service v6.0.0, deployed 14:46:00Z, author p.nair, summary 'New UPI mandate flow', status rolled_back at 15:12:00Z. No deploy exists for ledger-db, settlement-service, order-service, portfolio-service, kafka or any config/auth service in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"count\":1,\"deployments\":[{\"id\":\"dep-6203\",\"service\":\"payment-service\",\"version\":\"v6.0.0\",\"deployed_at\":\"2026-06-01T14:46:00Z\""
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "\"deployed_at\":\"2026-06-01T14:46:00Z\",\"author\":\"p.nair\",\"summary\":\"New UPI mandate flow\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T14:46:00Z",
+      "id": "F13",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Exactly what v6.0.0 changed: changes=['mandate create/approve endpoints','new ledger entry type MANDATE_HOLD'] — this is the only ledger-write-path schema change in the incident window. No config/flag change is associated with it.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"changes\":[\"mandate create/approve endpoints\",\"new ledger entry type MANDATE_HOLD\"]"
+        },
+        {
+          "call_id": "tc-018",
+          "quote": "summary\":\"New UPI mandate flow\",\"changes\":[\"mandate create/approve endpoints\",\"new ledger entry type MANDATE_HOLD\"]"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T14:46:00Z",
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Config-change sweep over the wider window 2026-06-01T00:00Z–16:59Z across all services returns count 0 — there were no flag/config/schema-gate changes anywhere, so no config-driven cause exists in the data (does not exclude state residing inside ledger-db).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"all services\""
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"all services\""
+        }
+      ],
+      "services": [],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Deployment timeline vs onset: the sole deploy (14:46:00Z) PRECEDES the 14:56 bucket onset and is rolled back at 15:12:00Z, yet payment-service error_rate stays ~60-63% after rollback — so removing the v6.0.0 code did not clear the failure, consistent with a non-deploy cause that the deploy merely coincided with.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"rolled_back_at\":\"2026-06-01T15:12:00Z\""
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "\"deployed_at\":\"2026-06-01T14:46:00Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:12:00Z",
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment-service dependency graph: it reaches ledger-db (kind 'db'), bank-partner-api (kind 'external', has_telemetry=false) and kafka (kind 'queue-produce'), with api-gateway -> payment-service (http). The only write path touched by the MANDATE_HOLD change is the direct payment-service -> ledger-db db edge (there is no intermediate ledger-service).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "{\"from\":\"payment-service\",\"to\":\"ledger-db\",\"kind\":\"db\"},{\"from\":\"payment-service\",\"to\":\"bank-partner-api\",\"kind\":\"external\"},{\"from\":\"payment-service\",\"to\":\"kafka\",\"kind\":\"queue-produce\"}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "\"name\":\"ledger-db\",\"type\":\"postgres\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true"
+        }
+      ],
+      "services": [
+        "payment-service",
+        "ledger-db",
+        "kafka",
+        "bank-partner-api"
+      ],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No deployment or config change exists for ledger-db itself: get_deployments(service=ledger-db, 13:00-16:59Z) returns count 0. So the ledger-write failure has no concurrent deploy — its cause (per T1/F10-F11: 98% disk at 14:48:20Z from retained WAL of inactive replication slot analytics_cdc) is state/monitoring, not a rollout. Precedent HIST-114 'ledger-db disk full from retained WAL' matches symptom and root cause exactly; HIST-110/111/102 are infra/query leads only.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "\"count\":0,\"deployments\":[],\"scope\":\"ledger-db\""
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "{\"id\":\"HIST-114\",\"date\":\"2025-04-18\",\"title\":\"ledger-db disk full from retained WAL\",\"services\":[\"ledger-db\"],\"symptoms\":[\"no space left on device\",\"write failures\"],\"root_cause\":\"Inactive replication slot retained WAL until disk filled\""
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:48:20Z",
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service shows the same error_rate onset as payment-service and settlement-service: flat ~0.19-0.23% through 14:55, then jump in the 14:55-14:58 bucket to avg 16.71% (max 49.57) and sustained ~47-48% (avg 47.5, max 51.76) for the rest of the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-042",
+          "quote": "{\"ts\":\"2026-06-01T14:55:00Z\",\"avg\":0.28,\"max\":0.29},{\"ts\":\"2026-06-01T14:58:00Z\",\"avg\":16.71,\"max\":49.57}"
+        },
+        {
+          "call_id": "tc-029",
+          "quote": "\"max\":51.76,\"mean\":32.0"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-06-01T14:58:00Z",
+      "id": "F19",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service's errors carry the same F9 DB storage error text as payment-service: 236 ERROR log entries, all matching 'INSERT INTO orders failed: No space left on device', first_seen 2026-06-01T15:00:42Z through 16:57:47Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "\"pattern\":\"INSERT INTO orders failed: No space left on device orderId=<n>\",\"count\":236,\"first_seen\":\"2026-06-01T15:00:42Z\""
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-06-01T15:00:42Z",
+      "id": "F20",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service, a third direct writer of ledger-db, does NOT show the onset: its error_rate stays flat ~0.19-0.27% (max 0.32) across the entire 14:00-16:59 window with no deviation at 14:54-14:58 or later.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-030",
+          "quote": "{\"ts\":\"2026-06-01T14:54:00Z\",\"avg\":0.19,\"max\":0.29},{\"ts\":\"2026-06-01T15:03:00Z\",\"avg\":0.21,\"max\":0.3}"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "\"max\":0.32,\"mean\":0.21"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-06-01T14:58:00Z",
+      "id": "F21",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "portfolio-service emits zero ERROR-level logs in 14:00-16:59Z (total_matched 0) and zero matches for the 'No space left on device' storage signature in 14:30-16:59Z — both queries not truncated/partial, so it genuinely did not error.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-041",
+          "quote": "\"total_matched\":0,\"returned\":0,\"truncated\":false"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "\"total_matched\":0,\"returned\":0,\"truncated\":false"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F22",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Blast radius across the four ledger-db writers is 3 of 4 confirmed erroring with the same storage signature (payment-service, settlement-service, order-service), while portfolio-service remained clean — order-service's onset (14:55-14:58 bucket) is at/just before payment/settlement's 14:56 bucket, consistent with a shared downstream DB origin rather than a payment/settlement-specific code path.",
+      "kind": "inference",
+      "refs": [],
+      "services": [
+        "order-service",
+        "portfolio-service",
+        "payment-service",
+        "settlement-service",
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:58:00Z",
+      "id": "F23",
+      "agent": "observability",
+      "task_id": "T5",
+      "verified": false,
+      "verification_note": "no evidence refs"
+    },
+    {
+      "statement": "ledger-db exposes exactly five metrics — connections_active, cpu_pct, disk_used_pct, replication_lag_ms, slow_queries_per_min. There is NO IOPS or disk-throughput metric for this component, so IOPS saturation (HIST-110) cannot be measured or confirmed from the available telemetry; the metric names are 'disk_used_pct', not 'disk_usage_pct'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "available_metrics\":[\"connections_active\",\"cpu_pct\",\"disk_used_pct\",\"replication_lag_ms\",\"slow_queries_per_min\"]"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T13:00:00Z",
+      "id": "F24",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "ledger-db disk_used_pct shows a sustained monotonic climb to saturation: 89.18% at 13:00, crossing 95% by 14:05 (95.25), 98% by 14:35-14:40 (98.38), reaching 100.0 at 14:55-15:00 and holding 100.0 for every bucket through 16:55. Summary min 89.18, max 100.0, mean 97.27, missing_points 0.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-033",
+          "quote": "{\"ts\":\"2026-06-01T14:40:00Z\",\"avg\":98.38,\"max\":98.52}"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "{\"ts\":\"2026-06-01T14:55:00Z\",\"avg\":99.92,\"max\":100.0}"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "\"summary\":{\"min\":89.18,\"max\":100.0,\"mean\":97.27"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:55:00Z",
+      "id": "F25",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The disk climb did NOT begin in the incident window — it was already underway hours earlier: disk_used_pct was 78.16% at 11:00, rising steadily ~0.6%/6min (79.36 at 11:12, 83.72 at 12:00, 87.12 at 12:36, 88.68 at 12:54, 89.18 at 13:00). The 'rise toward 98%' begins no later than 11:00Z, ~3h48m before the 14:46 deploy — strongly pre-dating the v6.0.0 change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-044",
+          "quote": "{\"ts\":\"2026-06-01T11:00:00Z\",\"avg\":78.16,\"max\":78.43}"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "{\"ts\":\"2026-06-01T12:54:00Z\",\"avg\":88.68,\"max\":88.9}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T11:00:00Z",
+      "id": "F26",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Finer 2-min resolution across the 14:46-14:56 onset window shows disk_used_pct climbing smoothly through the deploy: 98.73% at 14:46, 99.28 at 14:48, 99.53 at 14:52, 99.72 at 14:54, 99.93 at 14:56, then exactly 100.0 at 14:58. The disk hits hard-full ~14:58, i.e. just AFTER the payment/settlement error onset at 14:56 — disk was already ~99% (vs ~98.4% at 14:40) well before the deploy.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-043",
+          "quote": "{\"ts\":\"2026-06-01T14:58:00Z\",\"avg\":100.0,\"max\":100.0}"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "{\"ts\":\"2026-06-01T14:46:00Z\",\"avg\":98.73,\"max\":98.76}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:58:00Z",
+      "id": "F27",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db cpu_pct is completely flat with no saturation during 14:46-14:56 or anywhere in 13:00-16:59: it oscillates ~29-31% throughout (14:46-14:50 avg 30.47->31.31, 14:55 avg 30.21), summary min 25.73, max 33.86, mean 30.02, missing_points 0. No CPU exhaustion.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-034",
+          "quote": "{\"ts\":\"2026-06-01T14:50:00Z\",\"avg\":31.31,\"max\":32.54}"
+        },
+        {
+          "call_id": "tc-034",
+          "quote": "\"summary\":{\"min\":25.73,\"max\":33.86,\"mean\":30.02"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:50:00Z",
+      "id": "F28",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db connections_active shows NO connection saturation or pile-up: flat ~60-64 connections across the whole 13:00-16:59 window (14:46-14:56 buckets avg 61.55/60.83/61.14), summary min 54.84, max 68.34, mean 62.15. slow_queries_per_min is likewise flat ~1.0/min (summary min 0.35, max 1.75, mean 0.99). Neither connections nor query latency indicates a concurrent saturation event during the onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-035",
+          "quote": "{\"ts\":\"2026-06-01T14:55:00Z\",\"avg\":61.14,\"max\":63.61}"
+        },
+        {
+          "call_id": "tc-035",
+          "quote": "\"summary\":{\"min\":54.84,\"max\":68.34,\"mean\":62.15"
+        },
+        {
+          "call_id": "tc-036",
+          "quote": "\"summary\":{\"min\":0.35,\"max\":1.75,\"mean\":0.99"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:55:00Z",
+      "id": "F29",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The 'analytics_cdc' slot was ALREADY flagged inactive with massive retained WAL long before the incident window: the earliest slot WARN log is 2026-06-01T12:19:34Z 'replication slot \\'analytics_cdc\\' is inactive; retaining 63157 MB of WAL'. It predates the 14:46 deploy by ~2.5 hours. This directly undercuts the deploy-linked-coincidence reading of H1's WAL trigger — the slot was drained/abandoned well before v6.0.0.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "2026-06-01T12:19:34Z\",\"level\":\"WARN\",\"message\":\"replication slot 'analytics_cdc' is inactive; retaining 63157 MB of WAL"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T12:19:34Z",
+      "id": "F30",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Retained WAL levels are large, oscillating and rising across 12:19-14:49Z, i.e. the slot was suppressed for hours, not minutes: 63157 MB (12:19:34) -> 83343 MB (12:32:52) -> 91901 MB (12:33:57), then 77137 MB (13:12:19), 92599 MB (13:48:09), 78423 MB (14:16:25), 33916 MB (14:34:05), 69518 MB (14:46:32), 77371 MB (14:49:47). The 14:46:32 value sits inside an ongoing pre-existing retention pattern, not a step change at deploy time.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "63357 MB of WAL"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "2026-06-01T14:46:32Z\",\"level\":\"WARN\",\"message\":\"replication slot 'analytics_cdc' is inactive; retaining 69518 MB of WAL"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "2026-06-01T14:49:47Z\",\"level\":\"WARN\",\"message\":\"replication slot 'analytics_cdc' is inactive; retaining 77371 MB of WAL"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:49:47Z",
+      "id": "F31",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/3 refs verified (tc-026: quote not found in tool output)"
+    },
+    {
+      "statement": "slot WARN log volume in the queried ledger-db log store is 14 entries, first_match 12:19:34Z, last_match 14:49:47Z, and the query's reported data_range starts at 2026-06-01T11:00:00Z — ledger-db logs are only retained from 11:00Z, so the true first WAL-retention/slot-inactivity moment cannot be seen in logs and may be earlier than 12:19:34Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "\"total_matched\":14,\"returned\":14,\"truncated\":false"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "\"first_match\":\"2026-06-01T12:19:34Z\""
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T11:00:00Z",
+      "id": "F32",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Corroborating metric: ledger-db disk_used_pct was ALREADY 78.26% at the first available point 2026-06-01T11:00:00Z and climbed monotonically ~1%/8min to 100.0% at the 15:00 bucket; the first log window is not a fresh start. This shows disk pressure was a pre-existing, steadily accumulating condition across the whole observable morning, reaching 98.19% by the 14:36 bucket — before the 14:46 deploy.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-040",
+          "quote": "{\"ts\":\"2026-06-01T11:00:00Z\",\"avg\":78.26,\"max\":78.62}"
+        },
+        {
+          "call_id": "tc-040",
+          "quote": "{\"ts\":\"2026-06-01T14:36:00Z\",\"avg\":98.19,\"max\":98.52}"
+        },
+        {
+          "call_id": "tc-040",
+          "quote": "{\"ts\":\"2026-06-01T15:00:00Z\",\"avg\":100.0,\"max\":100}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:36:00Z",
+      "id": "F33",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "ledger-db replication_lag_ms was already ~923.9 ms (avg) at 11:00Z and rose steadily to 3703.04 by the 14:52 bucket — i.e. the slot/WAL lag was continuously degrading through the entire observable period, with no discontinuity at or near the 14:46 deploy (14:44 avg 3573.57 -> 14:52 avg 3703.04 is a smooth continuation).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-039",
+          "quote": "{\"ts\":\"2026-06-01T11:00:00Z\",\"avg\":923.9,\"max\":949.34}"
+        },
+        {
+          "call_id": "tc-039",
+          "quote": "{\"ts\":\"2026-06-01T14:52:00Z\",\"avg\":3703.04,\"max\":3827.92}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:52:00Z",
+      "id": "F34",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db exposes NO wal_retention_mb / slot-level metric: available_metrics = [connections_active, cpu_pct, disk_used_pct, replication_lag_ms, slow_queries_per_min]. Slot state is only visible via WARN logs (inactive+MB retained) plus disk_used_pct/replication_lag_ms proxies, so the slot's exact activation/stop timestamps must be inferred from logs.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-028",
+          "quote": "has no metric 'wal_retention_mb'"
+        },
+        {
+          "call_id": "tc-028",
+          "quote": "\"available_metrics\":[\"connections_active\",\"cpu_pct\",\"disk_used_pct\",\"replication_lag_ms\",\"slow_queries_per_min\"]"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F35",
+      "agent": "observability",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_accepted",
+  "stats": {
+    "latency_s": 211.66,
+    "llm_calls": 29,
+    "prompt_tokens": 200275,
+    "completion_tokens": 41121,
+    "total_tokens": 241396,
+    "tool_calls": 45,
+    "tool_attempts": 46,
+    "tool_failures": 6,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 2,
+    "tasks": 6,
+    "tasks_failed": 0,
+    "findings": 35,
+    "findings_verified": 34,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 2,
+        "prompt_tokens": 3271,
+        "completion_tokens": 1522
+      },
+      "dependency": {
+        "calls": 7,
+        "prompt_tokens": 32237,
+        "completion_tokens": 5669
+      },
+      "observability": {
+        "calls": 14,
+        "prompt_tokens": 102257,
+        "completion_tokens": 13526
+      },
+      "reasoning": {
+        "calls": 3,
+        "prompt_tokens": 31165,
+        "completion_tokens": 11253
+      },
+      "critic": {
+        "calls": 2,
+        "prompt_tokens": 21023,
+        "completion_tokens": 2909
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 10322,
+        "completion_tokens": 6242
+      }
+    }
+  },
+  "warnings": [
+    "fact demoted to assumption: Removing the v6.0.0 code did not fix the incident: after the 15:12:00Z rollback,"
+  ]
+}

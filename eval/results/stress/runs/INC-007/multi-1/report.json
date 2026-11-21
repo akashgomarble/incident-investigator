@@ -1,0 +1,1937 @@
+{
+  "incident_id": "INC-007",
+  "system": "multi_agent",
+  "outcome": "inconclusive",
+  "summary": "The incident is real, localized to auth-service's token-validation path, and per the reviewed analysis the root cause is NOT adequately established: H1 (JWT library/TokenValidator regression from dep-5710) at 0.45 and H2 (scheduled signing-key rotation cfg-2705 published before all validators adopted it) at 0.40 remain effectively tied and name different origins and fixes. What is solid: a single-minute step in auth-service error_rate from ~0.2% to ~36% at 2026-04-15T14:02:00Z with flat throughput (~400 req/s) and p99 (~90 ms), a flat ~2h plateau (latest 15:56Z), and an independent, time-aligned ~21% error plateau at the unchanged caller api-gateway, which rules out a log-pipeline reporting artifact (H5). Fleet-wide sweeps show the only changes all day are auth-service dep-5710 v7.3.0 at 14:00Z ('jjwt 0.11 -> 0.12 (breaking parser API)', 'TokenValidator rewritten') and cfg-2705 at 14:01Z (jwt.signing.key_id k-2025-10 -> k-2026-04); both are still live and neither was ever reverted. Every decisive discriminator is unreachable in this run: no per-instance/pod, endpoint or token-issuer dimension exists, no diff/JWKS-source/rotation-mode metadata exists, the deployed library version is self-contradictory, and the single-change rollback test could not be run with read-only tooling (logs also unsearchable). H3 (clock skew/cert) and H4's resource-exhaustion arm are not supported; H4's pod-restart arm is not closed out. Immediate action is a safe mitigation plus the rollback experiment: roll back dep-5710 first (H1 is the marginally better fit on shape), then re-test with cfg-2705 reverted if the error persists.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "JWT library upgrade (dep-5710) introduced a token-validation regression",
+      "statement": "auth-service deploy dep-5710 v7.3.0 at 14:00:00Z replaced the JWT parser (jjwt 0.11 -> 0.12, described as a breaking parser API change) and rewrote TokenValidator. The new/unmigrated validation path emits a wrong invalid_token verdict for a persistent subset of otherwise-valid tokens, producing a step from ~0.2% to ~36% error_rate at 14:02:00Z that plateaus for ~2h without converging, with throughput and p99 latency untouched. The deterministic, converging-never nature of the plateau fits a code fault better than a propagation race. NOTE the mechanism hop remains unevidenced: no diff, no clock-skew/TTL/strictness defaults, and the deployed library version is self-contradictory, so this is a timing-and-shape argument, not a mechanism proof.",
+      "category": "bad_deployment",
+      "root_cause_service": "auth-service (jjwt parser / TokenValidator code path)",
+      "trigger_change_id": "dep-5710",
+      "confidence": 0.45,
+      "pre_cap_confidence": 0.5,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "Deploy dep-5710 v7.3.0 goes live at 14:00:00Z as the only fleet deployment that day, with a breaking jjwt parser API change and a rewritten TokenValidator; never rolled back.",
+          "finding_ids": [
+            "F1",
+            "F13",
+            "F16",
+            "F22",
+            "F32",
+            "F33",
+            "F37",
+            "F38",
+            "F40"
+          ]
+        },
+        {
+          "claim": "The rewritten validator applies different parser semantics (clock-skew default / claim strictness) to a class of valid tokens, inverting them to invalid_token.",
+          "finding_ids": []
+        },
+        {
+          "claim": "auth-service error_rate steps from 0.16% (14:01Z) to 36.08% (14:02Z), exactly 2 minutes after the deploy, then holds 35-39% through 15:59Z with no decay.",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F17",
+            "F27",
+            "F28"
+          ]
+        },
+        {
+          "claim": "The fault is a wrong-verdict, not load or resource: throughput flat ~390-417 req/s, p99 flat ~86-95 ms, cpu_pct ~38%, memory_pct ~52%, rate_limited ~2/min.",
+          "finding_ids": [
+            "F9",
+            "F10",
+            "F29",
+            "F30"
+          ]
+        },
+        {
+          "claim": "api-gateway, the caller of auth-service, shows an independent contemporaneous ~21% error plateau in the same window, confirming a real user-facing fault rather than a reporting artifact.",
+          "finding_ids": [
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F13",
+        "F16",
+        "F22",
+        "F32",
+        "F33",
+        "F37",
+        "F38",
+        "F40",
+        "F7",
+        "F8",
+        "F17",
+        "F27",
+        "F28",
+        "F9",
+        "F10",
+        "F29",
+        "F30",
+        "F11",
+        "F18"
+      ],
+      "contradicting_evidence": [
+        "F2",
+        "F14",
+        "F26"
+      ],
+      "assumptions": [
+        "The deployed jjwt version is unknown (F33: summary says '4.x', change list says '0.12'); the hypothesis only requires that parser semantics changed materially, which both strings assert.",
+        "The TokenValidator rewrite's behavioural delta is unknown (F34: one-line string only); the 'inverts a class of valid tokens' hop is assumed, not evidenced.",
+        "Because no instance/endpoint/issuer label exists (F26), the ~36% is treated as uniform across the service aggregate; a per-instance split cannot be measured and is not claimed as support.",
+        "No unlogged change on an implicit dependency (secrets manager / mesh / JWKS) occurred; F19/F20/F41/F44 show no recorded one, but the change feed is service-scoped only."
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Scheduled signing-key rotation (cfg-2705) published a new key_id before all validators/consumers adopted it",
+      "statement": "security-automation rotated jwt.signing.key_id from 'k-2025-10' to 'k-2026-04' at 14:01:00Z as a single un-staged key assignment on auth-service. A fraction of token validations then resolve the wrong key (or a validator holds/expects the previous key_id), yielding invalid_token for ~1/3 of validations, one minute before the 14:02:00Z error step. This matches the HIST-108 precedent (lead only). The hypothesis carries an unresolved internal weakness: a key-propagation race should converge as validators reload, yet the error is a flat 35-39% plateau for ~2h with no decay, which requires an unobserved permanently-stalled (or per-pod-frozen) reload.",
+      "category": "config_change",
+      "root_cause_service": "auth-service signing-key configuration / key distribution path",
+      "trigger_change_id": "cfg-2705",
+      "confidence": 0.4,
+      "pre_cap_confidence": 0.4,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-2705, the only config change fleet-wide on 2026-04-15, rotates jwt.signing.key_id k-2025-10 -> k-2026-04 on auth-service at 14:01:00Z; single key-value assignment with no dual-key/grace/overlap field; never reverted.",
+          "finding_ids": [
+            "F2",
+            "F14",
+            "F19",
+            "F20",
+            "F35",
+            "F39",
+            "F41",
+            "F43",
+            "F44"
+          ]
+        },
+        {
+          "claim": "The new key_id is live before every validator/consumer has adopted it (or a subset keeps using the old key_id), so those validations resolve the wrong key and return invalid_token.",
+          "finding_ids": []
+        },
+        {
+          "claim": "If the keys are resolved per-pod (HIST-108-style JWKS reload), only lagging pods would fail - but the plateau is flat, so any such partition must be frozen for ~2h.",
+          "finding_ids": [
+            "F8",
+            "F17",
+            "F28"
+          ]
+        },
+        {
+          "claim": "auth-service error_rate steps to ~36% at 14:02:00Z, 1 minute after the rotation, with unchanged throughput/latency/resources, and holds through 15:59Z.",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F9",
+            "F10",
+            "F15",
+            "F27",
+            "F29"
+          ]
+        },
+        {
+          "claim": "api-gateway, the caller, inherits a contemporaneous ~21% error plateau.",
+          "finding_ids": [
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2",
+        "F14",
+        "F15",
+        "F19",
+        "F35",
+        "F39",
+        "F41",
+        "F7",
+        "F8",
+        "F17",
+        "F11",
+        "F18"
+      ],
+      "contradicting_evidence": [
+        "F8",
+        "F17",
+        "F28",
+        "F26",
+        "F36",
+        "F45"
+      ],
+      "assumptions": [
+        "The rotation was not staged/dual-key: F35 shows no grace/overlap field, but F35/F43/F47 concede the record is silent in both directions, so 'single hard cutover' is NOT established.",
+        "Whether auth-service reads the key from one shared source or per-pod JWKS is unknown (F43/F45/F47); the mechanism requires per-pod or partially-updated resolution, which no source confirms.",
+        "The ~36% cut is defined by key_id/issuance epoch relative to 14:01:00Z; this is unmeasured - F26 shows only a fleet-aggregate series with no issuer/key/instance dimension, so '~1/3 of tokens' is an inference from one number.",
+        "An unobserved mechanism keeps a propagation race permanently non-convergent (no finding supports a stalled reload).",
+        "HIST-108 is a lead only (F46): its one-line resolution does not establish the key-loading model for this incident."
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H4",
+      "title": "Bad/partial auth-service pod subset (crash-looping or hung instances) fails a fraction of calls",
+      "statement": "A subset of auth-service instances is unhealthy - crash-looping, hung, or not fully rolled out - so a fraction of requests land on an instance that returns 401/errors while healthy instances serve the rest. NOT closed out: F26 shows no instance/pod dimension exists, so a uniform-vs-split partition cannot be measured, and F31 + the tool log show the 'restarts' metric and the auth-service ERROR log query both failed with backend 503, so restart counts are unknown.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "auth-service instances (pods) / rollout state",
+      "trigger_change_id": "dep-5710",
+      "confidence": 0.06,
+      "pre_cap_confidence": 0.06,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5710 rolls out at 14:00:00Z as a single whole-service event with no canary/stage/rollout-percentage metadata and no rollback.",
+          "finding_ids": [
+            "F1",
+            "F13",
+            "F32",
+            "F37",
+            "F38",
+            "F40"
+          ]
+        },
+        {
+          "claim": "A subset of instances is unhealthy (crash-loop/hung/unmigrated) and returns errors for the traffic it serves.",
+          "finding_ids": []
+        },
+        {
+          "claim": "Service-level CPU (~38%) and memory (~52%) are flat across onset, arguing against resource pressure or OOM-driven restarts at the aggregate level.",
+          "finding_ids": [
+            "F29",
+            "F10",
+            "F9"
+          ]
+        },
+        {
+          "claim": "Restart counts and pod-level state are UNKNOWN because the 'restarts' metric query returned 503 and no instance label exists, so a crash-looping subset is not excluded.",
+          "finding_ids": [
+            "F26",
+            "F31"
+          ]
+        },
+        {
+          "claim": "api-gateway sees a contemporaneous elevated error plateau, consistent with a fraction of auth calls failing.",
+          "finding_ids": [
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F13",
+        "F7",
+        "F8",
+        "F31"
+      ],
+      "contradicting_evidence": [
+        "F9",
+        "F10",
+        "F17",
+        "F29",
+        "F30",
+        "F26"
+      ],
+      "assumptions": [
+        "The failing instances return 401/5xx without adding p99 latency or reducing throughput - hard to reconcile with a crash loop, which is why this stays low-probability.",
+        "Per-instance error data would be needed to confirm; F26 shows such a dimension does not exist in this backend, making this hypothesis close to unfalsifiable rather than merely untested."
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H3",
+      "title": "Clock skew / NTP drift or expired certificate makes a fraction of tokens appear expired/unverifiable",
+      "statement": "A clock source drifted or a certificate in the validation path expired, so a subset of token validations fail on expiry/verification checks independent of the two auth-service changes.",
+      "category": "infrastructure_failure",
+      "root_cause_service": "auth-service hosts / platform clock (NTP) or TLS certificate in the validation path",
+      "trigger_change_id": "null",
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "A time source or certificate degrades so a fraction of tokens appear expired or unverifiable.",
+          "finding_ids": []
+        },
+        {
+          "claim": "auth-service error_rate steps to ~36% at 14:02:00Z and plateaus to 15:59Z.",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F28"
+          ]
+        },
+        {
+          "claim": "api-gateway inherits elevated errors in the same window.",
+          "finding_ids": [
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F7",
+        "F8"
+      ],
+      "contradicting_evidence": [
+        "F1",
+        "F2",
+        "F13",
+        "F14",
+        "F15",
+        "F17",
+        "F9",
+        "F10",
+        "F29"
+      ],
+      "assumptions": [
+        "A clock/cert fault would coincidentally produce a clean single-minute step at 14:02:00Z, 1-2 minutes after the only two fleet changes of the day (implausible).",
+        "No change or telemetry record for a clock/cert fault exists anywhere in the window (F19, F20, F41, F44)."
+      ],
+      "rejection_reason": "null"
+    },
+    {
+      "rank": 5,
+      "hypothesis_id": "H5",
+      "title": "Reporter's framing: the 36% error rate is partly an artifact of the identity-namespace log-pipeline outage",
+      "statement": "The down log pipeline in the identity namespace distorted error reporting or traffic accounting, so the measured 36% 401 rate overstates or mis-attributes the real user-facing impact. Rejected: the decisive counter-evidence is NOT metric self-consistency (the same backend returned 503s and has no instance dimension) but the INDEPENDENT caller-side series: api-gateway, which had zero deployments and zero config changes all day, shows its own ~21% error plateau starting in the same 13:54-14:03Z bucket. A log-pipeline artifact in the identity namespace cannot manufacture a synchronized error step in an unchanged, independently-instrumented caller.",
+      "category": "unknown",
+      "root_cause_service": "observability / log pipeline (identity namespace)",
+      "trigger_change_id": "null",
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "identity-namespace log pipeline down since morning, so auth-service logs are unsearchable and log queries return 503.",
+          "finding_ids": [
+            "F31"
+          ]
+        },
+        {
+          "claim": "The reported 36% and api-gateway's ~21% both derive from the same metric backend.",
+          "finding_ids": [
+            "F7",
+            "F8",
+            "F11"
+          ]
+        },
+        {
+          "claim": "Independent caller-side evidence falsifies the artifact reading: api-gateway was unchanged all day (zero deploys, zero config changes) yet shows a contemporaneous ~21% error plateau.",
+          "finding_ids": [
+            "F5",
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F5",
+        "F9",
+        "F11",
+        "F26"
+      ],
+      "assumptions": [
+        "None material; the only residual is that the metric backend itself could be globally wrong, which would still not explain api-gateway's independent plateau being time-aligned with auth-service's."
+      ],
+      "rejection_reason": "Falsified by the independent caller-side series: api-gateway had zero deployments and zero config changes on 2026-04-15 (F5) yet shows its own ~21% error plateau in the same 13:54-14:03Z bucket as auth-service's step (F11). Throughput (F9) and latency are unchanged, so there is no traffic-accounting distortion. This is a genuine, caller-observable fault, not a log-pipeline reporting artifact."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "auth-service error_rate stepped from a ~0.2% baseline to ~36% in a single minute at 2026-04-15T14:02:00Z (14:00=0.26%, 14:01=0.16%, 14:02=36.08%, 14:03=38.34%).",
+      "finding_ids": [
+        "F7",
+        "F27"
+      ]
+    },
+    {
+      "statement": "The elevated error rate is a persistent, flat plateau ~35-39% from 14:02Z through the latest data (15:56Z, last 36.53%, max 40.33% at 15:08Z), with no decay and no second step.",
+      "finding_ids": [
+        "F8",
+        "F28"
+      ]
+    },
+    {
+      "statement": "auth-service throughput is unaffected across onset: request_rate stays ~390-417 req/s before and after (13:56=390.51, 14:00=400.07, 14:04=404.31, 15:56=408.9).",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "auth-service latency_p99_ms shows no change at onset, steady ~86-95 ms across 13:50-14:12.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "api-gateway, a caller of auth-service, shows a contemporaneous elevated error_rate plateau of ~21% (13:54 bucket avg=2.51 max=20.72, 14:03=21.21, sustained ~20.7-21.4% through 15:51), with onset in the same 13:54-14:03Z bucket as auth-service.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "api-gateway had zero deployments and zero config changes between 00:00Z and 15:59Z on 2026-04-15.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "The only deployment anywhere in the fleet in the window is auth-service dep-5710 v7.3.0 at 2026-04-15T14:00:00Z, summarised as 'Upgrade JWT library to 4.x; refactor token validation' with changes 'jjwt 0.11 -> 0.12 (breaking parser API)' and 'TokenValidator rewritten'; status 'live', rolled_back_at null.",
+      "finding_ids": [
+        "F1",
+        "F13",
+        "F22",
+        "F32",
+        "F37",
+        "F40"
+      ]
+    },
+    {
+      "statement": "The only config change in the window is auth-service cfg-2705: jwt.signing.key_id rotated from 'k-2025-10' to 'k-2026-04' at 2026-04-15T14:01:00Z by author 'security-automation', description 'Scheduled signing-key rotation'; it was not reverted.",
+      "finding_ids": [
+        "F2",
+        "F14",
+        "F19",
+        "F20",
+        "F39",
+        "F41"
+      ]
+    },
+    {
+      "statement": "The deploy's metadata is internally contradictory about the JWT library version (summary 'JWT library to 4.x' vs change list 'jjwt 0.11 -> 0.12'); no version, dependency lock or diff is present, so the deployed jjwt version is not resolvable.",
+      "finding_ids": [
+        "F16",
+        "F33"
+      ]
+    },
+    {
+      "statement": "The TokenValidator rewrite is captured only as the one-line string 'TokenValidator rewritten'; no diff, config values, or clock-skew/TTL/claim-strictness defaults are exposed.",
+      "finding_ids": [
+        "F34"
+      ]
+    },
+    {
+      "statement": "cfg-2705 is recorded as a single key-value assignment with no second key entry, no 'previous key retained', no overlap/grace-period field, and no reload/JWKS-source setting.",
+      "finding_ids": [
+        "F35",
+        "F43"
+      ]
+    },
+    {
+      "statement": "No source (cfg-2705 record, the config store service-scoped 2025-01-01 to 2026-04-15 or fleet-wide 2025-10-01 to 2026-04-15, or the dependency graph) exposes auth-service's key-loading topology (shared single source vs per-pod JWKS).",
+      "finding_ids": [
+        "F43",
+        "F44",
+        "F45"
+      ]
+    },
+    {
+      "statement": "The dependency graph contains no key-store/JWKS, secrets-manager, config-service or service-mesh node; auth-service's downstream nodes are only user-db (postgres), redis-cache (redis, shared) and kyc-provider (external, has_telemetry=false).",
+      "finding_ids": [
+        "F24",
+        "F36",
+        "F45"
+      ]
+    },
+    {
+      "statement": "redis-cache is the single SHARED component in auth-service's neighbourhood (also used by portfolio-service, pricing-engine, market-data-service); a redis-cache-scoped config-change query for 13:30-15:59Z returned count=0.",
+      "finding_ids": [
+        "F4",
+        "F21",
+        "F23"
+      ]
+    },
+    {
+      "statement": "auth-service resource metrics are flat across onset: cpu_pct ~37-39% and memory_pct ~50-53%, with no step at 14:02 or ramp.",
+      "finding_ids": [
+        "F29"
+      ]
+    },
+    {
+      "statement": "auth-service rate_limited_per_min is flat and low across the window (2.15 at 13:50, 2.33 at 14:02, 2.1 at 15:56; mean 2.02), so no throttling surge accompanies the step.",
+      "finding_ids": [
+        "F30"
+      ]
+    },
+    {
+      "statement": "auth-service's available_metrics expose no instance/pod, endpoint or token-issuer dimension; every query returns a single fleet-aggregate series.",
+      "finding_ids": [
+        "F26"
+      ]
+    },
+    {
+      "statement": "The restart metric query ('restart_count') failed as not_found and the follow-up 'restarts' query and the auth-service ERROR log query both failed with backend unavailable (503); restart counts and a log-based 401 breakdown were not obtained.",
+      "finding_ids": [
+        "F31"
+      ]
+    },
+    {
+      "statement": "Neither change was ever reverted: dep-5710 is still status 'live' with rolled_back_at null as of 15:59Z, and no k-2026-04 -> k-2025-10 revert record exists, so no post-revert error_rate series exists in the window and the single-change rollback experiment was not run.",
+      "finding_ids": [
+        "F38",
+        "F39",
+        "F40",
+        "F41"
+      ]
+    },
+    {
+      "statement": "Historical precedents are leads only: HIST-108 (2025-10-01) '401s after JWT signing key rotation', root cause 'Key rotation published new key id before all pods loaded the JWKS', resolved by re-publishing the previous key and staging the rotation; HIST-109 (2025-07-11) 'Token validation regression after auth library upgrade', root cause 'JWT library upgrade changed clock-skew default', resolved by rollback/pinning skew.",
+      "finding_ids": [
+        "F46"
+      ]
+    },
+    {
+      "statement": "HIST-108's resolution text is a one-liner that does not state the key-loading model or whether the rotation was a hard swap, so it is consistent with either per-pod JWKS or a staged shared rotation.",
+      "finding_ids": [
+        "F46"
+      ]
+    },
+    {
+      "statement": "Only one deployment and one config change occurred during the incident window; the sole other fleet deployment all day was market-data-service dep-5699 v5.0.3 at 11:35Z ('Fix symbol mapping'), outside the identity path.",
+      "finding_ids": [
+        "F3",
+        "F22",
+        "F37"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The deployed jjwt version is unknown (F33: summary says '4.x', change list says '0.12'); H1 only requires that parser semantics changed materially, which both strings assert.",
+    "The TokenValidator rewrite's behavioural delta is unknown (F34: one-line string only); the 'inverts a class of valid tokens' hop is assumed, not evidenced.",
+    "Because no instance/endpoint/issuer label exists (F26), the ~36% is treated as a uniform service aggregate; the '~1/3 of tokens fail' framing is an inference from one number and is not used as evidence for either H1 or H2.",
+    "Whether auth-service reads the signing key from one shared source or per-pod JWKS is unknown (F43/F45/F47), so H2's required propagation mechanism can be neither confirmed nor excluded; 'single hard cutover' is not established.",
+    "An unobserved mechanism would be needed to keep a key-propagation race permanently non-convergent; no finding supports a stalled or frozen reload.",
+    "No unlogged change on an implicit dependency (secrets manager / service mesh / JWKS) occurred; F19/F20/F41/F44/F48 show no recorded one, but the change feed is service-scoped only.",
+    "HIST-108 and HIST-109 are leads only and do not establish the key-loading model or the parser semantics for this incident.",
+    "'Healthy metrics' claims rest on single series from a backend that returned 503s for some queries, so they should be read as 'no evidence of a load/resource cause' rather than 'excluded'.",
+    "The reported symptoms (401 invalid_token at 36%) accurately describe the fault; the error string itself could not be confirmed from logs.",
+    "(demoted from facts: no verified observation backs it) Ordering against the confirmed onset: deploy 14:00:00Z then key rotation 14:01:00Z then error step at 14:02:00Z, leaving a 1-2 minute gap between each change and the step; both changes are plausible causal candidates."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-15T00:00:00Z",
+      "event": "Start of the day-wide change sweep window; fleet-wide config query for 00:00-15:59Z returns exactly one record (cfg-2705), i.e. no second credential/secret change anywhere before onset.",
+      "finding_ids": [
+        "F20"
+      ]
+    },
+    {
+      "time": "2026-04-15T11:35:00Z",
+      "event": "Only other fleet deployment all day: market-data-service dep-5699 v5.0.3 ('Fix symbol mapping'), outside the identity path.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-04-15T13:50:00Z",
+      "event": "Steady-state baseline: auth-service error_rate ~0.2%, request_rate ~390-417 req/s, p99 ~86-95 ms, cpu ~38%, memory ~51%, rate_limited ~2/min.",
+      "finding_ids": [
+        "F7",
+        "F9",
+        "F10",
+        "F29",
+        "F30"
+      ]
+    },
+    {
+      "time": "2026-04-15T13:54:00Z",
+      "event": "api-gateway error_rate begins rising (13:54 bucket avg=2.51, max=20.72), the same broad bucket as auth-service's later step.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:00:00Z",
+      "event": "auth-service dep-5710 v7.3.0 goes live ('Upgrade JWT library to 4.x; refactor token validation'; changes 'jjwt 0.11 -> 0.12 (breaking parser API)' and 'TokenValidator rewritten'), status 'live', no canary/rollout metadata, never rolled back.",
+      "finding_ids": [
+        "F1",
+        "F13",
+        "F22",
+        "F32",
+        "F33",
+        "F34"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:01:00Z",
+      "event": "cfg-2705 by 'security-automation' rotates jwt.signing.key_id from 'k-2025-10' to 'k-2026-04'; recorded as a single un-staged assignment with no grace/overlap or reload/JWKS-source field.",
+      "finding_ids": [
+        "F2",
+        "F14",
+        "F35"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:02:00Z",
+      "event": "auth-service error_rate steps from 0.16% (14:01) to 36.08% (14:02), reaching 38.34% at 14:03, with throughput, p99 latency, cpu, memory and rate-limit all unchanged.",
+      "finding_ids": [
+        "F7",
+        "F9",
+        "F10",
+        "F29",
+        "F30"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:03:00Z",
+      "event": "api-gateway error_rate plateau confirmed at ~21% (14:03=21.21, sustained ~20.7-21.4% through 15:51) despite zero api-gateway deployments or config changes all day.",
+      "finding_ids": [
+        "F5",
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:12:00Z",
+      "event": "Incident INC-007 reported (SEV-1): users logged out / 401 invalid_token on ~1/3 of validations; identity-namespace log pipeline already down, so auth-service logs unsearchable.",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-04-15T15:08:00Z",
+      "event": "Maximum observed error_rate in the plateau: 40.33%.",
+      "finding_ids": [
+        "F8",
+        "F28"
+      ]
+    },
+    {
+      "time": "2026-04-15T15:56:00Z",
+      "event": "Latest auth-service data: error_rate still 36.53%, request_rate 408.9 req/s - a flat ~2h plateau with no decay or recovery.",
+      "finding_ids": [
+        "F8",
+        "F9",
+        "F28"
+      ]
+    },
+    {
+      "time": "2026-04-15T15:59:00Z",
+      "event": "Decisive re-checks: dep-5710 still 'live' with rolled_back_at null and no revert of cfg-2705 anywhere in the fleet; no post-revert error series exists, so the single-change rollback test remains untested.",
+      "finding_ids": [
+        "F38",
+        "F39",
+        "F40",
+        "F41",
+        "F42"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Immediate mitigation (safe, change-free): if a partial mitigation is needed while tests run, keep dep-5710 live as-is and page the auth-service on-call to prepare the rollback; do NOT make any additional auth-service config change, since adding a second change now would destroy the ability to attribute the fault.",
+      "priority": "immediate",
+      "rationale": "Both candidate changes are still live and unattributed (F38, F39); a third change would confound the only remaining discriminator and, with auth-service logs unsearchable (F31), there is no way to trace it afterward.",
+      "finding_ids": [
+        "F38",
+        "F39",
+        "F31"
+      ],
+      "hypothesis_id": null
+    },
+    {
+      "action": "Immediate discriminating test #1 (the single decisive runnable test): roll back ONLY dep-5710 (auth-service, revert to the pre-7.3.0 build, previously live at 14:00:00Z) and watch auth-service error_rate for 10-15 minutes. If the ~36% plateau collapses toward the ~0.2% baseline, H1 is the root cause.",
+      "priority": "immediate",
+      "rationale": "H1 is the marginally better fit on shape - a flat, non-converging ~2h plateau with flat throughput/latency fits a deterministic code-level validation fault better than a propagation race that should converge (F8, F17, F28). Neither change has ever been reverted, so this test has never been run and no post-revert error series exists (F38, F40, F42).",
+      "finding_ids": [
+        "F8",
+        "F17",
+        "F28",
+        "F38",
+        "F40",
+        "F42"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Immediate discriminating test #2 (only if error_rate does NOT recover after reverting dep-5710): revert cfg-2705 by re-publishing jwt.signing.key_id 'k-2025-10' (and re-publishing the previous signing key so all validators can load it) and watch auth-service error_rate for 10-15 minutes. Recovery here confirms H2.",
+      "priority": "immediate",
+      "rationale": "No revert/re-publish of jwt.signing.key_id exists anywhere in the fleet and no graceful overlap or previous-key retention is recorded (F35, F39, F41, F43), so the HIST-108 failure mode (new key_id published before all pods loaded the JWKS) is untested for this incident (F6, F46, F47).",
+      "finding_ids": [
+        "F35",
+        "F39",
+        "F41",
+        "F43",
+        "F46",
+        "F47"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Immediate instrumentation to make the tests conclusive: capture auth-service error/401 counts and restart counts during and after each rollback (retry the 'restarts' metric and the auth-service ERROR log query when the backend is available), and separately restore/reroute the identity-namespace log pipeline (the pre-existing separate ticket) so the 401 verdict text can be read.",
+      "priority": "immediate",
+      "rationale": "The 'restarts' metric and the auth-service ERROR log query both failed with 503, so restart counts and the exact 401 error string were never obtained (F31); logs are the cheapest way to see whether failures say 'unknown key' (H2) versus expiry/claim-parse (H1).",
+      "finding_ids": [
+        "F31"
+      ],
+      "hypothesis_id": "null"
+    },
+    {
+      "action": "Short-term: once the offending change is identified and reverted, run a staged, single-variable re-application - deploy the TokenValidator/jjwt change alone (with a pinned, explicit library version and recorded clock-skew/TTL/claim-strictness defaults) and then the key rotation alone as a dual-key/staged rotation with the previous key retained - and verify error_rate stays at baseline after each step.",
+      "priority": "short_term",
+      "rationale": "The deploy metadata contradicts itself on the library version and exposes no diff or defaults (F33, F34), and cfg-2705 has no overlap/grace/previous-key field (F35), so neither change can currently be re-applied safely. This also supplies the per-change attribution that the metric backend cannot (F26).",
+      "finding_ids": [
+        "F26",
+        "F33",
+        "F34",
+        "F35"
+      ],
+      "hypothesis_id": "null"
+    },
+    {
+      "action": "Short-term: add per-instance/pod, per-endpoint and per-token-issuer label dimensions to auth-service metrics, and add a deployment canary/rollout-percentage and rollback field, so a uniform-vs-split error partition is measurable in future.",
+      "priority": "short_term",
+      "rationale": "The metric backend exposes only fleet-aggregate series with no instance, endpoint or issuer dimension (F26), so the H1-predicts-uniform vs H2-predicts-per-key-epoch-split test cannot be run at all; deployment records also lack canary/rollout granularity (F32).",
+      "finding_ids": [
+        "F26",
+        "F32"
+      ],
+      "hypothesis_id": "null"
+    },
+    {
+      "action": "Long-term: make signing-key rotation staged and dual-key by default, with rotation mode, JWKS source and previous-key retention recorded explicitly in the config/change metadata, and make the key-loading topology visible as a first-class dependency node.",
+      "priority": "long_term",
+      "rationale": "No source anywhere - cfg-2705's record, the service-scoped and fleet-wide config store, or the dependency graph - exposes whether the key comes from a shared source or per-pod JWKS, and there is no key-store/JWKS/mesh node in the graph (F35, F43, F44, F45, F47). HIST-108 (F46) shows this ambiguity has already caused one incident.",
+      "finding_ids": [
+        "F35",
+        "F43",
+        "F44",
+        "F45",
+        "F46",
+        "F47"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Long-term: gate JWT-parser/validator upgrades behind a canary with a mandatory recorded dependency lock and diff link, and add an automated post-deploy check that asserts the invalid_token verdict rate, so a parser-semantics change cannot silently invert a token class.",
+      "priority": "long_term",
+      "rationale": "The TokenValidator change is evidenced only by two one-line strings with a self-contradictory library version (F16, F33, F34), and the resulting 36% wrong-verdict rate ran ~2h with no rollback (F8, F38) - exactly the HIST-109 failure mode (F6).",
+      "finding_ids": [
+        "F8",
+        "F16",
+        "F33",
+        "F34",
+        "F38",
+        "F6"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Long-term: close the observability gap that blocked this investigation - restore and monitor the identity-namespace log pipeline, and add a redundancy/fallback path so a single metric-backend 503 cannot blind an incident.",
+      "priority": "long_term",
+      "rationale": "The identity-namespace log pipeline was already down at report time and the metric backend returned 503 for the 'restarts' query and the auth-service ERROR log query (F31), preventing log-based attribution between the two candidate changes.",
+      "finding_ids": [
+        "F31"
+      ],
+      "hypothesis_id": "null"
+    }
+  ],
+  "data_gaps": [
+    "auth-service logs are unsearchable (identity-namespace log pipeline down since the morning), so the 401 verdicts could not be traced to a failing key/credential lookup or to a claim/clock check - this is the single most useful missing artifact for separating H2 from H1.",
+    "The metric backend exposes no instance/pod, endpoint or token-issuer label dimension (F26), so the uniform-vs-split partition (H1 predicts uniform; H2 predicts a split by key epoch or by reloaded pods) cannot be measured at all - the decisive test is unreachable rather than merely unrequested.",
+    "No metadata source exposes the TokenValidator diff, commit/PR body, dependency lock or genuine jjwt version (F33 self-contradictory), nor its clock-skew/TTL/claim-strictness defaults (F34), so H1's mechanism hop cannot be confirmed or refuted.",
+    "No source exposes whether auth-service resolves the signing key from one shared source or per-pod JWKS, nor whether cfg-2705 retained the previous key or was a hard cutover (F35, F43, F44, F45, F47) - so H2's mechanism cannot be confirmed or excluded.",
+    "The single-change rollback experiment (revert cfg-2705 only, or roll back dep-5710 only) was never run and is not runnable with the read-only tooling; neither change was ever reverted (F38-F42), so the discriminating post-revert error series does not exist.",
+    "auth-service restart counts are unknown: the 'restart_count' query failed as not_found and the 'restarts' query failed with 503 (F31), so H4's pod-restart arm is NOT closed out; flat cpu/memory (F29) argues against resource pressure but not against a crash-looping subset.",
+    "The ~36% figure is a fleet-aggregate with no issuer/instance dimension (F26), so the '~1/3 of tokens fail' framing is an inference from one number, not a measured partition, and cannot be used to favor H1 over H2.",
+    "The change feed is service-scoped only and contains no secrets-manager, config-service or service-mesh node (F24, F45); an unlogged/out-of-band credential or policy change is therefore unobservable, though no such change was recorded for 00:00-15:59Z (F19, F20, F41, F44).",
+    "A fleet-wide config query for 2026-03-01 to 2026-04-15 failed twice with 503 (F48), so only a single wide 2025-10-01 to 2026-04-15 window corroborates the count=1 result (F44).",
+    "Upstream callers other than api-gateway (order-service, portfolio-service, pricing-engine, market-data-service, payment-service, settlement-service, exchange-gateway, notification-service) were not individually checked for elevated error_rate, so the full blast radius is unconfirmed beyond api-gateway's ~21% plateau (F11, F12).",
+    "redis-cache runtime telemetry (hit/miss, eviction, failover, replica sync) was not queried; only the absence of a recorded redis-cache config/deploy change is established (F21, F23).",
+    "'Healthy metrics' claims rest on single aggregate series from a backend that returned 503s on several queries (F29, F31), so resource causes are not excluded, only unsupported."
+  ],
+  "what_would_change_the_conclusion": [
+    "Reverting dep-5710 alone and observing auth-service error_rate fall from ~36% back toward the ~0.2% baseline within minutes would establish H1 as the root cause and overturn the inconclusive outcome.",
+    "Reverting cfg-2705 (re-publishing key 'k-2025-10' and the previous signing key) with error_rate recovery while dep-5710 stays live would establish H2 as the root cause.",
+    "A per-instance/per-pod error breakdown showing failures concentrated in ~1/3 of instances (rather than uniform across the fleet aggregate) would favor H2's propagation mechanism over H1's deterministic code fault.",
+    "A per-token-issuer or issuance-epoch breakdown showing failures clustered around the 14:01Z key rotation would favor H2; a break confined to a token class independent of issuance time would favor H1.",
+    "Log evidence showing 'unknown key'/'signature verification failed' style verdicts would favor H2, whereas 'expired'/'claim parse' verdicts would favor H1 - currently unobtainable because the auth-service log query returns 503.",
+    "Evidence of a deliberately stalled or permanently frozen key reload (or a JWKS source shared by all pods, which would make a partial-propagation race impossible) would decisively move the ranking between H2 and H1.",
+    "Recovery of dep-5710's diff or dependency lock showing no semantic change to clock-skew/TTL/claim-strictness would weaken H1; showing a changed clock-skew or strictness default would strongly support H1 (the HIST-109 mechanism).",
+    "A discovered unlogged change on an implicit dependency (secrets manager, service mesh/policy, or JWKS endpoint) contemporaneous with 14:01-14:02Z would introduce a third candidate and invalidate the two-change attribution.",
+    "Evidence that the 14:02Z step is an artifact of the metric backend itself (e.g. a known backend-wide miscalculation spanning the window) would undercut the localization, though it would still have to explain api-gateway's independent ~21% plateau.",
+    "Per-instance restart data showing a crash-looping or hung pod subset would revive H4, especially if the failing instances also account for the ~36% share of traffic."
+  ],
+  "findings": [
+    {
+      "statement": "A single auth-service deployment, dep-5710 v7.3.0, went live at 2026-04-15T14:00:00Z, described as 'Upgrade JWT library to 4.x; refactor token validation' with changes 'jjwt 0.11 -> 0.12 (breaking parser API)' and 'TokenValidator rewritten'; status still 'live', never rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "dep-5710"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "jjwt 0.11 -> 0.12 (breaking parser API)"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"deployed_at\":\"2026-04-15T11:35:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F1",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "One config change hit auth-service at 2026-04-15T14:01:00Z: jwt.signing.key_id rotated from 'k-2025-10' to 'k-2026-04' by author 'security-automation', described as a 'Scheduled signing-key rotation'. It was not reverted.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "jwt.signing.key_id"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "k-2025-10"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "k-2026-04"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F2",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Both auth-service changes (deploy 14:00Z, key rotation 14:01Z) occurred within the ~11 minutes before the 14:12Z incident report; no other service changed in the 00:00–15:59Z window besides market-data-service dep-5699 v5.0.3 at 11:35Z ('Fix symbol mapping'), which is outside the identity path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "dep-5699"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"count\":2"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\""
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F3",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service dependency graph: it calls user-db (postgres), redis-cache (cache) and kyc-provider (external, has_telemetry=false), and is called by api-gateway. redis-cache is the one SHARED component, also used by portfolio-service, pricing-engine and market-data-service — a neighbour-induced fault could reach auth-service via that cache.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "\"from\":\"auth-service\",\"to\":\"user-db\",\"kind\":\"db\""
+        },
+        {
+          "call_id": "tc-005",
+          "quote": "\"from\":\"api-gateway\",\"to\":\"auth-service\",\"kind\":\"http\""
+        },
+        {
+          "call_id": "tc-012",
+          "quote": "\"name\":\"redis-cache\""
+        }
+      ],
+      "services": [
+        "auth-service",
+        "api-gateway",
+        "user-db",
+        "redis-cache",
+        "kyc-provider"
+      ],
+      "time": null,
+      "id": "F4",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "api-gateway (the caller of auth-service) had zero deployments and zero config changes between 00:00Z and 15:59Z on 2026-04-15, ruling it out as a change point in this window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "\"count\":0,\"deployments\":[]"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": null,
+      "id": "F5",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Past incidents matching the same symptom class: HIST-109 (2025-07-11) 'Token validation regression after auth library upgrade' — root cause 'JWT library upgrade changed clock-skew default', resolved by rollback/pinning skew; HIST-108 (2025-10-01) '401s after JWT signing key rotation' — root cause 'Key rotation published new key id before all pods loaded the JWKS', resolved by re-publishing the previous key and staging the rotation. Both are leads only, not evidence about the current incident.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "Token validation regression after auth library upgrade"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "Key rotation published new key id before all pods loaded the JWKS"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F6",
+      "agent": "dependency",
+      "task_id": "T2",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service error_rate jumps from a stable baseline of ~0.2% to ~36% in a single minute at 14:02Z: 14:00=0.26%, 14:01=0.16%, 14:02=36.08%, 14:03=38.34%. So onset is 2026-04-15T14:02:00Z (minute-level; 4-min buckets had made it look like 14:00).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "\"ts\":\"2026-04-15T14:01:00Z\",\"avg\":0.16"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":36.08"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F7",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service error rate stays flat/plateaued at ~35-39% from 14:02Z through the latest data 15:56Z (last value 36.53%, max seen 40.33% at 15:08Z), i.e. a persistent step, not a transient spike.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "\"ts\":\"2026-04-15T15:08:00Z\",\"avg\":37.49,\"max\":40.33"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "\"ts\":\"2026-04-15T15:56:00Z\",\"avg\":36.53"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:56:00Z",
+      "id": "F8",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service throughput is NOT affected: request_rate is unchanged across onset, ~390-417 req/s both before and after (13:56=390.51, 14:00=400.07, 14:04=404.31, ..., 15:56=408.9). The failure is a wrong-verdict rate, not a load/drop in traffic.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"ts\":\"2026-04-15T13:56:00Z\",\"avg\":390.51"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"ts\":\"2026-04-15T14:04:00Z\",\"avg\":404.31"
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "\"ts\":\"2026-04-15T15:56:00Z\",\"avg\":408.9"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F9",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service latency_p99_ms shows NO change at onset: steady ~86-95 ms across 13:50-14:12 (13:56=92.79, 14:01=86.49, 14:02=93.08, 14:03=90.82, 14:12=91.83). The 401/error surge is not accompanied by added latency or timeouts.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "\"ts\":\"2026-04-15T14:01:00Z\",\"avg\":86.49"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":93.08"
+        },
+        {
+          "call_id": "tc-008",
+          "quote": "\"ts\":\"2026-04-15T14:12:00Z\",\"avg\":91.83"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F10",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "api-gateway (a caller of auth-service) shows contemporaneous elevated error_rate: baseline ~0.2-0.25% then rises to a plateau of ~21% (13:54 bucket avg=2.51 max=20.72, 14:03=21.21, sustained ~20.7-21.4% through 15:51). Its onset is within the same 13:54-14:03 bucket as auth-service, i.e. same incident window at coarser 9-min resolution.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "\"ts\":\"2026-04-15T13:54:00Z\",\"avg\":2.51,\"max\":20.72"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "\"ts\":\"2026-04-15T14:03:00Z\",\"avg\":21.21"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-04-15T14:03:00Z",
+      "id": "F11",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The metric backend exposes NO 'web-frontend', 'identity-service' or 'token-service' services; known services are: api-gateway, auth-service, order-service, portfolio-service, pricing-engine, market-data-service, payment-service, settlement-service, notification-service, exchange-gateway, ledger-db, user-db, redis-cache, kafka, exchange-api, bank-partner-api, kyc-provider, email-provider. So candidate upstream callers to check for a 401/error anomaly are among these (e.g. order-service, portfolio-service, pricing-engine, market-data-service, exchange-gateway).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "\"known_services\":[\"api-gateway\",\"auth-service\",\"order-service\",\"portfolio-service\",\"pricing-engine\",\"market-data-service\",\"payment-service\",\"settlement-service\",\"notification-service\",\"exchange-gateway\",\"ledger-db\",\"user-db\",\"redis-cache\",\"kafka\",\"exchange-api\",\"bank-partner-api\",\"kyc-provider\",\"email-provider\"]"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F12",
+      "agent": "observability",
+      "task_id": "T1",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "In the full window 2026-04-15T13:30Z–15:59Z (and, per F3, all of 00:00–15:59Z) the ONLY deployment anywhere in the fleet is auth-service dep-5710 v7.3.0 at 2026-04-15T14:00:00Z, summarised as 'Upgrade JWT library to 4.x; refactor token validation' with changes 'jjwt 0.11 -> 0.12 (breaking parser API)' / 'TokenValidator rewritten'; status 'live', rolled_back_at null. It precedes the metric onset (14:02:00Z) by exactly 2 minutes and was never rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "jjwt 0.11 -> 0.12 (breaking parser API)"
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"deployed_at\":\"2026-04-15T14:00:00Z\""
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F13",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The ONLY config change in 2026-04-15T13:30Z–15:59Z is auth-service cfg-2705: key 'jwt.signing.key_id' rotated from 'k-2025-10' to 'k-2026-04' at 2026-04-15T14:01:00Z by author 'security-automation', description 'Scheduled signing-key rotation'; it is in the identity/token-signing path and also un-reverted. Timing: 1 minute before the 14:02:00Z error step.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "\"key\":\"jwt.signing.key_id\",\"old_value\":\"k-2025-10\",\"new_value\":\"k-2026-04\",\"changed_at\":\"2026-04-15T14:01:00Z\""
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "Scheduled signing-key rotation"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F14",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Ordering against the confirmed onset: deploy 14:00:00Z → key rotation 14:01:00Z → error_rate step 14:02:00Z (0.16% at 14:01 to 36.08% at 14:02), leaving a 1–2 minute gap between each change and the step. Both changes are therefore plausible causal candidates; the deploy is the one that touches token-validation code (TokenValidator rewritten) and the config change touches the signing key id.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "2026-04-15T14:00:00Z"
+        },
+        {
+          "call_id": "tc-021",
+          "quote": "\"changed_at\":\"2026-04-15T14:01:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F15",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The deploy's own metadata is internally inconsistent about the library version: summary says 'Upgrade JWT library to 4.x' while the change list says 'jjwt 0.11 -> 0.12 (breaking parser API)'. Either way the change is described as a breaking parser API change in the component that produces the invalid_token verdict.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "Upgrade JWT library to 4.x; refactor token validation"
+        },
+        {
+          "call_id": "tc-022",
+          "quote": "jjwt 0.11 -> 0.12 (breaking parser API)"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F16",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Persistence (from T1/F8): the error plateau has held ~35–39% from 14:02Z through 15:56Z (~2 h) with throughput and p99 latency flat, and neither change has been rolled back. This is the signature of a deterministic validation change (code/config) rather than transient load or resource exhaustion, though clock skew / cert expiry cannot be excluded from change data alone.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-022",
+          "quote": "\"status\":\"live\""
+        },
+        {
+          "call_id": "tc-017",
+          "quote": "\"status\":\"live\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F17",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedent (lead only, not evidence about this incident): HIST-108 (2025-10-01, auth-service, symptoms '401 invalid_token','users logged out', category config_change) root cause 'Key rotation published new key id before all pods loaded the JWKS', resolution 'Re-published previous key; staged rotation'; HIST-109 (2025-07-11) root cause 'JWT library upgrade changed clock-skew default', resolution 'Rolled back; pinned skew config'. The two candidate changes here map one-to-one onto those two precedent failure modes.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "Key rotation published new key id before all pods loaded the JWKS"
+        },
+        {
+          "call_id": "tc-020",
+          "quote": "JWT library upgrade changed clock-skew default"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F18",
+      "agent": "dependency",
+      "task_id": "T3",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Config-change sweep over the target window 2026-04-15T13:30Z–15:59Z across ALL services returns exactly one change: cfg-2705 on auth-service, key 'jwt.signing.key_id', old_value 'k-2025-10' → new_value 'k-2026-04', changed_at 2026-04-15T14:01:00Z, author 'security-automation', description 'Scheduled signing-key rotation'. No change is attributed to a secrets manager, config service, service-mesh/policy layer or redis-cache.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-027",
+          "quote": "\"count\":1,\"changes\":[{\"id\":\"cfg-2705\",\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\""
+        },
+        {
+          "call_id": "tc-027",
+          "quote": "\"scope\":\"all services\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F19",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Widening the config-change window to the whole day 2026-04-15T00:00Z–15:59Z across all services still returns count=1 and the same single auth-service record (cfg-2705), i.e. there is no second, unlogged credential/secret change anywhere in the fleet before the 14:02Z onset.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-035",
+          "quote": "\"count\":1,\"changes\":[{\"id\":\"cfg-2705\""
+        },
+        {
+          "call_id": "tc-035",
+          "quote": "\"scope\":\"all services\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T00:00:00Z",
+      "id": "F20",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "A redis-cache-scoped config-change query for 2026-04-15T13:30Z–15:59Z returns count=0, i.e. no recorded configuration/state transition on the shared cache that could explain a fraction of token lookups failing.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-028",
+          "quote": "\"count\":0,\"changes\":[],\"scope\":\"redis-cache\""
+        }
+      ],
+      "services": [
+        "redis-cache"
+      ],
+      "time": "2026-04-15T13:30:00Z",
+      "id": "F21",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Deployment sweep for 2026-04-15T13:30Z–15:59Z across all services returns exactly one deployment: dep-5710 auth-service v7.3.0 at 14:00:00Z by d.verma, status 'live', rolled_back_at null; no mesh/policy or infrastructure deployment appears.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-029",
+          "quote": "\"count\":1,\"deployments\":[{\"id\":\"dep-5710\",\"service\":\"auth-service\",\"version\":\"v7.3.0\",\"deployed_at\":\"2026-04-15T14:00:00Z\""
+        },
+        {
+          "call_id": "tc-029",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F22",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "redis-cache is type 'redis', owner 'platform', has_telemetry true, and \"shared\": true; auth-service → redis-cache (kind cache) is one of four cache edges into it (also portfolio-service, pricing-engine, market-data-service). REPEAT-WITHOUT-CONTRADICTION with F4: it is the single SHARED component in auth-service's neighbourhood, so it is the only route by which a neighbour could induce auth-service 401s.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-030",
+          "quote": "\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "{\"from\":\"auth-service\",\"to\":\"redis-cache\",\"kind\":\"cache\"}"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "redis-cache"
+      ],
+      "time": null,
+      "id": "F23",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service's downstream node set is exactly {user-db (postgres), redis-cache (redis, shared), kyc-provider (external, has_telemetry=false)} — no secrets-manager, config-service or service-mesh node exists in the graph, so those implicit dependencies could not be observed as change nodes by the earlier sweep. Its own node is 'shared': false, has_telemetry: true.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-037",
+          "quote": "\"name\":\"kyc-provider\",\"type\":\"external\",\"owner\":\"vendor\",\"has_telemetry\":false"
+        },
+        {
+          "call_id": "tc-037",
+          "quote": "\"name\":\"auth-service\",\"type\":\"service\",\"owner\":\"identity\",\"has_telemetry\":true,\"shared\":false"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F24",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical precedents (leads only, NOT evidence about this incident) include a cache-side failure mode that the reported symptom class does not: HIST-107 (2025-12-09, services redis-cache + market-data-service, symptoms 'cache miss storm','quote latency', root cause 'Redis primary failure promoted an empty replica'). Its symptoms differ from the current '401 invalid_token / users logged out', which is consistent with change data showing no redis-cache event.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-038",
+          "quote": "\"id\":\"HIST-107\",\"date\":\"2025-12-09\",\"title\":\"Cold cache storm after redis failover\""
+        },
+        {
+          "call_id": "tc-038",
+          "quote": "\"root_cause\":\"Redis primary failure promoted an empty replica\""
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "market-data-service"
+      ],
+      "time": null,
+      "id": "F25",
+      "agent": "dependency",
+      "task_id": "T6",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service's available_metrics are cpu_pct, error_rate, latency_p99_ms, memory_pct, rate_limited_per_min, request_rate, restarts. There is NO instance/pod, endpoint, or token-issuer label/dimension exposed — every query returns a single fleet-aggregate series, so the per-instance/per-endpoint breakdown requested by T4 cannot be produced from this backend.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "\"available_metrics\":[\"cpu_pct\",\"error_rate\",\"latency_p99_ms\",\"memory_pct\",\"rate_limited_per_min\",\"request_rate\",\"restarts\"]"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "\"available_metrics\":[\"cpu_pct\",\"error_rate\",\"latency_p99_ms\",\"memory_pct\",\"rate_limited_per_min\",\"request_rate\",\"restarts\"]"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F26",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service error_rate (metric 'error_rate', unit '% of requests (HTTP 5xx)') over 13:50Z–15:59Z at 3-min resolution shows a single step at the 14:02Z bucket: 13:50=0.19, 13:53=0.24, 13:56=0.29, 13:59=0.21, then 14:02=36.88 avg / 38.34 max, and a flat plateau thereafter through 15:59 (avg per bucket 34.8–38.2, overall summary mean 32.85, max 40.33 at 15:08). The elevated level is uniform/sustained across the whole service aggregate, not intermittent.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-023",
+          "quote": "{\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":36.88,\"max\":38.34}"
+        },
+        {
+          "call_id": "tc-023",
+          "quote": "\"summary\":{\"min\":0.16,\"max\":40.33,\"mean\":32.85"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F27",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Coarse 30-min buckets confirm a stable plateau, not a ramp: 14:00 bucket avg=33.87 max=38.53, 14:30 avg=36.03 max=39.75, 15:00 avg=36.18 max=40.33, 15:30 avg=36.20 max=39.61 (30-min summary mean 35.57). No decay, no second step, no recovery within the window — consistent with a deterministic, persistent validation change rather than load/resource exhaustion.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-045",
+          "quote": "{\"ts\":\"2026-04-15T15:00:00Z\",\"avg\":36.18,\"max\":40.33}"
+        },
+        {
+          "call_id": "tc-045",
+          "quote": "\"summary\":{\"min\":0.16,\"max\":40.33,\"mean\":35.57"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F28",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service resource metrics are HEALTHY and unchanged across the onset (closes out H4's resource-exhaustion arm): cpu_pct (unit '%') is flat ~37–39% (13:56=38.65, 14:02=38.81, 14:14=39.23, 15:56=38.26; window min 34.24 max 42.31 mean 38.15) and memory_pct is flat ~50–53% (13:56=51.04, 14:02=52.94, 15:56=50.24; window min 46.89 max 57.82 mean 51.73). Neither shows a step at 14:02 or any ramp.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-024",
+          "quote": "{\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":38.81,\"max\":39.45}"
+        },
+        {
+          "call_id": "tc-024",
+          "quote": "\"min\":34.24,\"max\":42.31,\"mean\":38.15"
+        },
+        {
+          "call_id": "tc-025",
+          "quote": "{\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":52.94,\"max\":55.59}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F29",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service rate_limited_per_min is flat and low across the window (unit 'req/min'): 2.15 at 13:50, 2.33 at 14:02, 2.0 at 14:14, 1.74 at 15:50, 2.1 at 15:56; window min 0.96 max 3.23 mean 2.02. No throttling surge accompanies the 401/error step, i.e. the failure is not a rate-limit/backpressure symptom.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-043",
+          "quote": "{\"ts\":\"2026-04-15T14:02:00Z\",\"avg\":2.33,\"max\":3.04}"
+        },
+        {
+          "call_id": "tc-043",
+          "quote": "\"min\":0.96,\"max\":3.23,\"mean\":2.02"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:00Z",
+      "id": "F30",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The restart metric query failed with type 'not_found' for 'restart_count' (the correct metric name is 'restarts'), and my follow-up query for 'restarts' plus the auth-service ERROR log query both failed with backend unavailable (503, gave up after 3 attempts). Therefore auth-service restart_count for 13:50Z–15:59Z is NOT obtained, and the auth-service error/401 counts (as opposed to the error_rate percentage) could not be broken down or quantified.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "service 'auth-service' has no metric 'restart_count'"
+        },
+        {
+          "call_id": "tc-042",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        },
+        {
+          "call_id": "tc-044",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F31",
+      "agent": "observability",
+      "task_id": "T4",
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "dep-5710 (auth-service v7.3.0, 2026-04-15T14:00:00Z, author d.verma) is a single, whole-service deployment event with no canary/partial-rollout fields and no rollback: status 'live', rolled_back_at null. No rollout-percentage, stage, canary or rollback metadata exists on the record.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "\"id\":\"dep-5710\",\"service\":\"auth-service\",\"version\":\"v7.3.0\",\"deployed_at\":\"2026-04-15T14:00:00Z\",\"author\":\"d.verma\""
+        },
+        {
+          "call_id": "tc-031",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F32",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "dep-5710's metadata is internally contradictory about the JWT library version: the summary says 'Upgrade JWT library to 4.x' while the change list says 'jjwt 0.11 -> 0.12 (breaking parser API)'. No version, dependency lock, diff or library field apart from these two strings is present, so the deployed jjwt version is not resolvable from the deploy metadata.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "\"summary\":\"Upgrade JWT library to 4.x; refactor token validation\",\"changes\":[\"jjwt 0.11 -> 0.12 (breaking parser API)\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F33",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The TokenValidator rewrite is captured ONLY as the one-line string 'TokenValidator rewritten'. The change record exposes no diff, no config values, and no clock-skew, TTL or claim-strictness defaults — those semantics are not recoverable from change/PR metadata.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "\"TokenValidator rewritten\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F34",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "cfg-2705 is recorded as a single key-value assignment, not a staged/dual-key rotation: key 'jwt.signing.key_id' changed from 'k-2025-10' to 'k-2026-04' at 2026-04-15T14:01:00Z by 'security-automation', description 'Scheduled signing-key rotation'. There is no second key entry, no 'previous key retained' field, no overlap/grace-period field and no reload/JWKS-source setting (e.g. per-pod JWKS vs shared store) in the record, so single-shared-source vs per-pod-with-independent-reload cannot be determined from it.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-032",
+          "quote": "\"id\":\"cfg-2705\",\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\",\"old_value\":\"k-2025-10\",\"new_value\":\"k-2026-04\",\"changed_at\":\"2026-04-15T14:01:00Z\",\"author\":\"security-automation\",\"description\":\"Scheduled signing-key rotation\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F35",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service's declared dependency node has no 'shared' flag and no key/JWKS-related attribute: {\"name\":\"auth-service\",\"type\":\"service\",\"owner\":\"identity\",\"has_telemetry\":true,\"shared\":false}. The only shared node in its graph is redis-cache, and kyc-provider has has_telemetry=false; no JWKS/key-store component appears as a dependency at all.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-033",
+          "quote": "\"name\":\"auth-service\",\"type\":\"service\",\"owner\":\"identity\",\"has_telemetry\":true,\"shared\":false"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "\"name\":\"redis-cache\",\"type\":\"redis\",\"owner\":\"platform\",\"has_telemetry\":true,\"shared\":true"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "redis-cache"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F36",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The 'all services' scope query for 13:59-15:59Z returns exactly one deployment — dep-5710, auth-service, status 'live', rolled_back_at null — confirming there is no additional auth-service deploy, canary stage or post-14:00Z rollback event anywhere in the fleet in that window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-040",
+          "quote": "\"count\":1,\"deployments\":[{\"id\":\"dep-5710\""
+        },
+        {
+          "call_id": "tc-040",
+          "quote": "\"scope\":\"all services\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F37",
+      "agent": "dependency",
+      "task_id": "T5",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Decisive re-check of dep-5710: as of the latest data (query window 13:30Z-15:59Z, auth-service scope), dep-5710 v7.3.0 (auth-service, deployed 2026-04-15T14:00:00Z, author d.verma) is STILL status 'live' with rolled_back_at: null. The deploy was never rolled back at any point up to 15:59Z, so H1 has not been falsification-tested.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-047",
+          "quote": "\"id\":\"dep-5710\",\"service\":\"auth-service\",\"version\":\"v7.3.0\",\"deployed_at\":\"2026-04-15T14:00:00Z\",\"author\":\"d.verma\""
+        },
+        {
+          "call_id": "tc-047",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:59:00Z",
+      "id": "F38",
+      "agent": "dependency",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Decisive re-check of cfg-2705: the only config change on auth-service in 13:30Z-15:59Z is still cfg-2705, key 'jwt.signing.key_id', old_value 'k-2025-10' -> new_value 'k-2026-04' at 2026-04-15T14:01:00Z by 'security-automation'. There is NO revert/re-publish entry (no k-2026-04 -> k-2025-10 record), so the key rotation was never undone and H2 has not been falsification-tested.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-048",
+          "quote": "\"key\":\"jwt.signing.key_id\",\"old_value\":\"k-2025-10\",\"new_value\":\"k-2026-04\",\"changed_at\":\"2026-04-15T14:01:00Z\""
+        },
+        {
+          "call_id": "tc-048",
+          "quote": "\"count\":1"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F39",
+      "agent": "dependency",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Fleet-wide deployment sweep for the post-onset window 2026-04-15T14:00:00Z-15:59:59Z (all services) returns exactly one deployment — dep-5710 — with scroll/rollback fields unchanged: \"status\":\"live\",\"rolled_back_at\":null. No deployment, and specifically no rollback event, occurred anywhere in the fleet after 14:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-049",
+          "quote": "\"count\":1,\"deployments\":[{\"id\":\"dep-5710\""
+        },
+        {
+          "call_id": "tc-049",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F40",
+      "agent": "dependency",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Fleet-wide config sweep for the same post-onset window (2026-04-15T14:00:00Z-15:59:59Z, all services) returns exactly one change — cfg-2705 — and no revert/re-publish of jwt.signing.key_id, no second key entry, and no other service's config change. So there is no configuration-driven recovery event after 14:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-050",
+          "quote": "\"count\":1,\"changes\":[{\"id\":\"cfg-2705\",\"service\":\"auth-service\""
+        },
+        {
+          "call_id": "tc-050",
+          "quote": "\"new_value\":\"k-2026-04\",\"changed_at\":\"2026-04-15T14:01:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F41",
+      "agent": "dependency",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Because neither single change was reverted, no auth-service error_rate series exists 'in the minutes immediately after a revert' in 14:00Z-15:59Z: the post-onset metric window contains only the one deployment and one config change with unchanged status, so the H1-vs-H2 discriminating measurement is absent from the data rather than showing a null result. Both changes remain live and attributable to the same 14:02Z error step.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-049",
+          "quote": "\"count\":1"
+        },
+        {
+          "call_id": "tc-050",
+          "quote": "\"count\":1"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:59:00Z",
+      "id": "F42",
+      "agent": "dependency",
+      "task_id": "T7",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Exhaustive config-store sweep cannot expose any additional auth-service key or a JWKS/key-source setting: a service-scoped query for auth-service across 2025-01-01→2026-04-15 returns count=1 — only cfg-2705 (key 'jwt.signing.key_id', old 'k-2025-10' → new 'k-2026-04', 2026-04-15T14:01:00Z, author 'security-automation'). No key named e.g. jwks.url, jwt.signing.key_source, jwt.signing.previous_key or reload/grace field exists. So single-shared-source vs per-pod-JWKS is not exposed by cfg-2705 or by any sibling config entry.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-051",
+          "quote": "\"count\":1,\"changes\":[{\"id\":\"cfg-2705\",\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F43",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A fleet-wide config query over the whole 2025-10-01→2026-04-15 window still returns exactly one record, cfg-2705, confirming no other service or hidden config entry (secrets manager, key store, mesh) carries the rotation mode anywhere in the store over ~6.5 months.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-056",
+          "quote": "\"count\":1,\"changes\":[{\"id\":\"cfg-2705\",\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\""
+        }
+      ],
+      "services": [],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F44",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The dependency graph exposes NO key-store/JWKS component and NO key/JWKS-related attribute on any node: auth-service's node is {\"name\":\"auth-service\",\"type\":\"service\",\"owner\":\"identity\",\"has_telemetry\":true,\"shared\":false} and the node set is only api-gateway, auth-service, user-db, redis-cache, kyc-provider. Its downstream edges are auth-service→user-db (db), →redis-cache (cache), →kyc-provider (external). There is no way to read the key-resolution topology from graph attributes either.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-053",
+          "quote": "\"name\":\"auth-service\",\"type\":\"service\",\"owner\":\"identity\",\"has_telemetry\":true,\"shared\":false"
+        },
+        {
+          "call_id": "tc-053",
+          "quote": "{\"from\":\"auth-service\",\"to\":\"user-db\",\"kind\":\"db\"}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F45",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "HIST-108's record confirms the SYMPTOM class and a pod-level propagation root cause but its resolution text is a one-liner that does NOT state the key-loading model or whether the rotation was a hard swap: root_cause 'Key rotation published new key id before all pods loaded the JWKS', resolution 'Re-published previous key; staged rotation'. So the historical note is consistent with either a per-pod JWKS (independent reload) or a staged shared rotation; it does not confirm cfg-2705 retained or dropped the previous key. Treated as a lead only.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-052",
+          "quote": "\"root_cause\":\"Key rotation published new key id before all pods loaded the JWKS\",\"category\":\"config_change\",\"resolution\":\"Re-published previous key; staged rotation\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2025-10-01T00:00:00Z",
+      "id": "F46",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Inference for the hypothesis ledger: because no source (cfg-2705's record, the config store, or the dependency graph) exposes whether auth-service reads the signing key from one shared source or from per-pod JWKS, H2's required mechanism — new key_id published before all validators/pods loaded it — cannot be confirmed OR excluded from change/dependency evidence. H2 also cannot be demoted on the grounds that the key source is shared, since no field asserts that either. If anything, HIST-108 is the only adjacent datapoint and its root cause is explicitly a per-pod JWKS propagation failure.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-051",
+          "quote": "\"key\":\"jwt.signing.key_id\""
+        },
+        {
+          "call_id": "tc-052",
+          "quote": "before all pods loaded the JWKS"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": null,
+      "id": "F47",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Retrieval gap: the fleet-wide config query for 2026-03-01→2026-04-15 (tc-054) and its retry (tc-055) both failed with 'backend unavailable (503) (gave up after 3 attempts)', so a month-by-month cross-check of that shorter window is incomplete; the equivalent 2025-10-01→2026-04-15 sweep (tc-056) succeeded but only as a single wide window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-054",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        },
+        {
+          "call_id": "tc-055",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        }
+      ],
+      "services": [],
+      "time": null,
+      "id": "F48",
+      "agent": "dependency",
+      "task_id": "T8",
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "critic_inconclusive",
+  "stats": {
+    "latency_s": 304.13,
+    "llm_calls": 35,
+    "prompt_tokens": 247909,
+    "completion_tokens": 48117,
+    "total_tokens": 296026,
+    "tool_calls": 56,
+    "tool_attempts": 88,
+    "tool_failures": 13,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 11,
+    "rounds": 3,
+    "tasks": 8,
+    "tasks_failed": 0,
+    "findings": 48,
+    "findings_verified": 48,
+    "usage_by_agent": {
+      "orchestrator": {
+        "calls": 3,
+        "prompt_tokens": 8914,
+        "completion_tokens": 2301
+      },
+      "observability": {
+        "calls": 7,
+        "prompt_tokens": 46252,
+        "completion_tokens": 6977
+      },
+      "dependency": {
+        "calls": 18,
+        "prompt_tokens": 105536,
+        "completion_tokens": 16075
+      },
+      "reasoning": {
+        "calls": 3,
+        "prompt_tokens": 32046,
+        "completion_tokens": 10032
+      },
+      "critic": {
+        "calls": 3,
+        "prompt_tokens": 40461,
+        "completion_tokens": 6184
+      },
+      "reporting": {
+        "calls": 1,
+        "prompt_tokens": 14700,
+        "completion_tokens": 6548
+      }
+    }
+  },
+  "warnings": [
+    "fact demoted to assumption: Ordering against the confirmed onset: deploy 14:00:00Z then key rotation 14:01:0"
+  ]
+}

@@ -1,0 +1,699 @@
+{
+  "incident_id": "INC-012",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Payment failures were a SYMPTOM, not the fault. The shared ledger-db ran out of disk because the inactive replication slot 'analytics_cdc' retained tens of GB of WAL; disk_used_pct grew from 84% (12:00) to 100% (~14:49) and PostgreSQL PANICked writing files at 15:01. This broke all ledger-db writers simultaneously — payment-service ('ledger write failed: ... No space left on device', error_rate 0.23%->61% at 15:00) AND order-service ('INSERT INTO orders failed: No space left on device', 15:00:42), which was untouched by any deploy. The payment-service v6.0.0 deploy at 14:46 is coincidental: disk growth began hours earlier, and the 15:12 rollback did not recover the error rate (still ~61% at 16:50). CPU (~30%), slow queries (~1/min) and connections (~62) were flat; payment-service restarts were 0. Root cause: resource_exhaustion on ledger-db (inactive replication slot retaining WAL), matching historical incident HIST-114. The incident report's guess (bad_deployment) is refuted by timing, scope and the no-recovery rollback.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "ledger-db disk exhaustion from inactive analytics_cdc replication slot retaining WAL",
+      "statement": "The shared ledger-db ran out of disk because the inactive replication slot 'analytics_cdc' retained tens of GB of WAL, growing disk from 84% (12:00) to 100% (~14:49). Once full, PostgreSQL could not write WAL/data files, so every writer (payment-service ledger writes, order-service order inserts, etc.) failed with 'No space left on device'. The fault ORIGINATES in ledger-db / its replication-slot configuration, not in payment-service.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": null,
+      "confidence": 0.9,
+      "pre_cap_confidence": 0.9,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "analytics_cdc replication slot went inactive and stopped advancing the confirmed WAL position",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "slot retained WAL, growing disk_used_pct from 84% to 100% over ~3h",
+          "finding_ids": [
+            "F6",
+            "F7",
+            "F10"
+          ]
+        },
+        {
+          "claim": "disk full -> PostgreSQL PANIC writing pg_wal xlogtemp files",
+          "finding_ids": [
+            "F8"
+          ]
+        },
+        {
+          "claim": "all ledger-db writers fail with 'No space left on device' (payment ledger writes, order inserts)",
+          "finding_ids": [
+            "F1",
+            "F9"
+          ]
+        },
+        {
+          "claim": "payment-service error_rate jumps to ~61% at 15:00 and stays there",
+          "finding_ids": [
+            "F2",
+            "F15"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "F14",
+        "F16"
+      ],
+      "contradicting_evidence": [
+        "F3",
+        "F15"
+      ],
+      "assumptions": [
+        "The analytics_cdc slot was left in place by an analytics/CDC consumer that stopped or was decommissioned",
+        "disk_used_pct reflects /var/lib/postgresql/data volume"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "payment-service v6.0.0 deploy (new MANDATE_HOLD ledger entry type) caused the failures",
+      "statement": "The new mandate flow / new ledger entry type in v6.0.0 introduced a fault that broke ledger writes, producing the payment-service error spike.",
+      "category": "bad_deployment",
+      "root_cause_service": "payment-service",
+      "trigger_change_id": "dep-6203",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F2",
+        "F6",
+        "F9",
+        "F15",
+        "F16"
+      ],
+      "assumptions": [],
+      "rejection_reason": "Timing and scope contradict it: disk on the shared ledger-db was already 84% three hours before the deploy and hit 100% ~before the deploy; the identical error hit order-service (untouched by the deploy) at the same 15:00 onset; error rate did not recover after rollback (still ~61% at 16:50); errors are disk-space errors, not entry-type/schema errors."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "ledger-db CPU or query-load saturation from a new heavy query",
+      "statement": "A new/report query saturated ledger-db CPU or caused slow queries, degrading all writers.",
+      "category": "capacity_saturation",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F11",
+        "F8"
+      ],
+      "assumptions": [],
+      "rejection_reason": "ledger-db cpu_pct stayed flat ~30% (25.73-33.86) and slow_queries_per_min flat ~1/min throughout; the only resource that moved was disk, and the errors are explicitly disk-space errors."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "ledger-db disk filled from 84% (12:00) to 100% (~14:49), hours before the 14:46 deploy.",
+      "finding_ids": [
+        "F6",
+        "F3"
+      ]
+    },
+    {
+      "statement": "ledger-db logs show an inactive replication slot 'analytics_cdc' retaining tens of GB of WAL from 12:19 onward.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "ledger-db PANICked at 15:01 writing pg_wal files due to no space left on device.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "Both payment-service and order-service hit identical 'No space left on device' errors at ~15:00; order-service was unaffected by the deploy.",
+      "finding_ids": [
+        "F1",
+        "F9"
+      ]
+    },
+    {
+      "statement": "payment-service error_rate onset was 15:00 (0.23%->61.35%), later than the 14:46 deploy.",
+      "finding_ids": [
+        "F2",
+        "F3"
+      ]
+    },
+    {
+      "statement": "The 15:12 rollback of v6.0.0 did not restore service; error rate ~61% at 16:50.",
+      "finding_ids": [
+        "F15",
+        "F3"
+      ]
+    },
+    {
+      "statement": "ledger-db CPU, slow-query and connection metrics stayed flat; the only moving resource was disk.",
+      "finding_ids": [
+        "F11",
+        "F12"
+      ]
+    },
+    {
+      "statement": "No config/feature-flag changes occurred in the window.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "HIST-114 (2025-04-18) documents the same ledger-db failure mode: inactive replication slot retaining WAL filling disk.",
+      "finding_ids": [
+        "F14"
+      ]
+    }
+  ],
+  "assumptions": [],
+  "timeline": [
+    {
+      "time": "2026-06-01T12:00:00Z",
+      "event": "ledger-db disk already at 84%; replication_lag ~1.7s",
+      "finding_ids": [
+        "F6",
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-06-01T12:19:34Z",
+      "event": "First ledger-db warning: replication slot 'analytics_cdc' inactive, retaining 63157 MB of WAL",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "time": "2026-06-01T13:10:01Z",
+      "event": "ledger-db disk usage 90%",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:15:45Z",
+      "event": "ledger-db disk usage 95%",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:46:00Z",
+      "event": "payment-service v6.0.0 deployed (dep-6203)",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:48:20Z",
+      "event": "ledger-db disk usage 98%",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-06-01T14:49:00Z",
+      "event": "ledger-db disk reaches 100%",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:00:26Z",
+      "event": "First payment-service 'ledger write failed: No space left on device'",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:00:42Z",
+      "event": "First order-service 'INSERT INTO orders failed: No space left on device'",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:01:01Z",
+      "event": "ledger-db PANIC writing pg_wal/xlogtemp: No space left on device",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-06-01T15:12:00Z",
+      "event": "v6.0.0 rolled back; error rate unchanged (~61%)",
+      "finding_ids": [
+        "F3",
+        "F15"
+      ]
+    },
+    {
+      "time": "2026-06-01T16:59:00Z",
+      "event": "Ledger-db still 100% disk, replication_lag ~5.2s, payment error rate ~61%",
+      "finding_ids": [
+        "F6",
+        "F10",
+        "F15"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Free space on ledger-db immediately: drop/disable the inactive 'analytics_cdc' replication slot (after confirming the CDC consumer is truly decommissioned) to release retained WAL.",
+      "priority": "immediate",
+      "rationale": "Releases tens of GB of retained WAL and restores writes; matches HIST-114 resolution 'Dropped slot'.",
+      "finding_ids": [
+        "F7",
+        "F8",
+        "F14"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "After freeing space, VACUUM/checkpoint so PG recovers; verify disk drops and payment/order write success rates recover.",
+      "priority": "immediate",
+      "rationale": "Confirms the causal chain and service restoration; rollback of v6.0.0 can then be un-done if desired.",
+      "finding_ids": [
+        "F1",
+        "F2",
+        "F9"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add monitoring/alerting on replication-slot inactive time and retained WAL size, and on ledger-db disk growth rate (proactive warning at 80%).",
+      "priority": "short_term",
+      "rationale": "HIST-114 resolution explicitly added a slot-lag alert; disk reached 84% unnoticed for hours.",
+      "finding_ids": [
+        "F6",
+        "F7",
+        "F14"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Automate disk autogrow / WAL-archive alerts and cap WAL retention for unused slots; runbook step to identify long-inactive slots on disk-pressure alerts.",
+      "priority": "long_term",
+      "rationale": "Prevents recurrence of a shared-datastore outage that took down multiple payment/order flows.",
+      "finding_ids": [
+        "F7",
+        "F8"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Do NOT treat this as a v6.0.0 code fault; keep the rollback only if desired but note it did not fix the outage.",
+      "priority": "short_term",
+      "rationale": "Rollback at 15:12 did not recover error rate; misattributing to the deploy delays real remediation.",
+      "finding_ids": [
+        "F15",
+        "F9"
+      ],
+      "hypothesis_id": "H2"
+    }
+  ],
+  "data_gaps": [
+    "No ledger-db metrics/logs were returned for a disk-usage trend reaching 84% before 12:00 — how long the disk had been growing and when analytics_cdc last advanced is unknown.",
+    "Identity/owner of the analytics_cdc consumer and whether it was decommissioned (the reason the slot went inactive) is not visible in the data.",
+    "No explicit confirmation of the disk volume size / where the retained-WAL MB values sum to, to quantify free-space needed.",
+    "settlement-service and portfolio-service logs show almost no error activity, so their actual impact from the ledger-db outage is unverified (portfolio had only 1 generic retry warning)."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "payment-service logged 354 ERROR entries 'ledger write failed: ERROR: could not extend file: No space left on device', first seen 2026-06-01T15:00:26Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "ledger write failed: ERROR: could not extend file: No space left on device (payment e3489438)"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:00:26Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "payment-service error_rate jumped from ~0.23% to 61.35% in the 15:00 bucket and stayed ~61-63% through 16:50, i.e. onset at 15:00, not at the 14:46 deploy.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-06-01T15:00:00Z\",\"avg\":61.35,\"max\":66.98}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T15:00:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Only one deployment in the window: payment-service v6.0.0 at 2026-06-01T14:46:00Z, rolled_back at 2026-06-01T15:12:00Z.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"deployed_at\":\"2026-06-01T14:46:00Z\""
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T14:46:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "No config or feature-flag changes occurred in any service during 13:00-17:00.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"count\":0,\"changes\":[]"
+        }
+      ],
+      "services": [],
+      "time": "2026-06-01T13:00:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "ledger-db is a SHARED postgres used by order-service, portfolio-service, payment-service and settlement-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "{\"from\":\"order-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"shared\":true"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T12:00:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db disk_used_pct rose monotonically from 84.03% at 12:00 to 99.68% at 14:49 and was pinned at 100% from 15:02 onward.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-06-01T12:00:00Z\",\"avg\":84.03"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-06-01T14:49:00Z\",\"avg\":99.68,\"max\":100.0}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T14:49:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db logged 'replication slot 'analytics_cdc' is inactive; retaining <N> MB of WAL' repeatedly from 12:19:34 onward, with retentions of tens of GB (e.g. 63157 MB, 92599 MB).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "replication slot 'analytics_cdc' is inactive; retaining 63157 MB of WAL"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "retaining 92599 MB of WAL"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T12:19:34Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db logged disk-usage warnings: 'disk usage 90%' at 13:10:01, 'disk usage 95%' at 14:15:45, 'disk usage 98%' at 14:48:20, then PANIC 'could not write to file \"pg_wal/xlogtemp.37478\": No space left on device' at 15:01:01.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "\"message\":\"disk usage 90% on /var/lib/postgresql/data\""
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "PANIC: could not write to file \"pg_wal/xlogtemp.37478\": No space left on device"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T15:01:01Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service (trading team, not touched by payment-service's deploy) logged 236 ERROR entries 'INSERT INTO orders failed: No space left on device', first seen 2026-06-01T15:00:42Z — the identical DB error at the same onset time.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "INSERT INTO orders failed: No space left on device orderId=8ab6dc3a"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-06-01T15:00:42Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "ledger-db replication_lag_ms climbed steadily from ~1712 ms at 12:00 to ~5213 ms at 16:59.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"ts\":\"2026-06-01T12:00:00Z\",\"avg\":1712.46"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "{\"ts\":\"2026-06-01T16:59:00Z\",\"avg\":5213.45"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T16:59:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db cpu_pct stayed flat ~30% (min 25.73, max 33.86) and slow_queries_per_min stayed flat ~1/min across the whole window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "\"summary\":{\"min\":25.73,\"max\":33.86,\"mean\":30.02"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"summary\":{\"min\":0.35,\"max\":1.75,\"mean\":0.99"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T16:00:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db connections_active stayed flat ~62 (min 54.85, max 68.34) — no connection-pool exhaustion.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "\"summary\":{\"min\":54.85,\"max\":68.34,\"mean\":62.26"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-06-01T16:00:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "payment-service restarts metric is 0 across the whole window — no crash loop.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "\"summary\":{\"min\":0.0,\"max\":0.0,\"mean\":0.0"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T16:00:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Historical post-mortem HIST-114 (2025-04-18) describes the same ledger-db failure: 'no space left on device', root cause 'Inactive replication slot retained WAL until disk filled', category resource_exhaustion.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-019",
+          "quote": "Inactive replication slot retained WAL until disk filled"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2025-04-18T00:00:00Z",
+      "id": "F14",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "payment-service error rate remained ~61-63% well after the v6.0.0 rollback at 15:12 (e.g. 16:50 bucket avg 61.63), so the rollback did not restore service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-06-01T16:50:00Z\",\"avg\":61.63,\"max\":63.76}"
+        }
+      ],
+      "services": [
+        "payment-service"
+      ],
+      "time": "2026-06-01T16:50:00Z",
+      "id": "F15",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Interpretation: the disk growth started at least 3h before the 14:46 deploy and the fault is confined to the shared ledger-db, so the fault originates in ledger-db (inactive analytics_cdc replication slot) and the payment-service deploy is coincidental, not causal.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-06-01T12:00:00Z\",\"avg\":84.03"
+        },
+        {
+          "call_id": "tc-016",
+          "quote": "replication slot 'analytics_cdc' is inactive"
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "payment-service"
+      ],
+      "time": null,
+      "id": "F16",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 54.93,
+    "llm_calls": 6,
+    "prompt_tokens": 64410,
+    "completion_tokens": 8073,
+    "total_tokens": 72483,
+    "tool_calls": 19,
+    "tool_attempts": 20,
+    "tool_failures": 1,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 16,
+    "findings_verified": 16,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 6,
+        "prompt_tokens": 64410,
+        "completion_tokens": 8073
+      }
+    }
+  },
+  "warnings": []
+}

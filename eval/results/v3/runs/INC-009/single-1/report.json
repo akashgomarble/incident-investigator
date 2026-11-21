@@ -1,0 +1,786 @@
+{
+  "incident_id": "INC-009",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "Order placement latency/timeouts originate from portfolio-service deploy dep-5905 (v4.5.0, rolled out 08:56:32Z) which added an unindexed query on the shared ledger-db's 48M-row trades table (Seq Scan on trades, rows=48211907). The full-table scans drove ledger-db CPU from ~30% to ~96% and saturated its connections, starving order-service's INSERT INTO orders and causing statement timeouts. Both affected services (portfolio-service, order-service) are the two that query trades/orders heavily; the anomaly begins exactly in the first metric bucket after the deploy (08:58), while the earlier 08:00 autovacuum config change left CPU flat at ~30% for 56 minutes and is not the trigger. Root cause is a bad_deployment in portfolio-service; order-service is a downstream victim of the shared database saturation.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "Bad deployment: portfolio-service v4.5.0 unindexed trades query saturates shared ledger-db, starving order-service",
+      "statement": "portfolio-service deploy dep-5905 (v4.5.0, 08:56) introduced a query on the 48M-row trades table filtered by account_id + executed_at with no supporting index ('no migration included'). Postgres runs a Seq Scan on trades (~48M rows) per request, driving ledger-db CPU to ~96% and consuming connections. The shared ledger-db becomes CPU/connection starved, so order-service's INSERT INTO orders exceed their statement timeout, producing order-placement slowness and timeouts.",
+      "category": "bad_deployment",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": "dep-5905",
+      "confidence": 0.9,
+      "pre_cap_confidence": 0.9,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5905 deploys new trades query with no index at 08:56",
+          "finding_ids": [
+            "F6"
+          ]
+        },
+        {
+          "claim": "First bad buckets and first portfolio slow query appear at 08:58 (portfolio p99 185->6963ms, ledger-db CPU 30->96%, order p99 151->2878ms)",
+          "finding_ids": [
+            "F2",
+            "F3",
+            "F1",
+            "F14"
+          ]
+        },
+        {
+          "claim": "ledger-db logs Seq Scan on trades (rows=48211907) application_name=portfolio-service, ~140 slow queries/min",
+          "finding_ids": [
+            "F5",
+            "F4"
+          ]
+        },
+        {
+          "claim": "Shared ledger-db saturates; portfolio and order db pools peg (12->50, 14->46)",
+          "finding_ids": [
+            "F9",
+            "F8",
+            "F10"
+          ]
+        },
+        {
+          "claim": "order-service INSERT INTO orders hit statement timeout against ledger-db",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F8",
+        "F9",
+        "F10",
+        "F14",
+        "F13"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The deploy's new query is the direct source of the trades Seq Scan (query text matches change summary).",
+        "order-service's INSERT INTO orders is contending on the same CPU-bound ledger-db instance."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "Config change: aggressive autovacuum on ledger-db (cfg-2903) causes CPU/IO saturation",
+      "statement": "The DBA's 08:00 autovacuum_vacuum_scale_factor change (0.2->0.1) made autovacuum far more aggressive on the 48M-row trades table, saturating ledger-db CPU and slowing all queries, including order-service inserts.",
+      "category": "config_change",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": "cfg-2903",
+      "confidence": 0.05,
+      "pre_cap_confidence": 0.05,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "cfg-2903 changes autovacuum at 08:00",
+          "finding_ids": [
+            "F7"
+          ]
+        },
+        {
+          "claim": "ledger-db CPU/IO saturates",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "order-service inserts time out",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F7"
+      ],
+      "contradicting_evidence": [
+        "F7",
+        "F14",
+        "F5",
+        "F6"
+      ],
+      "assumptions": [],
+      "rejection_reason": "Timing does not fit: the config change is at 08:00 but ledger-db CPU stayed flat at ~30% for 56 minutes and only spiked at 08:58, exactly when dep-5905 rolled out. The slow queries are explicitly attributed to application_name=portfolio-service with a Seq Scan on trades, not autovacuum."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Resource exhaustion / infrastructure failure at ledger-db (CPU, IOPS or connections)",
+      "statement": "ledger-db itself ran out of a resource (CPU/IOPS/connections) independent of any release, degrading all dependent services.",
+      "category": "resource_exhaustion",
+      "root_cause_service": "ledger-db",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "ledger-db CPU hits 96%",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "connections rise, pools peg",
+          "finding_ids": [
+            "F8",
+            "F9"
+          ]
+        },
+        {
+          "claim": "order-service inserts time out",
+          "finding_ids": [
+            "F8"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F3"
+      ],
+      "contradicting_evidence": [
+        "F14",
+        "F6",
+        "F5",
+        "F12"
+      ],
+      "assumptions": [],
+      "rejection_reason": "The CPU spike is a consequence of the deployed seq-scan workload (query text and application_name=portfolio-service prove the source) and starts only after the 08:56 deploy. Disk and replication lag were normal (F12). No faulty node/broker."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "External dependency (exchange-api / market-data) failure propagating to order-service",
+      "statement": "A degradation of an external provider or market-data dependency slowed order placement.",
+      "category": "dependency_failure",
+      "root_cause_service": "exchange-api",
+      "trigger_change_id": null,
+      "confidence": 0.02,
+      "pre_cap_confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "exchange-api degrades",
+          "finding_ids": []
+        },
+        {
+          "claim": "order-service placement slows",
+          "finding_ids": [
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F8",
+        "F5",
+        "F3"
+      ],
+      "assumptions": [],
+      "rejection_reason": "All order-service errors are ledger-db statement timeouts (INSERT INTO orders), not exchange/gateway errors; the onset coincides with ledger-db CPU saturation and the portfolio deploy."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "order-service p99 rose from ~151ms (08:56) to 2878ms avg / 5607ms max (08:58) and stayed ~5.2s.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "portfolio-service p99 rose from ~185ms (08:56) to 6963ms (08:58) and stayed ~7s.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "ledger-db CPU rose from ~30% (08:56) to ~96% (08:58) and stayed saturated.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "ledger-db slow queries went from ~1/min to ~140/min.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "The dominant slow query is a Seq Scan on trades (rows=48211907) attributed to application_name=portfolio-service, first at 08:58:38.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "portfolio-service dep-5905 v4.5.0 rolled out at 08:56:32 adding an unindexed trades query with 'no migration included'.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "The only config change was ledger-db autovacuum_vacuum_scale_factor 0.2->0.1 at 08:00.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "order-service errors are all ledger-db INSERT INTO orders statement timeouts; error_rate ~9.4%, pool 14->46.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "portfolio-service db pool pegged at 50; its error_rate stayed flat (~0.2%).",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "ledger-db is shared by order-service, portfolio-service, payment-service, settlement-service.",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "statement": "payment-service and settlement-service latencies stayed flat.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "statement": "ledger-db disk usage (~71%) and replication lag (~40ms) were normal.",
+      "finding_ids": [
+        "F12"
+      ]
+    },
+    {
+      "statement": "HIST-111 precedent: unindexed report query caused trades seq scans / high db cpu.",
+      "finding_ids": [
+        "F13"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The deploy's new 'query on trades filtered by account_id + executed_at' is the literal source of the logged Seq Scan query (text matches).",
+    "order-service INSERT INTO orders and portfolio SELECT share the same ledger-db instance and contend for its CPU/connections.",
+    "The 2-minute metric buckets are aligned such that the 08:56 bucket predates the deploy's effect, making 08:58 the first affected bucket."
+  ],
+  "timeline": [
+    {
+      "time": "2026-05-05T08:00:00Z",
+      "event": "DBA config change cfg-2903 on ledger-db: autovacuum_vacuum_scale_factor 0.2 -> 0.1 (more aggressive autovacuum). No metric change follows.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "time": "2026-05-05T08:56:00Z",
+      "event": "portfolio-service deploy dep-5905 (v4.5.0) adds a new unindexed query on trades; no migration included.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-05-05T08:56:32Z",
+      "event": "dep-5905 rollout complete, all pods ready.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-05-05T08:58:00Z",
+      "event": "First bad metric bucket: portfolio p99 185->6963ms, order p99 151->2878ms, ledger-db CPU 30->96%, slow queries spike.",
+      "finding_ids": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F14"
+      ]
+    },
+    {
+      "time": "2026-05-05T08:58:38Z",
+      "event": "First ledger-db slow query: Seq Scan on trades (rows=48211907) application_name=portfolio-service.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-05-05T09:00:42Z",
+      "event": "First order-service error: ledger-db statement timeout on INSERT INTO orders.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "time": "2026-05-05T09:10:00Z",
+      "event": "Incident INC-009 reported (SEV-1); condition persists through 10:59 with no recovery.",
+      "finding_ids": [
+        "F1"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Roll back portfolio-service to the previous version (pre-v4.5.0) to stop the seq-scan workload on ledger-db and confirm ledger-db CPU and order-service latency recover.",
+      "priority": "immediate",
+      "rationale": "Removal of the offending query is the fastest way to restore the shared database; the fault was introduced by dep-5905.",
+      "finding_ids": [
+        "F6",
+        "F3",
+        "F1"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a composite index on trades(account_id, executed_at) (or equivalent) and deploy it via a proper migration, then re-introduce the query.",
+      "priority": "short_term",
+      "rationale": "The Seq Scan on 48M rows is the direct cause; the change summary noted 'no migration included'. Mirrors HIST-111 resolution.",
+      "finding_ids": [
+        "F5",
+        "F13",
+        "F6"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Add a CI/query-review gate that blocks unindexed full-table scans on large shared tables before deployment.",
+      "priority": "long_term",
+      "rationale": "Prevents recurrence; HIST-111's resolution explicitly called for a query review gate.",
+      "finding_ids": [
+        "F13"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Isolate heavy analytical/reporting queries from the transactional order path (separate replica or resource-group for portfolio/reporting).",
+      "priority": "long_term",
+      "rationale": "Order placement shares a single CPU-bound ledger-db with portfolio reporting; isolation prevents a reporting regression from taking down order placement.",
+      "finding_ids": [
+        "F10",
+        "F8"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "No EXPLAIN plan or schema/index listing for the trades table was available; the absence of the index is inferred from the logged 'Seq Scan on trades' and the deploy's 'no migration included'.",
+    "Ledger-db logs only expose WARN-level slow-query entries after 08:58; no autovacuum activity logs were returned, so the 08:00 config change's immediate behavior could not be directly observed (only that CPU stayed flat until 08:56).",
+    "No per-query connection/waits attribution on ledger-db to prove exactly which callers were starved vs. served; order-service starvation is inferred from its own timeout errors plus overall connection saturation."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "order-service p99 latency was normal (~148-165ms) until the 08:56 bucket, then jumped at 08:58 to 2878ms avg / max 5607ms and stayed ~5.2s through 10:50.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-031",
+          "quote": "{\"ts\":\"2026-05-05T08:56:00Z\",\"avg\":151.35,\"max\":153.11}"
+        },
+        {
+          "call_id": "tc-031",
+          "quote": "{\"ts\":\"2026-05-05T08:58:00Z\",\"avg\":2878.21,\"max\":5607.8}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":5235.57,\"max\":5629.31}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-05-05T08:58:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "portfolio-service p99 latency was flat (~175-185ms) through 08:56, then jumped at 08:58 to 6963ms and stayed ~7s.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-030",
+          "quote": "{\"ts\":\"2026-05-05T08:56:00Z\",\"avg\":184.94,\"max\":192.6}"
+        },
+        {
+          "call_id": "tc-030",
+          "quote": "{\"ts\":\"2026-05-05T08:58:00Z\",\"avg\":6963.67,\"max\":7056.7}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-05-05T08:58:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db CPU was ~30% through 08:56, then jumped to ~96% at 08:58 and stayed saturated.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-032",
+          "quote": "{\"ts\":\"2026-05-05T08:56:00Z\",\"avg\":30.53,\"max\":32.14}"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "{\"ts\":\"2026-05-05T08:58:00Z\",\"avg\":95.99,\"max\":96.36}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-05-05T08:58:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db slow queries were ~1/min until 08:30, then spiked in the 08:45-09:00 bucket (avg 19.48, max 139.68) and reached ~140/min from 09:00.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-05-05T08:45:00Z\",\"avg\":19.48,\"max\":139.68}"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":140.74,\"max\":152.51}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-05-05T08:58:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The dominant slow query at ledger-db is a Seq Scan on the trades table (rows=48211907) attributed to application_name=portfolio-service, first seen 08:58:38.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-036",
+          "quote": "slow query 8690ms: SELECT * FROM trades WHERE account_id=$1 AND executed_at > $2 ORDER BY executed_at -- Seq Scan on trades (rows=48211907) application_name=portfolio-service"
+        },
+        {
+          "call_id": "tc-007",
+          "quote": "\"first_seen\":\"2026-05-05T08:58:38Z\""
+        }
+      ],
+      "services": [
+        "ledger-db",
+        "portfolio-service"
+      ],
+      "time": "2026-05-05T08:58:38Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "portfolio-service was deployed as dep-5905 (v4.5.0) at 08:56, with change summary 'new query on trades filtered by account_id + executed_at' and 'no migration included'; rollout completed 08:56:32. No other service was deployed in the window.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "\"id\":\"dep-5905\",\"service\":\"portfolio-service\",\"version\":\"v4.5.0\",\"deployed_at\":\"2026-05-05T08:56:00Z\""
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "\"new query on trades filtered by account_id + executed_at\""
+        },
+        {
+          "call_id": "tc-034",
+          "quote": "deployment dep-5905 (v4.5.0) rollout complete, all pods ready"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-05-05T08:56:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "The only config change in the window was cfg-2903 on ledger-db at 08:00 (autovacuum_vacuum_scale_factor 0.2 -> 0.1, 'More aggressive autovacuum'); ledger-db CPU remained ~30% for the following 56 minutes.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"id\":\"cfg-2903\",\"service\":\"ledger-db\",\"key\":\"autovacuum_vacuum_scale_factor\",\"old_value\":0.2,\"new_value\":0.1,\"changed_at\":\"2026-05-05T08:00:00Z\""
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "{\"ts\":\"2026-05-05T08:54:00Z\",\"avg\":30.63,\"max\":30.94}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-05-05T08:00:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "order-service errors are exclusively 'canceling statement due to statement timeout (INSERT INTO orders)' against ledger-db, first seen 09:00:42; error_rate rose from ~0.2% to ~9.4%, and db_pool_in_use rose from ~14 to ~46.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "ledger-db: canceling statement due to statement timeout (INSERT INTO orders) orderId=15a39d3b"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "\"first_match\":\"2026-05-05T09:00:42Z\""
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":9.41,\"max\":10.0}"
+        },
+        {
+          "call_id": "tc-014",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":46.51,\"max\":51.63}"
+        }
+      ],
+      "services": [
+        "order-service",
+        "ledger-db"
+      ],
+      "time": "2026-05-05T09:00:42Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "4/4 refs verified"
+    },
+    {
+      "statement": "portfolio-service's db_pool_in_use jumped from ~12 to pegged at its max of 50 at 08:45-09:00 onward, while its error_rate stayed flat at ~0.2% (it is slow but not erroring).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-026",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":50.0,\"max\":50}"
+        },
+        {
+          "call_id": "tc-033",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":0.19,\"max\":0.31}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-05-05T08:58:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "ledger-db is a shared datastore used by order-service, portfolio-service, payment-service and settlement-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"from\":\"portfolio-service\",\"to\":\"ledger-db\",\"kind\":\"db\"}"
+        },
+        {
+          "call_id": "tc-010",
+          "quote": "\"shared\":true"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": null,
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "payment-service and settlement-service latencies were flat across the whole incident window (payment ~317-324ms, settlement ~236-247ms), despite also depending on ledger-db.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "{\"ts\":\"2026-05-05T08:45:00Z\",\"avg\":317.86,\"max\":341.77}"
+        },
+        {
+          "call_id": "tc-019",
+          "quote": "{\"ts\":\"2026-05-05T08:45:00Z\",\"avg\":243.29,\"max\":262.36}"
+        }
+      ],
+      "services": [
+        "payment-service",
+        "settlement-service"
+      ],
+      "time": null,
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No disk pressure on ledger-db (disk_used_pct ~71% flat) and no replication lag (replication_lag_ms ~40ms flat) during the incident.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-020",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":71.04,\"max\":72.44}"
+        },
+        {
+          "call_id": "tc-035",
+          "quote": "{\"ts\":\"2026-05-05T09:00:00Z\",\"avg\":39.52,\"max\":42.43}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": null,
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Historical incident HIST-111 is an exact precedent: a new report query without an index caused sequential scans that slowed ledger-db, root cause bad_deployment, resolution 'Added index; query review gate'.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-037",
+          "quote": "\"root_cause\":\"New report query without index did sequential scans\""
+        },
+        {
+          "call_id": "tc-037",
+          "quote": "HIST-111"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": null,
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Inference: portfolio-service's deploy rollout (08:56:32) precedes the first bad metric bucket (08:58) and the first portfolio-slow-query log (08:58:38) by ~1.5-2 minutes; nothing else anomalous occurs between 08:00 and 08:56.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-034",
+          "quote": "deployment dep-5905 (v4.5.0) rollout complete, all pods ready"
+        },
+        {
+          "call_id": "tc-036",
+          "quote": "slow query 8690ms: SELECT * FROM trades"
+        },
+        {
+          "call_id": "tc-032",
+          "quote": "{\"ts\":\"2026-05-05T08:58:00Z\",\"avg\":95.99,\"max\":96.36}"
+        }
+      ],
+      "services": [
+        "portfolio-service",
+        "ledger-db"
+      ],
+      "time": "2026-05-05T08:56:32Z",
+      "id": "F14",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "Inference: order-service was NOT released this week and had no config change; its latency cliff is simultaneous with ledger-db CPU saturation and its errors are all ledger-db statement timeouts, making it a downstream victim rather than the origin.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "\"count\":1"
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "ledger-db: canceling statement due to statement timeout (INSERT INTO orders)"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": null,
+      "id": "F15",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 103.68,
+    "llm_calls": 9,
+    "prompt_tokens": 179574,
+    "completion_tokens": 17489,
+    "total_tokens": 197063,
+    "tool_calls": 37,
+    "tool_attempts": 37,
+    "tool_failures": 1,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 15,
+    "findings_verified": 15,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 9,
+        "prompt_tokens": 179574,
+        "completion_tokens": 17489
+      }
+    }
+  },
+  "warnings": []
+}

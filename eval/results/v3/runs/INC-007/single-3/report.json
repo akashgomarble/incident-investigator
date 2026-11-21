@@ -1,0 +1,603 @@
+{
+  "incident_id": "INC-007",
+  "system": "single_agent",
+  "outcome": "inconclusive",
+  "summary": "Onset was sharp at ~14:00-14:02: auth-service HTTP 5xx error_rate jumped from ~0.2% to ~36% and held steady for two hours; api-gateway showed 401 invalid_token specifically on POST /v1/token/validate (466 matches, first 14:02:22Z). No resource, capacity, dependency or infra signal (flat CPU/memory/latency, zero restarts, stable request rates, healthy redis/user-db). Exactly two changes bracket the onset: code deploy dep-5710 (auth-service v7.3.0, JWT lib jjwt 0.11->0.12 with a 'breaking parser API', TokenValidator rewritten) at 14:00, and config change cfg-2705 (jwt.signing.key_id rotation k-2025-10 -> k-2026-04) at 14:01. Both are strong, near-identical fault vectors and are only one minute apart; the decisive evidence — auth-service's own logs — is unavailable because the identity namespace log pipeline is down. With neither change rolled back and no separation possible from metrics alone, the origin is auth-service (identity namespace) but the specific trigger cannot be definitively distinguished. Best-ranked root cause is the JWT library upgrade deploy (earliest change, directly rewrites the token parser); the signing-key rotation is a close second (matching HIST-108).",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "auth-service v7.3.0 JWT library upgrade broke token validation (bad_deployment)",
+      "statement": "Deploy dep-5710 (auth-service v7.3.0) upgraded jjwt 0.11->0.12 with a 'breaking parser API' and rewrote TokenValidator at 14:00. The refactor introduced a validation defect (e.g. changed default/parsing behaviour) so that a large fraction of otherwise-valid tokens now fail parsing, returning 401 invalid_token on POST /v1/token/validate.",
+      "category": "bad_deployment",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "dep-5710",
+      "confidence": 0.5,
+      "pre_cap_confidence": 0.5,
+      "confidence_label": "medium",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "dep-5710 deploys token-validation rewrite at 14:00",
+          "finding_ids": [
+            "F4"
+          ]
+        },
+        {
+          "claim": "first 401 invalid_token at 14:02:22",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "auth-service 5xx rises to ~36% and persists",
+          "finding_ids": [
+            "F1"
+          ]
+        },
+        {
+          "claim": "no rollback, no recovery",
+          "finding_ids": [
+            "F10"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F3",
+        "F4",
+        "F6",
+        "F7",
+        "F10",
+        "F12",
+        "F11"
+      ],
+      "contradicting_evidence": [
+        "F5"
+      ],
+      "assumptions": [
+        "The deployed TokenValidator rewrite contains a validation defect.",
+        "The 14:00 deploy rollout completed within ~2 minutes to all pods."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "JWT signing-key rotation caused validation failures (config_change)",
+      "statement": "Config change cfg-2705 rotated auth-service jwt.signing.key_id from k-2025-10 to k-2026-04 at 14:01. If the new key/JWKS was published before all pods loaded it (the HIST-108 pattern), tokens signed/validated against the new key id fail, producing 401 invalid_token for the affected fraction of traffic.",
+      "category": "config_change",
+      "root_cause_service": "auth-service",
+      "trigger_change_id": "cfg-2705",
+      "confidence": 0.35,
+      "pre_cap_confidence": 0.35,
+      "confidence_label": "low",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-2705 rotates signing key id at 14:01",
+          "finding_ids": [
+            "F5"
+          ]
+        },
+        {
+          "claim": "401 invalid_token begins 14:02",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "error rate locks at ~36% with no recovery",
+          "finding_ids": [
+            "F1"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F1",
+        "F3",
+        "F5",
+        "F10",
+        "F11"
+      ],
+      "contradicting_evidence": [
+        "F4",
+        "F2"
+      ],
+      "assumptions": [
+        "New key id published/loaded inconsistently across pods or old tokens signed with the previous key are rejected.",
+        "A ~1/3 failure fraction reflects the share of tokens tied to the rotated key."
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Dependency/infrastructure failure (rejected)",
+      "statement": "A downstream dependency or shared component (redis-cache, user-db, kyc-provider) or node-level resource exhaustion caused the 401s.",
+      "category": "dependency_failure",
+      "root_cause_service": "redis-cache",
+      "trigger_change_id": null,
+      "confidence": 0.03,
+      "pre_cap_confidence": 0.03,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F6",
+        "F7",
+        "F8"
+      ],
+      "assumptions": [],
+      "rejection_reason": "redis-cache cpu flat ~22%, user-db and redis show no error/health degradation, auth-service cpu/memory/latency/restarts all normal, request rates stable; no signal of a dependency or infra fault, and 401 invalid_token is a validation-logic outcome, not a connectivity error."
+    }
+  ],
+  "facts": [
+    {
+      "statement": "auth-service error_rate jumped from ~0.2% to ~36% at the 14:00 bucket and stayed ~36% through end of window.",
+      "finding_ids": [
+        "F1"
+      ]
+    },
+    {
+      "statement": "api-gateway error_rate rose to ~21% in the same bucket.",
+      "finding_ids": [
+        "F2"
+      ]
+    },
+    {
+      "statement": "All 466 api-gateway warnings are 401 invalid_token on POST /v1/token/validate, first seen 14:02:22Z.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "statement": "auth-service deploy dep-5710 (v7.3.0) shipped a JWT library upgrade (jjwt 0.11->0.12, breaking parser API) and a TokenValidator rewrite at 14:00.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "statement": "Config change cfg-2705 rotated jwt.signing.key_id from k-2025-10 to k-2026-04 at 14:01.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "statement": "auth-service cpu/memory/latency/restarts were flat; no resource or saturation signal.",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "statement": "Request rates for auth-service and api-gateway were stable.",
+      "finding_ids": [
+        "F7"
+      ]
+    },
+    {
+      "statement": "redis-cache and user-db showed no degraded health; kyc-provider has no telemetry and is not on the token path.",
+      "finding_ids": [
+        "F8"
+      ]
+    },
+    {
+      "statement": "auth-service logs are unavailable (backend 503) so the service-side 401 reason cannot be read.",
+      "finding_ids": [
+        "F9"
+      ]
+    },
+    {
+      "statement": "Neither dep-5710 nor cfg-2705 has been rolled back and the error rate has not recovered.",
+      "finding_ids": [
+        "F10"
+      ]
+    }
+  ],
+  "assumptions": [
+    "Both the 14:00 deploy and 14:01 config change were fully applied within ~1-2 minutes to the affected fleet.",
+    "The ~36% failure fraction is steady-state and reflects a deterministic subset of validate calls.",
+    "kyc-provider is not part of the token-validation path."
+  ],
+  "timeline": [
+    {
+      "time": "2026-04-15T14:00:00Z",
+      "event": "auth-service deploy dep-5710 (v7.3.0, jjwt 0.11->0.12 breaking parser API, TokenValidator rewritten) goes live.",
+      "finding_ids": [
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:01:00Z",
+      "event": "Config change cfg-2705 rotates jwt.signing.key_id to k-2026-04.",
+      "finding_ids": [
+        "F5"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:02:22Z",
+      "event": "First api-gateway WARN: POST /v1/token/validate -> 401 invalid_token.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:00:00Z",
+      "event": "auth-service 5xx error_rate rises to ~36%; api-gateway to ~21%.",
+      "finding_ids": [
+        "F1",
+        "F2"
+      ]
+    },
+    {
+      "time": "2026-04-15T14:12:00Z",
+      "event": "Incident reported (SEV-1).",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-04-15T15:59:00Z",
+      "event": "Error rate still ~36% with no rollback and no recovery.",
+      "finding_ids": [
+        "F1",
+        "F10"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Restore the identity-namespace log pipeline (or pull auth-service container logs directly) to obtain the exact parse/validation error and key-id mismatch details before/while mitigating.",
+      "priority": "immediate",
+      "rationale": "The decisive evidence separating the deploy from the config change is missing (F9); without it the trigger is ambiguous.",
+      "finding_ids": [
+        "F9"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Roll back dep-5710 (auth-service to pre-v7.3.0) first, since it is the earliest change and directly rewrites the token parser, and watch the error rate.",
+      "priority": "immediate",
+      "rationale": "If it is the deploy, rolling back is the fastest fix and recovers service; if error rate does not drop it implicates the config change.",
+      "finding_ids": [
+        "F4",
+        "F1"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "If rollback of dep-5710 does not resolve it, revert cfg-2705 to the previous key id k-2025-10 and re-publish the old key while staging the rotation.",
+      "priority": "immediate",
+      "rationale": "Matches the HIST-108 failure mode (key id published before all pods loaded the JWKS).",
+      "finding_ids": [
+        "F5",
+        "F11"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Stage signin-key rotations (publish new key alongside old, wait for JWKS propagation across all pods) and gate JWT library upgrades behind canary + token-parse tests.",
+      "priority": "short_term",
+      "rationale": "Both candidate triggers are change-management risks with prior incidents (HIST-108, HIST-109).",
+      "finding_ids": [
+        "F11"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Add a validation canary/alert on invalid_token rate and on signing-key id propagation so this class of failure is detected before SEV-1.",
+      "priority": "long_term",
+      "rationale": "The failure was invisible for ~2h and log pipeline outage hid the cause.",
+      "finding_ids": [
+        "F9",
+        "F1"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "auth-service logs are unsearchable (identity-namespace log pipeline down) — the exact service-side error for the 401 invalid_token (parse failure vs. unknown/rotated key id) is not observable, which is the key evidence needed to separate H1 from H2.",
+    "No telemetry from kyc-provider (external, has_telemetry=false), though it does not appear on the token-validation path.",
+    "Deployment metadata does not indicate whether dep-5710 used a canary/partial rollout, so the ~36% failure fraction cannot be attributed to a partial fleet version."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "auth-service HTTP 5xx error_rate jumped from ~0.2% to ~36% starting in the 14:00 bucket and stayed ~36% through 15:45.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-004",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":31.81,\"max\":38.53}"
+        },
+        {
+          "call_id": "tc-004",
+          "quote": "{\"ts\":\"2026-04-15T15:45:00Z\",\"avg\":35.99,\"max\":39.41}"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "api-gateway error_rate rose in the same 14:00 bucket from ~0.2% to ~21%, indicating the failures surface on calls the gateway makes to auth-service.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":18.36,\"max\":22.05}"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "api-gateway WARN logs show 401 invalid_token on POST /v1/token/validate first appearing 2026-04-15T14:02:22Z with 466 matches; the only pattern present.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-011",
+          "quote": "auth-service POST /v1/token/validate -> 401 invalid_token (trace 09dac90d)"
+        },
+        {
+          "call_id": "tc-011",
+          "quote": "\"first_match\":\"2026-04-15T14:02:22Z\""
+        }
+      ],
+      "services": [
+        "api-gateway",
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:02:22Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "A code deployment dep-5710 for auth-service v7.3.0 occurred at 14:00 (summary: 'Upgrade JWT library to 4.x; refactor token validation') with changes 'jjwt 0.11 -> 0.12 (breaking parser API)' and 'TokenValidator rewritten'; status live, not rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "\"id\":\"dep-5710\",\"service\":\"auth-service\",\"version\":\"v7.3.0\",\"deployed_at\":\"2026-04-15T14:00:00Z\""
+        },
+        {
+          "call_id": "tc-002",
+          "quote": "jjwt 0.11 -> 0.12 (breaking parser API)"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "A config change cfg-2705 rotated auth-service jwt.signing.key_id from k-2025-10 to k-2026-04 at 14:01 ('Scheduled signing-key rotation').",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "\"id\":\"cfg-2705\",\"service\":\"auth-service\",\"key\":\"jwt.signing.key_id\",\"old_value\":\"k-2025-10\",\"new_value\":\"k-2026-04\",\"changed_at\":\"2026-04-15T14:01:00Z\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:01:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "auth-service cpu_pct (~38%), memory_pct (~52%), latency_p99_ms (~90ms) and restarts (0) were flat across the incident; no resource or saturation signal.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":38.48,\"max\":40.32}"
+        },
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":51.7,\"max\":55.59}"
+        },
+        {
+          "call_id": "tc-013",
+          "quote": "\"mean\":0.0,\"first\":0.0,\"last\":0.0"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "3/3 refs verified"
+    },
+    {
+      "statement": "auth-service request_rate and api-gateway request_rate were stable (~395 req/s and ~1270 req/s), so the failure is not load-driven.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":398.08,\"max\":424.96}"
+        },
+        {
+          "call_id": "tc-028",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":1271.45,\"max\":1364.98}"
+        }
+      ],
+      "services": [
+        "auth-service",
+        "api-gateway"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "Downstream dependencies redis-cache (cpu ~22%) and user-db are healthy; kyc-provider is an external vendor with no telemetry but is not on the token-validation path.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-021",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":21.83,\"max\":22.93}"
+        },
+        {
+          "call_id": "tc-001",
+          "quote": "{\"name\":\"kyc-provider\",\"type\":\"external\",\"owner\":\"vendor\",\"has_telemetry\":false"
+        }
+      ],
+      "services": [
+        "redis-cache",
+        "user-db",
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "auth-service logs are unsearchable: query_logs returned 'backend unavailable (503)' on both attempts, so the decisive service-side reason for the 401s is not visible.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        },
+        {
+          "call_id": "tc-026",
+          "quote": "backend unavailable (503) (gave up after 3 attempts)"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:00:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "No rollback of either change has occurred (dep-5710 status live, rolled_back_at null; cfg-2705 is the current key), and the error rate has not recovered — consistent with a persistent fault, not a transient.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-018",
+          "quote": "\"status\":\"live\",\"rolled_back_at\":null"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:59:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The two closest historical incidents are HIST-109 ('Token validation regression after auth library upgrade', category bad_deployment, JWT library upgrade) and HIST-108 ('401s after JWT signing key rotation', category config_change) — both mirror current symptoms but are leads, not evidence.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "\"id\":\"HIST-109\""
+        },
+        {
+          "call_id": "tc-006",
+          "quote": "Key rotation published new key id before all pods loaded the JWKS"
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T15:59:00Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    },
+    {
+      "statement": "The failing operation is a healthy-path token validation call: request volume and latency are normal while ~36% of validate calls return 401, so the fault is in the validation logic/key material rather than in capacity or transport.",
+      "kind": "inference",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "{\"ts\":\"2026-04-15T14:00:00Z\",\"avg\":90.29,\"max\":94.9}"
+        },
+        {
+          "call_id": "tc-003",
+          "quote": "\"key\":\"jwt.signing.key_id\""
+        }
+      ],
+      "services": [
+        "auth-service"
+      ],
+      "time": "2026-04-15T14:00:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "2/2 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 54.83,
+    "llm_calls": 6,
+    "prompt_tokens": 79255,
+    "completion_tokens": 8957,
+    "total_tokens": 88212,
+    "tool_calls": 28,
+    "tool_attempts": 32,
+    "tool_failures": 4,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 12,
+    "findings_verified": 12,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 6,
+        "prompt_tokens": 79255,
+        "completion_tokens": 8957
+      }
+    }
+  },
+  "warnings": []
+}

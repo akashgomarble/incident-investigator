@@ -1,0 +1,592 @@
+{
+  "incident_id": "INC-002",
+  "system": "single_agent",
+  "outcome": "root_cause_identified",
+  "summary": "The portfolio page timeouts originate in portfolio-service, not api-gateway. At 09:52 UTC the infra-automation cost-optimisation profile cfg-2207 reduced portfolio-service db.pool.max_size from 50 to 5. The HikariCP pool immediately saturated (total=5, active=5, idle=0, requests waiting), JDBC connection acquisition exceeded the 3000ms timeout, portfolio-service error rate rose to ~22% and p99 to ~4.5s, and api-gateway surfaced 504 upstream timeouts on /v1/portfolio/holdings. The human-reported suspicion (gateway HTTP/2 deploy dep-5220 at 08:00) is contradicted: latency was normal for ~1h45m after that deploy, the same HTTP/2 change applied to order-service caused no impact, and the errors are JDBC pool exhaustion, not protocol failures. Request rate and CPU were flat and ledger-db/market-data-service were healthy, ruling out load, resource exhaustion, and dependency failure. This matches historical incident HIST-115 (same signature, config_change root cause). Fix: revert cfg-2207 to restore pool size 50.",
+  "ranked_hypotheses": [
+    {
+      "rank": 1,
+      "hypothesis_id": "H1",
+      "title": "portfolio-service JDBC pool capped at 5 by cost-optimisation config change cfg-2207",
+      "statement": "At 09:52 infra-automation applied the 'small' cost-optimisation profile to portfolio-service datasource, reducing db.pool.max_size from 50 to 5 (cfg-2207). The pool became saturated (active=5, idle=0, waiting up to 57), JDBC connection acquisition exceeded the 3000ms timeout, requests failed with 22% error rate, portfolio latency hit ~4.5s, and api-gateway returned 504s on /v1/portfolio/*. The fault originates in portfolio-service configuration, not the gateway deploy.",
+      "category": "config_change",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": "cfg-2207",
+      "confidence": 0.88,
+      "confidence_label": "high",
+      "status": "active",
+      "causal_chain": [
+        {
+          "claim": "cfg-2207 reduces db.pool.max_size 50 -> 5",
+          "finding_ids": [
+            "F3"
+          ]
+        },
+        {
+          "claim": "pool pinned at 5 with active=5, idle=0, waiting up to 57 and 3000ms acquire timeouts",
+          "finding_ids": [
+            "F6",
+            "F7"
+          ]
+        },
+        {
+          "claim": "portfolio-service p99 -> ~4.2s and error rate -> ~22%",
+          "finding_ids": [
+            "F4",
+            "F5"
+          ]
+        },
+        {
+          "claim": "api-gateway returns 504 upstream timeouts on /v1/portfolio/*",
+          "finding_ids": [
+            "F11"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F3",
+        "F6",
+        "F7",
+        "F4",
+        "F5",
+        "F11",
+        "F8",
+        "F12",
+        "F13",
+        "F14",
+        "F15"
+      ],
+      "contradicting_evidence": [],
+      "assumptions": [
+        "The 'small' profile's db.pool.max_size=5 is the value that took effect (matches observed pool ceiling of exactly 5)",
+        "Portfolio /holdings endpoint is DB-bound and cannot serve without a pooled JDBC connection"
+      ],
+      "rejection_reason": null
+    },
+    {
+      "rank": 2,
+      "hypothesis_id": "H2",
+      "title": "api-gateway HTTP/2 upgrade (dep-5220) broke upstream calls to portfolio-service",
+      "statement": "The reported hypothesis: the gateway v9.3.0 deploy at 08:00 switching upstream protocol to HTTP/2 introduced the fault. Rejected because latency was normal for ~1h45m after the deploy (08:00-09:45), the identical change was applied to order-service which remained completely healthy, and the portfolio-service error logs show a JDBC connection-pool exhaustion cause rather than a protocol/h2 failure.",
+      "category": "bad_deployment",
+      "root_cause_service": "api-gateway",
+      "trigger_change_id": "dep-5220",
+      "confidence": 0.06,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [
+        {
+          "claim": "dep-5220 enables h2 to portfolio-service at 08:00",
+          "finding_ids": [
+            "F2"
+          ]
+        },
+        {
+          "claim": "portfolio-service calls degrade ~09:45",
+          "finding_ids": [
+            "F4"
+          ]
+        }
+      ],
+      "supporting_evidence": [
+        "F2"
+      ],
+      "contradicting_evidence": [
+        "F9",
+        "F10",
+        "F6",
+        "F3",
+        "F4"
+      ],
+      "assumptions": [],
+      "rejection_reason": "Gateway latency was normal until 09:45, ~1h45m after the 08:00 deploy; the same h2 change on order-service caused no impact; error evidence points to portfolio JDBC pool exhaustion, not protocol errors."
+    },
+    {
+      "rank": 3,
+      "hypothesis_id": "H3",
+      "title": "Traffic/load outgrew provisioned JDBC capacity (capacity_saturation)",
+      "statement": "Request rate stayed flat at ~560 req/s the entire window with no surge, so growth in load did not drive the failure; the pool ceiling was lowered by config, not exceeded by demand.",
+      "category": "capacity_saturation",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": null,
+      "confidence": 0.04,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F8"
+      ],
+      "assumptions": [],
+      "rejection_reason": "request_rate is flat (~560 req/s) before and during the incident, so there was no load increase."
+    },
+    {
+      "rank": 4,
+      "hypothesis_id": "H4",
+      "title": "Dependency or shared-datastore failure (ledger-db / market-data-service)",
+      "statement": "portfolio-service dependencies ledger-db (slow_queries flat ~1/min) and market-data-service (p99 flat ~40ms) were both healthy; nothing indicates a downstream dependency fault.",
+      "category": "dependency_failure",
+      "root_cause_service": "portfolio-service",
+      "trigger_change_id": null,
+      "confidence": 0.02,
+      "confidence_label": "low",
+      "status": "rejected",
+      "causal_chain": [],
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "F13",
+        "F14"
+      ],
+      "assumptions": [],
+      "rejection_reason": "ledger-db slow queries and market-data-service latency are flat and healthy throughout."
+    }
+  ],
+  "facts": [],
+  "assumptions": [
+    "cfg-2207's 'small' profile value of 5 is what took effect (corroborated by pool ceiling of exactly 5 in metrics and logs).",
+    "The /v1/portfolio/holdings path requires a pooled JDBC connection to ledger-db and cannot degrade gracefully.",
+    "No other unobserved change occurred between 09:45 and 09:53 that could independently cause the pool saturation."
+  ],
+  "timeline": [
+    {
+      "time": "2026-03-10T07:00:00Z",
+      "event": "cfg-2199 order-service log.sampling_rate 0.1->0.2 (cosmetic; no latency impact).",
+      "finding_ids": [
+        "F10"
+      ]
+    },
+    {
+      "time": "2026-03-10T08:00:00Z",
+      "event": "dep-5220 api-gateway v9.3.0 deployed: envoy 1.29->1.30, HTTP/2 to portfolio-service and order-service. No immediate impact.",
+      "finding_ids": [
+        "F2",
+        "F9"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:45:00Z",
+      "event": "api-gateway and portfolio-service p99 latency ramp begins (~2100ms avg bucket, max ~4600ms); portfolio db_pool_in_use begins declining.",
+      "finding_ids": [
+        "F1",
+        "F4",
+        "F7"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:52:00Z",
+      "event": "cfg-2207 reduces portfolio-service db.pool.max_size 50->5 via 'small' cost-optimisation profile.",
+      "finding_ids": [
+        "F3"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:53:19Z",
+      "event": "portfolio-service logs first JDBC connection-acquisition timeouts; HikariPool 'Connection is not available' (total=5, active=5, idle=0, waiting increasing).",
+      "finding_ids": [
+        "F6"
+      ]
+    },
+    {
+      "time": "2026-03-10T09:53:53Z",
+      "event": "api-gateway logs first 'upstream timeout portfolio-service ... -> 504' warnings.",
+      "finding_ids": [
+        "F11"
+      ]
+    },
+    {
+      "time": "2026-03-10T10:00:00Z",
+      "event": "portfolio-service db_pool_in_use pinned at exactly 5.0; error rate ~22%; p99 ~4.2s sustained.",
+      "finding_ids": [
+        "F7",
+        "F5",
+        "F4"
+      ]
+    },
+    {
+      "time": "2026-03-10T10:05:00Z",
+      "event": "Incident INC-002 reported (portfolio page timing out).",
+      "finding_ids": []
+    },
+    {
+      "time": "2026-03-10T11:59:00Z",
+      "event": "Incident still ongoing; no rollback of dep-5220; cfg-2207 not yet reverted.",
+      "finding_ids": [
+        "F1",
+        "F7"
+      ]
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "Revert cfg-2207 to restore portfolio-service db.pool.max_size=50 (or set an appropriate validated size for observed ~560 req/s).",
+      "priority": "immediate",
+      "rationale": "The pool ceiling of 5 is the direct cause; observed demand sustained ~12 in-use connections pre-incident, so 5 cannot serve load.",
+      "finding_ids": [
+        "F3",
+        "F7",
+        "F6"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Do NOT roll back dep-5220 as the primary mitigation; if performed, expect no recovery since the h2 change is not the cause.",
+      "priority": "immediate",
+      "rationale": "order-service uses the same h2 change with zero impact and gateway latency was normal for ~1h45m post-deploy.",
+      "finding_ids": [
+        "F2",
+        "F9",
+        "F10"
+      ],
+      "hypothesis_id": "H2"
+    },
+    {
+      "action": "Add a guardrail/validation to infra-automation profiles so cost-optimisation cannot shrink datasource pools below a service's minimum required size.",
+      "priority": "short_term",
+      "rationale": "A blanket 'small' profile silently cut a production pool by 90%, echoing HIST-115.",
+      "finding_ids": [
+        "F3",
+        "F15"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Alert on db_pool_in_use being pinned at max_size with waiting>0 and on JDBC acquire-timeout log rate.",
+      "priority": "short_term",
+      "rationale": "Pool saturation was observable in metrics/logs minutes before user impact escalated.",
+      "finding_ids": [
+        "F6",
+        "F7"
+      ],
+      "hypothesis_id": "H1"
+    },
+    {
+      "action": "Review change-management for automated config pushes during business hours (cfg-2207 applied 09:52 with no canary).",
+      "priority": "long_term",
+      "rationale": "Automated unattended config change caused a SEV-2 outage.",
+      "finding_ids": [
+        "F3"
+      ],
+      "hypothesis_id": "H1"
+    }
+  ],
+  "data_gaps": [
+    "No direct log line stating the pool size was reloaded at 09:52; causation relies on timing correlation plus the pool ceiling of exactly 5 matching the new config value.",
+    "The latency ramp begins in the 09:45 bucket while cfg-2207 is stamped 09:52; the 15-minute bucket granularity makes the exact onset ambiguous (metrics cannot resolve sub-15-min).",
+    "ledger-db has no latency_p99_ms metric; health was assessed only via slow_queries_per_min and dependency-serving services' latency.",
+    "No telemetry for external providers (bank-partner-api, kyc-provider) but they are not on the portfolio path."
+  ],
+  "what_would_change_the_conclusion": [],
+  "findings": [
+    {
+      "statement": "api-gateway p99 latency jumped from ~210ms to ~4300ms in the 09:45 bucket and stayed there through 11:59; max reached 4711.85ms.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-001",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":2147.99,\"max\":4624.18}"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F1",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "The only code deployment in the window was dep-5220 on api-gateway (v9.3.0) at 08:00, enabling HTTP/2 to upstreams for BOTH portfolio-service and order-service; it was never rolled back.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-002",
+          "quote": "upstream protocol h2 for portfolio-service and order-service"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T08:00:00Z",
+      "id": "F2",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "A config change cfg-2207 on portfolio-service reduced db.pool.max_size from 50 to 5 at 09:52 via the 'small' cost-optimisation profile.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-003",
+          "quote": "{\"id\":\"cfg-2207\",\"service\":\"portfolio-service\",\"key\":\"db.pool.max_size\",\"old_value\":50,\"new_value\":5,\"changed_at\":\"2026-03-10T09:52:00Z\"}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:52:00Z",
+      "id": "F3",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service p99 latency jumped to ~4180ms in the 09:45 bucket (max 4546.3), matching the gateway latency spike.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-005",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":2079.79,\"max\":4546.3}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F4",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service error rate rose from ~0.2% to ~22% starting in the 09:45 bucket (max 24.02).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-006",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":9.06,\"max\":24.02}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F5",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service logs show 503 ERROR entries from 09:53:19, dominated by 'could not acquire JDBC connection within 3000ms' (270) and 'HikariPool-1 - Connection is not available... (total=5, active=5, idle=0, waiting=43)' (233).",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-007",
+          "quote": "HikariPool-1 - Connection is not available, request timed out after 3000ms (total=5, active=5, idle=0, waiting=43)"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:53:19Z",
+      "id": "F6",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service db_pool_in_use dropped from ~12 to exactly 5.0 from the 10:00 bucket onward, pinned at the new max_size=5.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-009",
+          "quote": "{\"ts\":\"2026-03-10T10:00:00Z\",\"avg\":5.0,\"max\":5}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T10:00:00Z",
+      "id": "F7",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service request_rate stayed flat at ~560 req/s across the whole window (08:00-11:59), showing no traffic surge.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-010",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":559.91,\"max\":585.08}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F8",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service, which also received the h2 upstream upgrade from dep-5220, shows completely flat p99 (~150ms) with no spike all day.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-008",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":149.94,\"max\":156.5}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F9",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "order-service error rate stayed ~0.2% throughout, unaffected.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-017",
+          "quote": "{\"ts\":\"2026-03-10T10:00:00Z\",\"avg\":0.22,\"max\":0.32}"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2026-03-10T10:00:00Z",
+      "id": "F10",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "gateway logs show 254 WARN entries, 252 of them 'upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504', beginning 09:53:53.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-014",
+          "quote": "upstream timeout portfolio-service GET /v1/portfolio/holdings -> 504 (trace 4ad3127e)"
+        }
+      ],
+      "services": [
+        "api-gateway"
+      ],
+      "time": "2026-03-10T09:53:53Z",
+      "id": "F11",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "portfolio-service CPU stayed flat ~36% throughout the incident (max 39.78), ruling out application CPU exhaustion.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-015",
+          "quote": "{\"ts\":\"2026-03-10T10:00:00Z\",\"avg\":35.77,\"max\":38.67}"
+        }
+      ],
+      "services": [
+        "portfolio-service"
+      ],
+      "time": "2026-03-10T10:00:00Z",
+      "id": "F12",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "ledger-db slow_queries_per_min stayed flat ~1.0 across the window, indicating the shared database was healthy.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-016",
+          "quote": "{\"ts\":\"2026-03-10T10:00:00Z\",\"avg\":1.19,\"max\":1.58}"
+        }
+      ],
+      "services": [
+        "ledger-db"
+      ],
+      "time": "2026-03-10T10:00:00Z",
+      "id": "F13",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "market-data-service (a portfolio-service dependency) p99 stayed flat ~40ms throughout, healthy.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-012",
+          "quote": "{\"ts\":\"2026-03-10T09:45:00Z\",\"avg\":40.32,\"max\":42.61}"
+        }
+      ],
+      "services": [
+        "market-data-service"
+      ],
+      "time": "2026-03-10T09:45:00Z",
+      "id": "F14",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    },
+    {
+      "statement": "Historical incident HIST-115 describes the same signature: 'connection pool misconfiguration' caused by a datasource pool overridden by a wrong environment profile, category config_change.",
+      "kind": "observation",
+      "refs": [
+        {
+          "call_id": "tc-013",
+          "quote": "Datasource pool size overridden by a wrong environment profile"
+        }
+      ],
+      "services": [
+        "order-service"
+      ],
+      "time": "2025-09-25T00:00:00Z",
+      "id": "F15",
+      "agent": "baseline",
+      "task_id": null,
+      "verified": true,
+      "verification_note": "1/1 refs verified"
+    }
+  ],
+  "termination_reason": "agent_submitted",
+  "stats": {
+    "latency_s": 47.58,
+    "llm_calls": 5,
+    "prompt_tokens": 49085,
+    "completion_tokens": 6997,
+    "total_tokens": 56082,
+    "tool_calls": 17,
+    "tool_attempts": 17,
+    "tool_failures": 1,
+    "tool_partial": 0,
+    "tool_recovered_by_retry": 0,
+    "rounds": 1,
+    "tasks": 0,
+    "tasks_failed": 0,
+    "findings": 15,
+    "findings_verified": 15,
+    "usage_by_agent": {
+      "baseline": {
+        "calls": 5,
+        "prompt_tokens": 49085,
+        "completion_tokens": 6997
+      }
+    }
+  },
+  "warnings": []
+}
