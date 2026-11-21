@@ -97,7 +97,7 @@ sequenceDiagram
     R-->>C: revised hypotheses (same ids, confidence moved, one rejected)
     C-->>O: accept, confidence cap 0.85
     O->>P: write report from reviewed state
-    P-->>O: draft; code clamps confidence, demotes unbacked facts, decides outcome
+    P-->>O: draft, then code clamps confidence, demotes unbacked facts, decides outcome
 ```
 
 ## 4. Why this is collaboration and not a chain of prompts
